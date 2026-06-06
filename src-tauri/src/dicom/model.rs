@@ -67,6 +67,21 @@ pub struct DicomFrameImage {
     pub rgba_base64: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DicomFramePixels {
+    pub width: u32,
+    pub height: u32,
+    pub frame_index: u32,
+    pub bits_allocated: u32,
+    pub pixel_representation: u32,
+    pub photometric_interpretation: Option<String>,
+    pub rescale_intercept: f64,
+    pub rescale_slope: f64,
+    pub pixel_base64: String,
+    pub min_value: f64,
+    pub max_value: f64,
+}
+
 impl ValidationResult {
     pub fn valid() -> Self {
         Self {

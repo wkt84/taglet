@@ -54,6 +54,20 @@ export type DicomFrameImage = {
   rgba_base64: string
 }
 
+export type DicomFramePixels = {
+  width: number
+  height: number
+  frame_index: number
+  bits_allocated: number
+  pixel_representation: number
+  photometric_interpretation?: string | null
+  rescale_intercept: number
+  rescale_slope: number
+  pixel_base64: string
+  min_value: number
+  max_value: number
+}
+
 export type TableDicomRow =
   | (DicomElement & {
       rowId: string

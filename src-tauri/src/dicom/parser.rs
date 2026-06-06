@@ -8,7 +8,7 @@ use base64::Engine;
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use super::model::{DicomFrameImage, DicomImageInfo, DicomNode, DicomTagInfo};
+use super::model::{DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo};
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 
@@ -98,7 +98,12 @@ pub fn image_info(obj: &DefaultDicomObject) -> Result<DicomImageInfo, String> {
     })
 }
 
-pub fn frame_image(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomFrameImage, String> {
+pub fn frame_image(
+    obj: &DefaultDicomObject,
+    frame_index: u32,
+    window_center_override: Option<f64>,
+    window_width_override: Option<f64>,
+) -> Result<DicomFrameImage, String> {
     let info = image_info(obj)?;
     if !info.supported {
         return Err(info
@@ -179,7 +184,10 @@ pub fn frame_image(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomFr
         values.push(stored * slope + intercept);
     }
 
-    let (window_center, window_width) = window_for_frame(&info, &values);
+    let (window_center, window_width) = match (window_center_override, window_width_override) {
+        (Some(center), Some(width)) if width > 0.0 => (center, width),
+        _ => window_for_frame(&info, &values),
+    };
     let invert = info
         .photometric_interpretation
         .as_deref()
@@ -191,6 +199,79 @@ pub fn frame_image(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomFr
         height,
         frame_index,
         rgba_base64: base64::engine::general_purpose::STANDARD.encode(rgba),
+    })
+}
+
+pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomFramePixels, String> {
+    let info = image_info(obj)?;
+    if !info.supported {
+        return Err(info
+            .unsupported_reason
+            .unwrap_or_else(|| "Image is not supported".to_string()));
+    }
+
+    let width = info.columns.ok_or_else(|| "Columns is missing".to_string())?;
+    let height = info.rows.ok_or_else(|| "Rows is missing".to_string())?;
+    let samples_per_pixel = info.samples_per_pixel.unwrap_or(1);
+    if samples_per_pixel != 1 {
+        return Err("Only grayscale frames are rendered for now".to_string());
+    }
+    if frame_index >= info.number_of_frames {
+        return Err(format!(
+            "Frame index {frame_index} is out of range for {} frame(s)",
+            info.number_of_frames
+        ));
+    }
+
+    let bits_allocated = info
+        .bits_allocated
+        .ok_or_else(|| "Bits Allocated is missing".to_string())?;
+    let bytes_per_sample = match bits_allocated {
+        8 => 1usize,
+        16 => 2usize,
+        other => return Err(format!("Bits Allocated {other} is not supported yet")),
+    };
+    let frame_sample_count = width as usize * height as usize * samples_per_pixel as usize;
+    let frame_byte_len = frame_sample_count
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| "Frame byte size overflow".to_string())?;
+    let frame_offset = frame_byte_len
+        .checked_mul(frame_index as usize)
+        .ok_or_else(|| "Frame offset overflow".to_string())?;
+
+    let pixel_bytes = obj
+        .get(tags::PIXEL_DATA)
+        .ok_or_else(|| "Pixel Data element is missing".to_string())?
+        .to_bytes()
+        .map_err(|error| error.to_string())?;
+
+    if pixel_bytes.len() < frame_offset + frame_byte_len {
+        return Err(format!(
+            "Pixel Data is too short for frame {frame_index}: expected at least {} bytes, got {}",
+            frame_offset + frame_byte_len,
+            pixel_bytes.len()
+        ));
+    }
+
+    let frame = &pixel_bytes[frame_offset..frame_offset + frame_byte_len];
+    let signed = info.pixel_representation.unwrap_or(0) == 1;
+    let slope = info.rescale_slope.unwrap_or(1.0);
+    let intercept = info.rescale_intercept.unwrap_or(0.0);
+    let (min_value, max_value) =
+        frame_min_max(frame, bits_allocated, signed, slope, intercept, frame_sample_count);
+
+    Ok(DicomFramePixels {
+        width,
+        height,
+        frame_index,
+        bits_allocated,
+        pixel_representation: info.pixel_representation.unwrap_or(0),
+        photometric_interpretation: info.photometric_interpretation,
+        rescale_intercept: intercept,
+        rescale_slope: slope,
+        pixel_base64: base64::engine::general_purpose::STANDARD.encode(frame),
+        min_value,
+        max_value,
     })
 }
 
@@ -498,4 +579,48 @@ fn grayscale_to_rgba(values: &[f64], center: f64, width: f64, invert: bool) -> V
     }
 
     rgba
+}
+
+fn frame_min_max(
+    frame: &[u8],
+    bits_allocated: u32,
+    signed: bool,
+    slope: f64,
+    intercept: f64,
+    sample_count: usize,
+) -> (f64, f64) {
+    let mut min_value = f64::INFINITY;
+    let mut max_value = f64::NEG_INFINITY;
+
+    for index in 0..sample_count {
+        let stored = match bits_allocated {
+            8 => {
+                let value = frame[index];
+                if signed {
+                    i8::from_le_bytes([value]) as f64
+                } else {
+                    value as f64
+                }
+            }
+            16 => {
+                let offset = index * 2;
+                let bytes = [frame[offset], frame[offset + 1]];
+                if signed {
+                    i16::from_le_bytes(bytes) as f64
+                } else {
+                    u16::from_le_bytes(bytes) as f64
+                }
+            }
+            _ => 0.0,
+        } * slope
+            + intercept;
+        min_value = min_value.min(stored);
+        max_value = max_value.max(stored);
+    }
+
+    if min_value.is_finite() && max_value.is_finite() {
+        (min_value, max_value)
+    } else {
+        (0.0, 1.0)
+    }
 }
