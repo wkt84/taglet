@@ -1,4 +1,5 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
+import AddTagDialog from './components/AddTagDialog'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
 import { useDicomFile } from './hooks/useDicomFile'
@@ -10,6 +11,7 @@ function fileName(path?: string) {
 
 export default function App() {
   const dicom = useDicomFile()
+  const [addingTag, setAddingTag] = useState(false)
   const title = useMemo(() => {
     const name = fileName(dicom.filePath)
     return name ? `Taglet - ${name}` : 'Taglet'
@@ -17,7 +19,7 @@ export default function App() {
 
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">
-      <Toolbar title={title} {...dicom} />
+      <Toolbar title={title} {...dicom} openAddTagDialog={() => setAddingTag(true)} />
       {dicom.error ? (
         <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
           {dicom.error}
@@ -30,6 +32,17 @@ export default function App() {
           onDelete={dicom.deleteNodeByPath}
         />
       </section>
+      {addingTag ? (
+        <AddTagDialog
+          existingTags={dicom.nodes.map((node) => node.tag)}
+          onClose={() => setAddingTag(false)}
+          onAdd={(node) => {
+            if (dicom.addRootTag(node)) {
+              setAddingTag(false)
+            }
+          }}
+        />
+      ) : null}
     </main>
   )
 }

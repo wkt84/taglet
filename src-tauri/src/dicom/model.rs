@@ -28,6 +28,14 @@ pub struct ValidationResult {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DicomTagInfo {
+    pub tag: String,
+    pub vr: String,
+    pub description: String,
+    pub editable: bool,
+}
+
 impl ValidationResult {
     pub fn valid() -> Self {
         Self {

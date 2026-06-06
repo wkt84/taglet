@@ -3,26 +3,6 @@ import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import type { DicomElement, DicomNode } from '../types/dicom'
 
-const EDITABLE_TEXT_VRS = new Set([
-  'AE',
-  'AS',
-  'CS',
-  'DA',
-  'DS',
-  'DT',
-  'IS',
-  'LO',
-  'LT',
-  'PN',
-  'SH',
-  'ST',
-  'TM',
-  'UC',
-  'UI',
-  'UR',
-  'UT',
-])
-
 function updateNode(nodes: DicomNode[], path: string[], nextValue: string): DicomNode[] {
   return nodes.map((node) => {
     if (node.kind === 'Element') {
@@ -53,23 +33,12 @@ function deleteNode(nodes: DicomNode[], path: string[]): DicomNode[] {
     })
 }
 
-function normalizeTag(input: string) {
-  const compact = input.trim().replace(/[()]/g, '').replace(/\s/g, '').toUpperCase()
-  const match = compact.match(/^([0-9A-F]{4}),?([0-9A-F]{4})$/)
-  return match ? `(${match[1]},${match[2]})` : undefined
-}
-
 function tagExists(nodes: DicomNode[], tag: string) {
   return nodes.some((node) => node.tag === tag)
 }
 
 function sortByTag(nodes: DicomNode[]) {
   return [...nodes].sort((left, right) => left.tag.localeCompare(right.tag))
-}
-
-function isPrivateTag(tag: string) {
-  const group = Number.parseInt(tag.slice(1, 5), 16)
-  return Number.isFinite(group) && group % 2 === 1
 }
 
 export function useDicomFile() {
@@ -141,38 +110,15 @@ export function useDicomFile() {
     setDirty(true)
   }, [])
 
-  const addRootTag = useCallback(() => {
+  const addRootTag = useCallback((node: DicomElement) => {
     setError(undefined)
-    const tag = normalizeTag(window.prompt('Tag, e.g. (0010,0010)', '') ?? '')
-    if (!tag) {
-      setError('Invalid tag format. Use (0010,0010).')
-      return
+    if (tagExists(nodes, node.tag)) {
+      setError(`${node.tag} already exists at the root level.`)
+      return false
     }
-    if (tagExists(nodes, tag)) {
-      setError(`${tag} already exists at the root level.`)
-      return
-    }
-
-    const vr = (window.prompt('VR, e.g. PN, LO, DS', 'LO') ?? '').trim().toUpperCase()
-    if (!EDITABLE_TEXT_VRS.has(vr)) {
-      setError(`${vr || '(empty)'} is not supported for Add Tag yet.`)
-      return
-    }
-
-    const value = window.prompt('Initial value', '') ?? ''
-    const node: DicomElement = {
-      kind: 'Element',
-      tag,
-      vr,
-      description: isPrivateTag(tag) ? '[Private]' : '[New]',
-      value,
-      length: value.length,
-      path: [tag],
-      editable: true,
-    }
-
     setNodes((current) => sortByTag([...current, node]))
     setDirty(true)
+    return true
   }, [nodes])
 
   const deleteNodeByPath = useCallback((path: string[]) => {

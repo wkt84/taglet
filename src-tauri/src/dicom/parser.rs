@@ -1,4 +1,4 @@
-use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
+use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
 use dicom_core::header::{HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
 use dicom_core::{Tag, VR};
@@ -7,7 +7,7 @@ use dicom_object::{open_file, DefaultDicomObject, InMemDicomObject};
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use super::model::DicomNode;
+use super::model::{DicomNode, DicomTagInfo};
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 
@@ -15,6 +15,23 @@ pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, Vec<DicomNode>), St
     let obj = open_file(path).map_err(|error| error.to_string())?;
     let nodes = object_to_nodes(&obj, Vec::new());
     Ok((obj, nodes))
+}
+
+pub fn tag_info(tag_text: &str) -> Result<DicomTagInfo, String> {
+    let tag = parse_tag(tag_text)?;
+    let vr = StandardDataDictionary
+        .by_tag(tag)
+        .map(|entry| virtual_vr_to_string(entry.vr()))
+        .unwrap_or_else(|| "LO".to_string());
+
+    let vr_for_editable = VR::from_str(&vr).unwrap_or(VR::LO);
+
+    Ok(DicomTagInfo {
+        tag: format_tag(tag),
+        vr,
+        description: description_for(tag),
+        editable: tag != PIXEL_DATA && is_text_editable(vr_for_editable),
+    })
 }
 
 pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<DicomNode> {
@@ -139,6 +156,13 @@ fn description_for(tag: Tag) -> String {
         .by_tag(tag)
         .map(|entry| entry.alias().to_string())
         .unwrap_or_else(|| "[Unknown]".to_string())
+}
+
+fn virtual_vr_to_string(vr: VirtualVr) -> String {
+    match vr.exact() {
+        Some(vr) => vr.to_string().to_owned(),
+        None => vr.relaxed().to_string().to_owned(),
+    }
 }
 
 fn is_text_editable(vr: VR) -> bool {

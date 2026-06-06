@@ -2,6 +2,7 @@ mod commands;
 mod dicom;
 
 use commands::file::{open_dicom_file, save_dicom_file, save_dicom_file_as, DicomStore};
+use commands::tags::lookup_dicom_tag;
 use commands::validate::validate_value;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -13,6 +14,7 @@ pub fn run() {
             open_dicom_file,
             save_dicom_file,
             save_dicom_file_as,
+            lookup_dicom_tag,
             validate_value
         ])
         .run(tauri::generate_context!())
