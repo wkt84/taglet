@@ -8,6 +8,7 @@ type Props = {
   dirty: boolean
   openFile: () => Promise<void>
   openAddTagDialog: () => void
+  openImageViewer: () => void
   saveFile: () => Promise<void>
   saveFileAs: () => Promise<void>
 }
@@ -19,6 +20,7 @@ export default function Toolbar({
   dirty,
   openFile,
   openAddTagDialog,
+  openImageViewer,
   saveFile,
   saveFileAs,
 }: Props) {
@@ -33,6 +35,9 @@ export default function Toolbar({
       </button>
       <button className="toolbar-button" disabled={!filePath || loading} onClick={openAddTagDialog}>
         Add Tag
+      </button>
+      <button className="toolbar-button" disabled={!filePath || loading} onClick={openImageViewer}>
+        Image Viewer
       </button>
       <button className="toolbar-button" disabled={!filePath || loading} onClick={saveFile}>
         Save

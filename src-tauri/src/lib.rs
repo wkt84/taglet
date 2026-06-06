@@ -2,6 +2,7 @@ mod commands;
 mod dicom;
 
 use commands::file::{open_dicom_file, save_dicom_file, save_dicom_file_as, DicomStore};
+use commands::image::{get_dicom_frame_image, get_dicom_image_info};
 use commands::tags::lookup_dicom_tag;
 use commands::validate::validate_value;
 
@@ -14,6 +15,8 @@ pub fn run() {
             open_dicom_file,
             save_dicom_file,
             save_dicom_file_as,
+            get_dicom_image_info,
+            get_dicom_frame_image,
             lookup_dicom_tag,
             validate_value
         ])

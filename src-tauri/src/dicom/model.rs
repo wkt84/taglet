@@ -36,6 +36,37 @@ pub struct DicomTagInfo {
     pub editable: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DicomImageInfo {
+    pub has_pixel_data: bool,
+    pub supported: bool,
+    pub unsupported_reason: Option<String>,
+    pub modality: Option<String>,
+    pub sop_class_uid: Option<String>,
+    pub transfer_syntax_uid: Option<String>,
+    pub rows: Option<u32>,
+    pub columns: Option<u32>,
+    pub samples_per_pixel: Option<u32>,
+    pub photometric_interpretation: Option<String>,
+    pub bits_allocated: Option<u32>,
+    pub bits_stored: Option<u32>,
+    pub high_bit: Option<u32>,
+    pub pixel_representation: Option<u32>,
+    pub number_of_frames: u32,
+    pub window_center: Vec<f64>,
+    pub window_width: Vec<f64>,
+    pub rescale_intercept: Option<f64>,
+    pub rescale_slope: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DicomFrameImage {
+    pub width: u32,
+    pub height: u32,
+    pub frame_index: u32,
+    pub rgba_base64: String,
+}
+
 impl ValidationResult {
     pub fn valid() -> Self {
         Self {

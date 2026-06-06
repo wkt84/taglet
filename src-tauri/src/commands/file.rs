@@ -5,12 +5,55 @@ use dicom_object::DefaultDicomObject;
 use tauri::State;
 
 use crate::dicom::model::DicomNode;
-use crate::dicom::parser::{apply_nodes_to_object, open_nodes};
+use crate::dicom::parser::{apply_nodes_to_object, open_full_object, open_nodes};
+
+struct StoredDicomObject {
+    full: Option<DefaultDicomObject>,
+}
 
 #[derive(Default)]
 pub struct DicomStore {
-    objects: Mutex<HashMap<String, DefaultDicomObject>>,
+    objects: Mutex<HashMap<String, StoredDicomObject>>,
     current_path: Mutex<Option<String>>,
+}
+
+impl DicomStore {
+    pub fn with_current_full_object<R>(
+        &self,
+        f: impl FnOnce(&DefaultDicomObject) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let current_path = self
+            .current_path
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "No DICOM file is currently open".to_string())?;
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?;
+        let stored = objects
+            .get(&current_path)
+            .ok_or_else(|| "Original DICOM object is not loaded in this session".to_string())?;
+        if stored.full.is_none() {
+            drop(objects);
+            let full = open_full_object(&current_path)?;
+            objects = self
+                .objects
+                .lock()
+                .map_err(|_| "DICOM store lock poisoned".to_string())?;
+            let stored = objects
+                .get_mut(&current_path)
+                .ok_or_else(|| "Original DICOM object is not loaded in this session".to_string())?;
+            stored.full = Some(full);
+        }
+
+        let object = objects
+            .get(&current_path)
+            .and_then(|stored| stored.full.as_ref())
+            .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
+        f(object)
+    }
 }
 
 #[tauri::command]
@@ -18,12 +61,17 @@ pub async fn open_dicom_file(
     path: String,
     store: State<'_, DicomStore>,
 ) -> Result<Vec<DicomNode>, String> {
-    let (object, nodes) = open_nodes(&path)?;
+    let (_preview, nodes) = open_nodes(&path)?;
     store
         .objects
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())?
-        .insert(path.clone(), object);
+        .insert(
+            path.clone(),
+            StoredDicomObject {
+                full: None,
+            },
+        );
     *store
         .current_path
         .lock()
@@ -65,9 +113,17 @@ fn save_to_path(
         .objects
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())?;
-    let object = objects
+    let stored = objects
         .get_mut(&source_path)
         .ok_or_else(|| "Original DICOM object is not loaded in this session".to_string())?;
+
+    if stored.full.is_none() {
+        stored.full = Some(open_full_object(&source_path)?);
+    }
+    let object = stored
+        .full
+        .as_mut()
+        .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
     apply_nodes_to_object(object, &nodes)?;
     object
@@ -75,8 +131,12 @@ fn save_to_path(
         .map_err(|error| error.to_string())?;
 
     if source_path != destination_path {
-        let cloned = object.clone();
-        objects.insert(destination_path.clone(), cloned);
+        objects.insert(
+            destination_path.clone(),
+            StoredDicomObject {
+                full: None,
+            },
+        );
     }
     *store
         .current_path

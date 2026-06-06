@@ -25,6 +25,35 @@ export type ValidationResult = {
   message?: string
 }
 
+export type DicomImageInfo = {
+  has_pixel_data: boolean
+  supported: boolean
+  unsupported_reason?: string | null
+  modality?: string | null
+  sop_class_uid?: string | null
+  transfer_syntax_uid?: string | null
+  rows?: number | null
+  columns?: number | null
+  samples_per_pixel?: number | null
+  photometric_interpretation?: string | null
+  bits_allocated?: number | null
+  bits_stored?: number | null
+  high_bit?: number | null
+  pixel_representation?: number | null
+  number_of_frames: number
+  window_center: number[]
+  window_width: number[]
+  rescale_intercept?: number | null
+  rescale_slope?: number | null
+}
+
+export type DicomFrameImage = {
+  width: number
+  height: number
+  frame_index: number
+  rgba_base64: string
+}
+
 export type TableDicomRow =
   | (DicomElement & {
       rowId: string
@@ -39,4 +68,3 @@ export type TableDicomRow =
       subRows: TableDicomRow[]
       items: DicomNode[][]
     })
-

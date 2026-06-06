@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import AddTagDialog from './components/AddTagDialog'
+import ImageViewer from './components/ImageViewer'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
 import { useDicomFile } from './hooks/useDicomFile'
@@ -51,6 +52,7 @@ function tagsAtPath(nodes: DicomNode[], parentPath: string[]): string[] {
 export default function App() {
   const dicom = useDicomFile()
   const [addingTag, setAddingTag] = useState(false)
+  const [showingImageViewer, setShowingImageViewer] = useState(false)
   const [selectedPath, setSelectedPath] = useState<string[]>()
   const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
   const existingTagsForTarget = useMemo(
@@ -64,7 +66,12 @@ export default function App() {
 
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">
-      <Toolbar title={title} {...dicom} openAddTagDialog={() => setAddingTag(true)} />
+      <Toolbar
+        title={title}
+        {...dicom}
+        openAddTagDialog={() => setAddingTag(true)}
+        openImageViewer={() => setShowingImageViewer(true)}
+      />
       {dicom.error ? (
         <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
           {dicom.error}
@@ -91,6 +98,7 @@ export default function App() {
           }}
         />
       ) : null}
+      {showingImageViewer ? <ImageViewer onClose={() => setShowingImageViewer(false)} /> : null}
     </main>
   )
 }
