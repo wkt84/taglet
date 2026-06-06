@@ -3,20 +3,26 @@ import type { TableDicomRow } from '../types/dicom'
 
 type Props = {
   row: Row<TableDicomRow>
+  selected: boolean
+  onSelect: (path: string[]) => void
 }
 
-export default function TagRow({ row }: Props) {
+export default function TagRow({ row, selected, onSelect }: Props) {
   const isSequence = row.original.kind === 'Sequence'
   const itemClass = row.original.itemIndex !== undefined ? 'border-t border-blue-100 bg-blue-50/40' : ''
   const sequenceClass = isSequence ? 'bg-sky-50 font-medium' : ''
   const stripeClass = row.index % 2 === 0 ? 'bg-white' : 'bg-slate-50'
+  const selectedClass = selected ? 'outline outline-2 outline-blue-400 outline-offset-[-2px]' : ''
 
   return (
     <tr
-      className={`${stripeClass} ${itemClass} ${sequenceClass} hover:bg-blue-100/60 ${
+      className={`${stripeClass} ${itemClass} ${sequenceClass} ${selectedClass} hover:bg-blue-100/60 ${
         isSequence ? 'cursor-pointer' : ''
       }`}
-      onClick={isSequence ? row.getToggleExpandedHandler() : undefined}
+      onClick={() => {
+        onSelect(row.original.path)
+        if (isSequence) row.toggleExpanded()
+      }}
       title={isSequence ? (row.getIsExpanded() ? 'Collapse sequence' : 'Expand sequence') : undefined}
     >
       {row.getVisibleCells().map((cell) => (

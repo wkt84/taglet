@@ -5,6 +5,7 @@ import type { DicomElement } from '../types/dicom'
 
 type Props = {
   existingTags: string[]
+  targetLabel: string
   onAdd: (node: DicomElement) => void
   onClose: () => void
 }
@@ -40,7 +41,7 @@ function isPrivateTag(tag: string) {
   return Number.isFinite(group) && group % 2 === 1
 }
 
-export default function AddTagDialog({ existingTags, onAdd, onClose }: Props) {
+export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<DicomTagOption>(DICOM_TAG_OPTIONS[0])
   const [customTag, setCustomTag] = useState('')
@@ -140,6 +141,13 @@ export default function AddTagDialog({ existingTags, onAdd, onClose }: Props) {
           </section>
 
           <aside className="space-y-3">
+            <div>
+              <div className="text-xs font-medium uppercase text-slate-500">Target</div>
+              <div className="mt-1 rounded border border-blue-100 bg-blue-50 p-2 text-xs text-blue-800">
+                {targetLabel}
+              </div>
+            </div>
+
             <div>
               <div className="text-xs font-medium uppercase text-slate-500">Selected</div>
               <div className="mt-1 rounded border border-slate-200 bg-slate-50 p-3 text-sm">

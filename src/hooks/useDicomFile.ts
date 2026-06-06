@@ -41,6 +41,58 @@ function sortByTag(nodes: DicomNode[]) {
   return [...nodes].sort((left, right) => left.tag.localeCompare(right.tag))
 }
 
+function isItemPath(path: string[], target: string[]) {
+  return samePath(path, target)
+}
+
+function insertNode(
+  nodes: DicomNode[],
+  parentPath: string[],
+  node: DicomElement,
+): { nodes: DicomNode[]; added: boolean; duplicate: boolean } {
+  if (parentPath.length === 0) {
+    if (tagExists(nodes, node.tag)) {
+      return { nodes, added: false, duplicate: true }
+    }
+    return {
+      nodes: sortByTag([...nodes, { ...node, path: [node.tag] }]),
+      added: true,
+      duplicate: false,
+    }
+  }
+
+  let added = false
+  let duplicate = false
+  const nextNodes = nodes.map((current) => {
+    if (current.kind === 'Element') return current
+
+    return {
+      ...current,
+      items: current.items.map((item, index) => {
+        if (added || duplicate) return item
+
+        const itemPath = [...current.path, `Item#${index}`]
+        if (isItemPath(itemPath, parentPath)) {
+          if (tagExists(item, node.tag)) {
+            duplicate = true
+            return item
+          }
+
+          added = true
+          return sortByTag([...item, { ...node, path: [...parentPath, node.tag] }])
+        }
+
+        const nested = insertNode(item, parentPath, node)
+        added = nested.added
+        duplicate = nested.duplicate
+        return nested.nodes
+      }),
+    }
+  })
+
+  return { nodes: nextNodes, added, duplicate }
+}
+
 export function useDicomFile() {
   const [filePath, setFilePath] = useState<string>()
   const [nodes, setNodes] = useState<DicomNode[]>([])
@@ -110,13 +162,20 @@ export function useDicomFile() {
     setDirty(true)
   }, [])
 
-  const addRootTag = useCallback((node: DicomElement) => {
+  const addTag = useCallback((parentPath: string[], node: DicomElement) => {
     setError(undefined)
-    if (tagExists(nodes, node.tag)) {
-      setError(`${node.tag} already exists at the root level.`)
+    const result = insertNode(nodes, parentPath, node)
+
+    if (result.duplicate) {
+      setError(`${node.tag} already exists in the selected target.`)
       return false
     }
-    setNodes((current) => sortByTag([...current, node]))
+    if (!result.added) {
+      setError('Could not find the selected Sequence item. Adding tags to this target is not available.')
+      return false
+    }
+
+    setNodes(result.nodes)
     setDirty(true)
     return true
   }, [nodes])
@@ -137,11 +196,11 @@ export function useDicomFile() {
       saveFile,
       saveFileAs,
       updateNodeValue,
-      addRootTag,
+      addTag,
       deleteNodeByPath,
     }),
     [
-      addRootTag,
+      addTag,
       deleteNodeByPath,
       dirty,
       error,

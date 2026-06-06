@@ -3,15 +3,60 @@ import AddTagDialog from './components/AddTagDialog'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
 import { useDicomFile } from './hooks/useDicomFile'
+import type { DicomNode } from './types/dicom'
 
 function fileName(path?: string) {
   if (!path) return undefined
   return path.split(/[\\/]/).pop()
 }
 
+function samePath(left: string[], right: string[]) {
+  return left.length === right.length && left.every((part, index) => part === right[index])
+}
+
+function addTargetPathFromSelection(path?: string[]) {
+  if (!path) return []
+  let itemIndex = -1
+  for (let index = path.length - 1; index >= 0; index -= 1) {
+    if (path[index].startsWith('Item#')) {
+      itemIndex = index
+      break
+    }
+  }
+  return itemIndex === -1 ? [] : path.slice(0, itemIndex + 1)
+}
+
+function targetLabel(path: string[]) {
+  return path.length === 0 ? 'Root dataset' : path.join(' / ')
+}
+
+function tagsAtPath(nodes: DicomNode[], parentPath: string[]): string[] {
+  if (parentPath.length === 0) return nodes.map((node) => node.tag)
+
+  for (const node of nodes) {
+    if (node.kind === 'Element') continue
+
+    for (const [index, item] of node.items.entries()) {
+      const itemPath = [...node.path, `Item#${index}`]
+      if (samePath(itemPath, parentPath)) return item.map((child) => child.tag)
+
+      const nested = tagsAtPath(item, parentPath)
+      if (nested.length > 0) return nested
+    }
+  }
+
+  return []
+}
+
 export default function App() {
   const dicom = useDicomFile()
   const [addingTag, setAddingTag] = useState(false)
+  const [selectedPath, setSelectedPath] = useState<string[]>()
+  const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
+  const existingTagsForTarget = useMemo(
+    () => tagsAtPath(dicom.nodes, addTargetPath),
+    [addTargetPath, dicom.nodes],
+  )
   const title = useMemo(() => {
     const name = fileName(dicom.filePath)
     return name ? `Taglet - ${name}` : 'Taglet'
@@ -28,16 +73,19 @@ export default function App() {
       <section className="min-h-0 flex-1 overflow-hidden p-4">
         <TagTable
           nodes={dicom.nodes}
+          selectedPath={selectedPath}
           onChange={dicom.updateNodeValue}
           onDelete={dicom.deleteNodeByPath}
+          onSelect={setSelectedPath}
         />
       </section>
       {addingTag ? (
         <AddTagDialog
-          existingTags={dicom.nodes.map((node) => node.tag)}
+          existingTags={existingTagsForTarget}
+          targetLabel={targetLabel(addTargetPath)}
           onClose={() => setAddingTag(false)}
           onAdd={(node) => {
-            if (dicom.addRootTag(node)) {
+            if (dicom.addTag(addTargetPath, node)) {
               setAddingTag(false)
             }
           }}

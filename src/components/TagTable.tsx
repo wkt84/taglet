@@ -13,11 +13,13 @@ import type { DicomElement, DicomNode, TableDicomRow } from '../types/dicom'
 
 type Props = {
   nodes: DicomNode[]
+  selectedPath?: string[]
   onChange: (path: string[], value: string) => void
   onDelete: (path: string[]) => void
+  onSelect: (path: string[]) => void
 }
 
-export default function TagTable({ nodes, onChange, onDelete }: Props) {
+export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSelect }: Props) {
   const [expanded, setExpanded] = useState<ExpandedState>({})
   const rows = useMemo(() => toTableRows(nodes), [nodes])
 
@@ -33,6 +35,7 @@ export default function TagTable({ nodes, onChange, onDelete }: Props) {
                 className="mr-1 w-5 rounded text-slate-700 hover:bg-slate-200"
                 onClick={(event) => {
                   event.stopPropagation()
+                  onSelect(row.original.path)
                   row.toggleExpanded()
                 }}
                 title={row.getIsExpanded() ? 'Collapse sequence' : 'Expand sequence'}
@@ -150,12 +153,22 @@ export default function TagTable({ nodes, onChange, onDelete }: Props) {
         </thead>
         <tbody>
           {table.getRowModel().rows.map((row) => (
-            <TagRow key={row.id} row={row} />
+            <TagRow
+              key={row.id}
+              row={row}
+              selected={samePath(row.original.path, selectedPath)}
+              onSelect={onSelect}
+            />
           ))}
         </tbody>
       </table>
     </div>
   )
+}
+
+function samePath(left: string[], right?: string[]) {
+  if (!right) return false
+  return left.length === right.length && left.every((part, index) => part === right[index])
 }
 
 function toTableRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDicomRow[] {
