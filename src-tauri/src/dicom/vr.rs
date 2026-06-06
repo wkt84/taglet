@@ -4,6 +4,18 @@ use regex::Regex;
 use super::model::ValidationResult;
 
 pub fn validate(vr: &str, value: &str) -> ValidationResult {
+    if vr == "SQ" {
+        return ValidationResult::invalid("SQ values cannot be edited directly");
+    }
+
+    if value.is_empty() {
+        return ValidationResult::valid();
+    }
+
+    if is_multi_value_vr(vr) {
+        return validate_multi(vr, value);
+    }
+
     match vr {
         "DA" => validate_da(value),
         "TM" => validate_tm(value),
@@ -14,9 +26,39 @@ pub fn validate(vr: &str, value: &str) -> ValidationResult {
         "LO" => validate_text(value, 64, "LO"),
         "SH" => validate_text(value, 16, "SH"),
         "PN" => validate_pn(value),
-        "SQ" => ValidationResult::invalid("SQ values cannot be edited directly"),
         _ => ValidationResult::valid(),
     }
+}
+
+fn validate_multi(vr: &str, value: &str) -> ValidationResult {
+    for (index, component) in value.split('\\').enumerate() {
+        let result = validate_single(vr, component);
+        if !result.valid {
+            let detail = result.message.unwrap_or_else(|| "invalid value".to_string());
+            return ValidationResult::invalid(format!("value #{}: {detail}", index + 1));
+        }
+    }
+
+    ValidationResult::valid()
+}
+
+fn validate_single(vr: &str, value: &str) -> ValidationResult {
+    match vr {
+        "DA" => validate_da(value),
+        "TM" => validate_tm(value),
+        "UI" => validate_ui(value),
+        "IS" => validate_is(value),
+        "DS" => validate_ds(value),
+        "CS" => validate_cs(value),
+        "LO" => validate_text(value, 64, "LO"),
+        "SH" => validate_text(value, 16, "SH"),
+        "PN" => validate_pn(value),
+        _ => ValidationResult::valid(),
+    }
+}
+
+fn is_multi_value_vr(vr: &str) -> bool {
+    matches!(vr, "DA" | "TM" | "UI" | "IS" | "DS" | "CS" | "LO" | "SH" | "PN")
 }
 
 fn validate_da(value: &str) -> ValidationResult {
@@ -117,5 +159,33 @@ fn validate_pn(value: &str) -> ValidationResult {
         ValidationResult::valid()
     } else {
         ValidationResult::invalid("PN name groups may contain at most five caret-separated components")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate;
+
+    #[test]
+    fn validates_multi_value_ds() {
+        assert!(validate("DS", "0\\0\\0").valid);
+        assert!(validate("DS", "-1.25\\2.5e3\\.75").valid);
+    }
+
+    #[test]
+    fn reports_invalid_multi_value_component() {
+        let result = validate("DS", "0\\abc\\1");
+
+        assert!(!result.valid);
+        assert_eq!(
+            result.message.as_deref(),
+            Some("value #2: DS must be a decimal string")
+        );
+    }
+
+    #[test]
+    fn allows_empty_values() {
+        assert!(validate("DS", "").valid);
+        assert!(validate("DA", "").valid);
     }
 }

@@ -29,15 +29,15 @@ export function useDicomFile() {
 
   const openFile = useCallback(async () => {
     setError(undefined)
-    const selected = await open({
-      multiple: false,
-      filters: [{ name: 'DICOM', extensions: ['dcm', 'dicom', '*'] }],
-    })
-
-    if (typeof selected !== 'string') return
-
     setLoading(true)
     try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'DICOM', extensions: ['dcm', 'dicom'] }],
+      })
+
+      if (typeof selected !== 'string') return
+
       const loaded = await invoke<DicomNode[]>('open_dicom_file', { path: selected })
       setFilePath(selected)
       setNodes(loaded)
@@ -66,14 +66,14 @@ export function useDicomFile() {
   const saveFileAs = useCallback(async () => {
     if (!filePath) return
     setError(undefined)
-    const destination = await save({
-      defaultPath: filePath,
-      filters: [{ name: 'DICOM', extensions: ['dcm', 'dicom'] }],
-    })
-    if (!destination) return
-
     setLoading(true)
     try {
+      const destination = await save({
+        defaultPath: filePath,
+        filters: [{ name: 'DICOM', extensions: ['dcm', 'dicom'] }],
+      })
+      if (!destination) return
+
       await invoke('save_dicom_file_as', { path: destination, nodes })
       setFilePath(destination)
       setDirty(false)

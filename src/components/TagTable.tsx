@@ -17,7 +17,7 @@ type Props = {
 }
 
 export default function TagTable({ nodes, onChange }: Props) {
-  const [expanded, setExpanded] = useState<ExpandedState>(true)
+  const [expanded, setExpanded] = useState<ExpandedState>({})
   const rows = useMemo(() => toTableRows(nodes), [nodes])
 
   const columns = useMemo<ColumnDef<TableDicomRow>[]>(
@@ -64,7 +64,9 @@ export default function TagTable({ nodes, onChange }: Props) {
               onCommit={(value) => onChange(row.original.path, value)}
             />
           ) : (
-            <span className="text-slate-500">[Sequence: {row.original.items.length} item(s)]</span>
+            <span className="inline-flex items-center rounded bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
+              {row.original.items.length} {row.original.items.length === 1 ? 'item' : 'items'}
+            </span>
           ),
       },
       {
@@ -147,4 +149,3 @@ function toTableRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDi
     }
   })
 }
-
