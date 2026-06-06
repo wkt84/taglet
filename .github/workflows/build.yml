@@ -1,6 +1,7 @@
 name: Build Taglet
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
