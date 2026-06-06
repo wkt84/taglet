@@ -4,6 +4,7 @@ use dicom_core::value::{PrimitiveValue, Value};
 use dicom_core::{Tag, VR};
 use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::{open_file, DefaultDicomObject, InMemDicomObject};
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use super::model::DicomNode;
@@ -68,6 +69,18 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
 }
 
 pub fn apply_nodes_to_object(obj: &mut InMemDicomObject, nodes: &[DicomNode]) -> Result<(), String> {
+    let desired_tags = nodes
+        .iter()
+        .map(node_tag)
+        .collect::<Result<HashSet<_>, _>>()?;
+    let existing_tags = obj.iter().map(|element| element.tag()).collect::<Vec<_>>();
+
+    for tag in existing_tags {
+        if tag != PIXEL_DATA && !desired_tags.contains(&tag) {
+            obj.remove_element(tag);
+        }
+    }
+
     for node in nodes {
         match node {
             DicomNode::Element {
@@ -97,6 +110,12 @@ pub fn apply_nodes_to_object(obj: &mut InMemDicomObject, nodes: &[DicomNode]) ->
         }
     }
     Ok(())
+}
+
+fn node_tag(node: &DicomNode) -> Result<Tag, String> {
+    match node {
+        DicomNode::Element { tag, .. } | DicomNode::Sequence { tag, .. } => parse_tag(tag),
+    }
 }
 
 fn display_value(value: &Value<InMemDicomObject>) -> String {

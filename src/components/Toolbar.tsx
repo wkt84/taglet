@@ -7,6 +7,7 @@ type Props = {
   loading: boolean
   dirty: boolean
   openFile: () => Promise<void>
+  addRootTag: () => void
   saveFile: () => Promise<void>
   saveFileAs: () => Promise<void>
 }
@@ -17,6 +18,7 @@ export default function Toolbar({
   loading,
   dirty,
   openFile,
+  addRootTag,
   saveFile,
   saveFileAs,
 }: Props) {
@@ -29,6 +31,9 @@ export default function Toolbar({
       <button className="toolbar-button" disabled={loading} onClick={openFile}>
         Open
       </button>
+      <button className="toolbar-button" disabled={!filePath || loading} onClick={addRootTag}>
+        Add Tag
+      </button>
       <button className="toolbar-button" disabled={!filePath || loading} onClick={saveFile}>
         Save
       </button>
@@ -38,4 +43,3 @@ export default function Toolbar({
     </header>
   )
 }
-

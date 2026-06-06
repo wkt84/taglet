@@ -14,9 +14,10 @@ import type { DicomElement, DicomNode, TableDicomRow } from '../types/dicom'
 type Props = {
   nodes: DicomNode[]
   onChange: (path: string[], value: string) => void
+  onDelete: (path: string[]) => void
 }
 
-export default function TagTable({ nodes, onChange }: Props) {
+export default function TagTable({ nodes, onChange, onDelete }: Props) {
   const [expanded, setExpanded] = useState<ExpandedState>({})
   const rows = useMemo(() => toTableRows(nodes), [nodes])
 
@@ -30,7 +31,10 @@ export default function TagTable({ nodes, onChange }: Props) {
             {row.getCanExpand() ? (
               <button
                 className="mr-1 w-5 rounded text-slate-700 hover:bg-slate-200"
-                onClick={row.getToggleExpandedHandler()}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  row.toggleExpanded()
+                }}
                 title={row.getIsExpanded() ? 'Collapse sequence' : 'Expand sequence'}
               >
                 {row.getIsExpanded() ? '▼' : '▶'}
@@ -77,8 +81,30 @@ export default function TagTable({ nodes, onChange }: Props) {
           return <span className="font-mono text-xs">{value === 4294967295 ? 'Undefined' : value}</span>
         },
       },
+      {
+        id: 'actions',
+        header: '',
+        cell: ({ row }) => {
+          const isPixelData = row.original.kind === 'Element' && row.original.tag === '(7FE0,0010)'
+          return (
+            <button
+              className="rounded px-2 py-0.5 text-xs text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
+              disabled={isPixelData}
+              onClick={(event) => {
+                event.stopPropagation()
+                if (window.confirm(`Delete ${row.original.tag}?`)) {
+                  onDelete(row.original.path)
+                }
+              }}
+              title={isPixelData ? 'Pixel Data cannot be deleted here' : `Delete ${row.original.tag}`}
+            >
+              Delete
+            </button>
+          )
+        },
+      },
     ],
-    [onChange],
+    [onChange, onDelete],
   )
 
   const table = useReactTable({
@@ -109,6 +135,7 @@ export default function TagTable({ nodes, onChange }: Props) {
           <col className="w-20" />
           <col />
           <col className="w-28" />
+          <col className="w-24" />
         </colgroup>
         <thead className="sticky top-0 z-10 bg-slate-700 text-left text-xs uppercase tracking-wide text-white">
           {table.getHeaderGroups().map((headerGroup) => (

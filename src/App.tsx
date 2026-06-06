@@ -24,9 +24,12 @@ export default function App() {
         </div>
       ) : null}
       <section className="min-h-0 flex-1 overflow-hidden p-4">
-        <TagTable nodes={dicom.nodes} onChange={dicom.updateNodeValue} />
+        <TagTable
+          nodes={dicom.nodes}
+          onChange={dicom.updateNodeValue}
+          onDelete={dicom.deleteNodeByPath}
+        />
       </section>
     </main>
   )
 }
-
