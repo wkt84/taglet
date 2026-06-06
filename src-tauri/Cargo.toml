@@ -1,0 +1,26 @@
+[package]
+name = "taglet"
+version = "0.1.0"
+description = "A DICOM tag editor"
+authors = ["Taglet contributors"]
+edition = "2021"
+
+[lib]
+name = "taglet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+chrono = "0.4"
+dicom-core = "0.7"
+dicom-dictionary-std = "0.7"
+dicom-object = "0.7"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["full"] }
+
