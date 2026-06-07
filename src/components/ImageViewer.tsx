@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomFramePixels, DicomImageInfo } from '../types/dicom'
 
@@ -12,6 +12,13 @@ function valueText(value: unknown) {
   return String(value)
 }
 
+function formatWindowNumber(value: number) {
+  if (!Number.isFinite(value)) return '0'
+  if (Math.abs(value) >= 1000) return value.toFixed(0)
+  if (Math.abs(value) >= 10) return value.toFixed(2)
+  return value.toPrecision(4).replace(/\.?0+$/, '')
+}
+
 function base64ToBytes(value: string) {
   const binary = window.atob(value)
   const bytes = new Uint8Array(binary.length)
@@ -21,13 +28,11 @@ function base64ToBytes(value: string) {
   return bytes
 }
 
-function renderFrameToRgba(frame: DicomFramePixels, windowCenter: number, windowWidth: number) {
+function decodeFrameValues(frame: DicomFramePixels) {
   const pixelBytes = base64ToBytes(frame.pixel_base64)
   const sampleCount = frame.width * frame.height
-  const rgba = new Uint8ClampedArray(sampleCount * 4)
+  const values = new Float64Array(sampleCount)
   const signed = frame.pixel_representation === 1
-  const invert = frame.photometric_interpretation === 'MONOCHROME1'
-  const low = windowCenter - windowWidth / 2
   const view = new DataView(pixelBytes.buffer, pixelBytes.byteOffset, pixelBytes.byteLength)
 
   for (let index = 0; index < sampleCount; index += 1) {
@@ -35,11 +40,49 @@ function renderFrameToRgba(frame: DicomFramePixels, windowCenter: number, window
     if (frame.bits_allocated === 8) {
       stored = signed ? view.getInt8(index) : view.getUint8(index)
     } else {
-      const offset = index * 2
-      stored = signed ? view.getInt16(offset, true) : view.getUint16(offset, true)
+      const bytesPerSample = frame.bits_allocated / 8
+      const offset = index * bytesPerSample
+      if (frame.bits_allocated === 16) {
+        stored = signed ? view.getInt16(offset, true) : view.getUint16(offset, true)
+      } else {
+        stored = signed ? view.getInt32(offset, true) : view.getUint32(offset, true)
+      }
     }
 
-    const value = stored * frame.rescale_slope + frame.rescale_intercept
+    values[index] = stored * frame.rescale_slope + frame.rescale_intercept
+  }
+
+  return values
+}
+
+function buildHistogram(values: Float64Array | undefined, min: number, max: number, binCount = 96) {
+  if (!values || values.length === 0 || max <= min) return []
+  const bins = Array.from({ length: binCount }, () => 0)
+  const scale = (binCount - 1) / (max - min)
+  const stride = Math.max(1, Math.floor(values.length / 250_000))
+
+  for (let index = 0; index < values.length; index += stride) {
+    const bin = Math.min(binCount - 1, Math.max(0, Math.floor((values[index] - min) * scale)))
+    bins[bin] += 1
+  }
+
+  const peak = Math.max(...bins, 1)
+  return bins.map((count) => count / peak)
+}
+
+function renderFrameToRgba(
+  frame: DicomFramePixels,
+  values: Float64Array,
+  rgba: Uint8ClampedArray<ArrayBuffer>,
+  windowCenter: number,
+  windowWidth: number,
+) {
+  const sampleCount = frame.width * frame.height
+  const invert = frame.photometric_interpretation === 'MONOCHROME1'
+  const low = windowCenter - windowWidth / 2
+
+  for (let index = 0; index < sampleCount; index += 1) {
+    const value = values[index]
     const normalized = Math.min(1, Math.max(0, (value - low) / windowWidth))
     const gray = Math.round((invert ? 1 - normalized : normalized) * 255)
     const rgbaOffset = index * 4
@@ -55,7 +98,12 @@ function renderFrameToRgba(frame: DicomFramePixels, windowCenter: number, window
 export default function ImageViewer({ onClose }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
+  const histogramTrackRef = useRef<HTMLDivElement>(null)
+  const rgbaBufferRef = useRef<Uint8ClampedArray<ArrayBuffer>>()
   const dragRef = useRef<{ x: number; y: number; panX: number; panY: number }>()
+  const histogramDragRef = useRef<'low' | 'high' | 'window'>()
+  const pendingWindowBoundsRef = useRef<{ low: number; high: number }>()
+  const windowUpdateFrameRef = useRef<number>()
   const [imageInfo, setImageInfo] = useState<DicomImageInfo>()
   const [framePixels, setFramePixels] = useState<DicomFramePixels>()
   const [frameIndex, setFrameIndex] = useState(0)
@@ -67,6 +115,29 @@ export default function ImageViewer({ onClose }: Props) {
   const [error, setError] = useState<string>()
   const [loading, setLoading] = useState(true)
   const [frameLoading, setFrameLoading] = useState(false)
+
+  const decodedValues = useMemo(() => {
+    if (!framePixels) return undefined
+    return decodeFrameValues(framePixels)
+  }, [framePixels])
+
+  const histogramMin = framePixels?.min_value ?? 0
+  const histogramMax = framePixels?.max_value ?? 1
+  const histogramRange = Math.max(0, histogramMax - histogramMin)
+  const minWindowWidth = Math.max(histogramRange / 4096, 1e-6)
+  const windowStep = Math.max(histogramRange / 2048, 1e-6)
+  const effectiveWindowCenter = useAutoWindow && framePixels
+    ? (framePixels.min_value + framePixels.max_value) / 2
+    : (windowCenter ?? 0)
+  const effectiveWindowWidth = useAutoWindow && framePixels
+    ? Math.max(minWindowWidth, framePixels.max_value - framePixels.min_value)
+    : Math.max(minWindowWidth, windowWidth ?? minWindowWidth)
+  const windowLow = effectiveWindowCenter - effectiveWindowWidth / 2
+  const windowHigh = effectiveWindowCenter + effectiveWindowWidth / 2
+  const histogram = useMemo(
+    () => buildHistogram(decodedValues, histogramMin, histogramMax),
+    [decodedValues, histogramMin, histogramMax],
+  )
 
   useEffect(() => {
     let canceled = false
@@ -111,8 +182,10 @@ export default function ImageViewer({ onClose }: Props) {
         if (!canceled) {
           setFramePixels(frame)
           if (useAutoWindow) {
+            const frameRange = Math.max(0, frame.max_value - frame.min_value)
+            const frameMinWindowWidth = Math.max(frameRange / 4096, 1e-6)
             setWindowCenter((frame.min_value + frame.max_value) / 2)
-            setWindowWidth(Math.max(1, frame.max_value - frame.min_value))
+            setWindowWidth(Math.max(frameMinWindowWidth, frameRange))
           }
         }
       })
@@ -129,7 +202,15 @@ export default function ImageViewer({ onClose }: Props) {
   }, [frameIndex, imageInfo?.supported])
 
   useEffect(() => {
-    if (!framePixels || !canvasRef.current) return
+    return () => {
+      if (windowUpdateFrameRef.current !== undefined) {
+        window.cancelAnimationFrame(windowUpdateFrameRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!framePixels || !decodedValues || !canvasRef.current) return
 
     const canvas = canvasRef.current
     canvas.width = framePixels.width
@@ -137,19 +218,24 @@ export default function ImageViewer({ onClose }: Props) {
     const context = canvas.getContext('2d')
     if (!context) return
 
-    const center = useAutoWindow
-      ? (framePixels.min_value + framePixels.max_value) / 2
-      : (windowCenter ?? 0)
-    const width = useAutoWindow
-      ? Math.max(1, framePixels.max_value - framePixels.min_value)
-      : Math.max(1, windowWidth ?? 1)
+    const rgbaLength = framePixels.width * framePixels.height * 4
+    if (rgbaBufferRef.current?.length !== rgbaLength) {
+      rgbaBufferRef.current = new Uint8ClampedArray(new ArrayBuffer(rgbaLength))
+    }
+
     const imageData = new ImageData(
-      renderFrameToRgba(framePixels, center, width),
+      renderFrameToRgba(
+        framePixels,
+        decodedValues,
+        rgbaBufferRef.current,
+        effectiveWindowCenter,
+        effectiveWindowWidth,
+      ),
       framePixels.width,
       framePixels.height,
     )
     context.putImageData(imageData, 0, 0)
-  }, [framePixels, useAutoWindow, windowCenter, windowWidth])
+  }, [decodedValues, effectiveWindowCenter, effectiveWindowWidth, framePixels])
 
   useEffect(() => {
     if (!framePixels || !viewportRef.current) return
@@ -163,12 +249,6 @@ export default function ImageViewer({ onClose }: Props) {
     setZoom(Number.isFinite(fitZoom) && fitZoom > 0 ? fitZoom : 1)
     setPan({ x: 0, y: 0 })
   }, [framePixels?.width, framePixels?.height])
-
-  const defaultCenter = imageInfo?.window_center[0] ?? 0
-  const defaultWidth = imageInfo?.window_width[0] ?? 400
-  const windowCenterMin = defaultCenter - Math.max(defaultWidth * 4, 2048)
-  const windowCenterMax = defaultCenter + Math.max(defaultWidth * 4, 2048)
-  const windowWidthMax = Math.max(defaultWidth * 4, 4096)
 
   function fitImage() {
     if (!framePixels || !viewportRef.current) return
@@ -188,7 +268,66 @@ export default function ImageViewer({ onClose }: Props) {
       setWindowWidth(imageInfo.window_width[0])
       setUseAutoWindow(false)
     } else {
-      setUseAutoWindow(true)
+      setAutoWindow(true)
+    }
+  }
+
+  function setAutoWindow(enabled: boolean) {
+    setUseAutoWindow(enabled)
+    if (enabled && framePixels) {
+      const frameRange = Math.max(0, framePixels.max_value - framePixels.min_value)
+      const frameMinWindowWidth = Math.max(frameRange / 4096, 1e-6)
+      setWindowCenter((framePixels.min_value + framePixels.max_value) / 2)
+      setWindowWidth(Math.max(frameMinWindowWidth, frameRange))
+    }
+  }
+
+  function setWindowBounds(low: number, high: number) {
+    const nextLow = Math.min(low, high - minWindowWidth)
+    const nextHigh = Math.max(high, nextLow + minWindowWidth)
+    setWindowCenter((nextLow + nextHigh) / 2)
+    setWindowWidth(nextHigh - nextLow)
+    setUseAutoWindow(false)
+  }
+
+  function scheduleWindowBounds(low: number, high: number) {
+    pendingWindowBoundsRef.current = { low, high }
+    if (windowUpdateFrameRef.current !== undefined) return
+
+    windowUpdateFrameRef.current = window.requestAnimationFrame(() => {
+      windowUpdateFrameRef.current = undefined
+      const bounds = pendingWindowBoundsRef.current
+      pendingWindowBoundsRef.current = undefined
+      if (bounds) setWindowBounds(bounds.low, bounds.high)
+    })
+  }
+
+  function valueToHistogramPercent(value: number) {
+    if (histogramMax <= histogramMin) return 50
+    const normalized = (value - histogramMin) / (histogramMax - histogramMin)
+    return Math.min(100, Math.max(0, 100 - normalized * 100))
+  }
+
+  function histogramEventValue(event: MouseEvent<HTMLElement>) {
+    const rect = histogramTrackRef.current?.getBoundingClientRect()
+    if (!rect) return histogramMin
+    const normalized = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height))
+    return histogramMax - normalized * (histogramMax - histogramMin)
+  }
+
+  function updateHistogramWindow(event: MouseEvent<HTMLElement>) {
+    if (!histogramDragRef.current || !framePixels) return
+    const value = histogramEventValue(event)
+    const clamped = Math.min(histogramMax, Math.max(histogramMin, value))
+
+    if (histogramDragRef.current === 'low') {
+      scheduleWindowBounds(clamped, Math.max(clamped + minWindowWidth, windowHigh))
+    } else if (histogramDragRef.current === 'high') {
+      scheduleWindowBounds(Math.min(windowLow, clamped - minWindowWidth), clamped)
+    } else {
+      const width = Math.max(minWindowWidth, windowHigh - windowLow)
+      const low = Math.min(histogramMax - width, Math.max(histogramMin, clamped - width / 2))
+      scheduleWindowBounds(low, low + width)
     }
   }
 
@@ -210,50 +349,111 @@ export default function ImageViewer({ onClose }: Props) {
               <span className="max-w-md text-sm text-red-300">{error}</span>
             ) : imageInfo?.supported ? (
               <div className="flex h-full w-full flex-col items-center justify-center gap-3 p-3">
-                <div
-                  ref={viewportRef}
-                  className="relative min-h-0 w-full flex-1 cursor-grab overflow-hidden active:cursor-grabbing"
-                  onMouseDown={(event) => {
-                    dragRef.current = {
-                      x: event.clientX,
-                      y: event.clientY,
-                      panX: pan.x,
-                      panY: pan.y,
-                    }
-                  }}
-                  onMouseMove={(event) => {
-                    if (!dragRef.current) return
-                    setPan({
-                      x: dragRef.current.panX + event.clientX - dragRef.current.x,
-                      y: dragRef.current.panY + event.clientY - dragRef.current.y,
-                    })
-                  }}
-                  onMouseUp={() => {
-                    dragRef.current = undefined
-                  }}
-                  onMouseLeave={() => {
-                    dragRef.current = undefined
-                  }}
-                  onWheel={(event) => {
-                    event.preventDefault()
-                    const factor = event.deltaY < 0 ? 1.1 : 0.9
-                    setZoom((current) => Math.min(8, Math.max(0.05, current * factor)))
-                  }}
-                >
-                  <canvas
-                    ref={canvasRef}
-                    className="absolute left-1/2 top-1/2 bg-black [image-rendering:auto]"
-                    style={{
-                      width: framePixels ? `${framePixels.width * zoom}px` : undefined,
-                      height: framePixels ? `${framePixels.height * zoom}px` : undefined,
-                      transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
+                <div className="flex min-h-0 w-full flex-1 gap-3">
+                  <div
+                    ref={viewportRef}
+                    className="relative min-h-0 flex-1 cursor-grab overflow-hidden active:cursor-grabbing"
+                    onMouseDown={(event) => {
+                      dragRef.current = {
+                        x: event.clientX,
+                        y: event.clientY,
+                        panX: pan.x,
+                        panY: pan.y,
+                      }
                     }}
-                  />
-                  {frameLoading ? (
-                    <div className="absolute left-3 top-3 rounded bg-slate-900/80 px-2 py-1 text-xs text-slate-300">
-                      Loading frame...
+                    onMouseMove={(event) => {
+                      if (!dragRef.current) return
+                      setPan({
+                        x: dragRef.current.panX + event.clientX - dragRef.current.x,
+                        y: dragRef.current.panY + event.clientY - dragRef.current.y,
+                      })
+                    }}
+                    onMouseUp={() => {
+                      dragRef.current = undefined
+                    }}
+                    onMouseLeave={() => {
+                      dragRef.current = undefined
+                    }}
+                    onWheel={(event) => {
+                      event.preventDefault()
+                      const factor = event.deltaY < 0 ? 1.1 : 0.9
+                      setZoom((current) => Math.min(8, Math.max(0.05, current * factor)))
+                    }}
+                  >
+                    <canvas
+                      ref={canvasRef}
+                      className="absolute left-1/2 top-1/2 bg-black [image-rendering:auto]"
+                      style={{
+                        width: framePixels ? `${framePixels.width * zoom}px` : undefined,
+                        height: framePixels ? `${framePixels.height * zoom}px` : undefined,
+                        transform: `translate(calc(-50% + ${pan.x}px), calc(-50% + ${pan.y}px))`,
+                      }}
+                    />
+                    {frameLoading ? (
+                      <div className="absolute left-3 top-3 rounded bg-slate-900/80 px-2 py-1 text-xs text-slate-300">
+                        Loading frame...
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="flex w-20 flex-col items-center gap-2 text-[10px] text-slate-400">
+                    <div className="font-mono">{formatWindowNumber(histogramMax)}</div>
+                    <div
+                      ref={histogramTrackRef}
+                      className="relative min-h-0 w-14 flex-1 cursor-ns-resize rounded border border-slate-600 bg-slate-900"
+                      onMouseDown={(event) => {
+                        histogramDragRef.current = 'window'
+                        updateHistogramWindow(event)
+                      }}
+                      onMouseMove={updateHistogramWindow}
+                      onMouseUp={() => {
+                        histogramDragRef.current = undefined
+                      }}
+                      onMouseLeave={() => {
+                        histogramDragRef.current = undefined
+                      }}
+                    >
+                      {histogram.map((count, index) => (
+                        <div
+                          key={index}
+                          className="absolute right-1 bg-cyan-400/70"
+                          style={{
+                            bottom: `${(index / Math.max(1, histogram.length)) * 100}%`,
+                            height: `${100 / Math.max(1, histogram.length)}%`,
+                            width: `${Math.max(1, count * 44)}px`,
+                          }}
+                        />
+                      ))}
+                      <div
+                        className="absolute left-0 right-0 bg-amber-300/20"
+                        style={{
+                          top: `${valueToHistogramPercent(windowHigh)}%`,
+                          height: `${Math.max(2, valueToHistogramPercent(windowLow) - valueToHistogramPercent(windowHigh))}%`,
+                        }}
+                      />
+                      <button
+                        className="absolute left-1/2 h-3 w-16 -translate-x-1/2 -translate-y-1/2 rounded border border-amber-100 bg-amber-300 shadow"
+                        style={{ top: `${valueToHistogramPercent(windowHigh)}%` }}
+                        title="Window upper bound"
+                        onMouseDown={(event) => {
+                          event.stopPropagation()
+                          histogramDragRef.current = 'high'
+                          updateHistogramWindow(event)
+                        }}
+                      />
+                      <button
+                        className="absolute left-1/2 h-3 w-16 -translate-x-1/2 -translate-y-1/2 rounded border border-amber-100 bg-amber-300 shadow"
+                        style={{ top: `${valueToHistogramPercent(windowLow)}%` }}
+                        title="Window lower bound"
+                        onMouseDown={(event) => {
+                          event.stopPropagation()
+                          histogramDragRef.current = 'low'
+                          updateHistogramWindow(event)
+                        }}
+                      />
                     </div>
-                  ) : null}
+                    <div className="font-mono">{formatWindowNumber(histogramMin)}</div>
+                  </div>
                 </div>
                 {imageInfo.number_of_frames > 1 ? (
                   <label className="flex w-full max-w-md items-center gap-3 text-xs text-slate-300">
@@ -292,51 +492,57 @@ export default function ImageViewer({ onClose }: Props) {
                     <input
                       type="checkbox"
                       checked={useAutoWindow}
-                      onChange={(event) => setUseAutoWindow(event.target.checked)}
+                      onChange={(event) => setAutoWindow(event.target.checked)}
                     />
                     Auto min/max
                   </label>
-                  <label className="block text-xs text-slate-600">
-                    WL
-                    <input
-                      className="mt-1 w-full"
-                      type="range"
-                      min={windowCenterMin}
-                      max={windowCenterMax}
-                      step={1}
-                      disabled={useAutoWindow || windowCenter === undefined}
-                      value={windowCenter ?? 0}
-                      onChange={(event) => setWindowCenter(Number(event.target.value))}
-                    />
-                    <input
-                      className="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
-                      type="number"
-                      disabled={useAutoWindow}
-                      value={windowCenter ?? 0}
-                      onChange={(event) => setWindowCenter(Number(event.target.value))}
-                    />
-                  </label>
-                  <label className="block text-xs text-slate-600">
-                    WW
-                    <input
-                      className="mt-1 w-full"
-                      type="range"
-                      min={1}
-                      max={windowWidthMax}
-                      step={1}
-                      disabled={useAutoWindow || windowWidth === undefined}
-                      value={windowWidth ?? 1}
-                      onChange={(event) => setWindowWidth(Number(event.target.value))}
-                    />
-                    <input
-                      className="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
-                      type="number"
-                      min={1}
-                      disabled={useAutoWindow}
-                      value={windowWidth ?? 1}
-                      onChange={(event) => setWindowWidth(Math.max(1, Number(event.target.value)))}
-                    />
-                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="block text-xs text-slate-600">
+                      Low
+                      <input
+                        className="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+                        type="number"
+                        step={windowStep}
+                        disabled={useAutoWindow}
+                        value={Number.isFinite(windowLow) ? formatWindowNumber(windowLow) : '0'}
+                        onChange={(event) => setWindowBounds(Number(event.target.value), windowHigh)}
+                      />
+                    </label>
+                    <label className="block text-xs text-slate-600">
+                      High
+                      <input
+                        className="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+                        type="number"
+                        step={windowStep}
+                        disabled={useAutoWindow}
+                        value={Number.isFinite(windowHigh) ? formatWindowNumber(windowHigh) : '1'}
+                        onChange={(event) => setWindowBounds(windowLow, Number(event.target.value))}
+                      />
+                    </label>
+                    <label className="block text-xs text-slate-600">
+                      WL
+                      <input
+                        className="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+                        type="number"
+                        step={windowStep}
+                        disabled={useAutoWindow}
+                        value={windowCenter === undefined ? '0' : formatWindowNumber(windowCenter)}
+                        onChange={(event) => setWindowCenter(Number(event.target.value))}
+                      />
+                    </label>
+                    <label className="block text-xs text-slate-600">
+                      WW
+                      <input
+                        className="mt-1 w-full rounded border border-slate-300 px-2 py-1 font-mono text-xs"
+                        type="number"
+                        min={minWindowWidth}
+                        step={windowStep}
+                        disabled={useAutoWindow}
+                        value={windowWidth === undefined ? formatWindowNumber(minWindowWidth) : formatWindowNumber(windowWidth)}
+                        onChange={(event) => setWindowWidth(Math.max(minWindowWidth, Number(event.target.value)))}
+                      />
+                    </label>
+                  </div>
                   <button className="rounded bg-slate-700 px-3 py-1.5 text-xs text-white hover:bg-slate-600" onClick={resetWindow}>
                     Reset to DICOM
                   </button>
@@ -398,6 +604,8 @@ export default function ImageViewer({ onClose }: Props) {
                 <dd>
                   slope {valueText(imageInfo.rescale_slope)}, intercept {valueText(imageInfo.rescale_intercept)}
                 </dd>
+                <dt className="text-slate-500">Dose Grid Scaling</dt>
+                <dd>{valueText(imageInfo.dose_grid_scaling)}</dd>
               </dl>
                 </section>
               </div>

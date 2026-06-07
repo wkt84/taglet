@@ -11,6 +11,7 @@ use std::str::FromStr;
 use super::model::{DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo};
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
+const DOSE_GRID_SCALING: Tag = Tag(0x3004, 0x000E);
 
 pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, Vec<DicomNode>), String> {
     let obj = OpenFileOptions::new()
@@ -63,6 +64,7 @@ pub fn image_info(obj: &DefaultDicomObject) -> Result<DicomImageInfo, String> {
     let window_width = get_f64_values(obj, tags::WINDOW_WIDTH);
     let rescale_intercept = get_f64_values(obj, tags::RESCALE_INTERCEPT).into_iter().next();
     let rescale_slope = get_f64_values(obj, tags::RESCALE_SLOPE).into_iter().next();
+    let dose_grid_scaling = get_f64_values(obj, DOSE_GRID_SCALING).into_iter().next();
 
     let unsupported_reason = image_unsupported_reason(
         has_pixel_data,
@@ -95,6 +97,7 @@ pub fn image_info(obj: &DefaultDicomObject) -> Result<DicomImageInfo, String> {
         window_width,
         rescale_intercept,
         rescale_slope,
+        dose_grid_scaling,
     })
 }
 
@@ -127,11 +130,7 @@ pub fn frame_image(
     let bits_allocated = info
         .bits_allocated
         .ok_or_else(|| "Bits Allocated is missing".to_string())?;
-    let bytes_per_sample = match bits_allocated {
-        8 => 1usize,
-        16 => 2usize,
-        other => return Err(format!("Bits Allocated {other} is not supported yet")),
-    };
+    let bytes_per_sample = bytes_per_sample(bits_allocated)?;
     let frame_sample_count = width as usize * height as usize * samples_per_pixel as usize;
     let frame_byte_len = frame_sample_count
         .checked_mul(bytes_per_sample)
@@ -156,31 +155,11 @@ pub fn frame_image(
 
     let frame = &pixel_bytes[frame_offset..frame_offset + frame_byte_len];
     let signed = info.pixel_representation.unwrap_or(0) == 1;
-    let slope = info.rescale_slope.unwrap_or(1.0);
-    let intercept = info.rescale_intercept.unwrap_or(0.0);
+    let (slope, intercept) = pixel_value_transform(&info);
     let mut values = Vec::with_capacity(width as usize * height as usize);
 
     for index in 0..frame_sample_count {
-        let stored = match bits_allocated {
-            8 => {
-                let value = frame[index];
-                if signed {
-                    i8::from_le_bytes([value]) as f64
-                } else {
-                    value as f64
-                }
-            }
-            16 => {
-                let offset = index * 2;
-                let bytes = [frame[offset], frame[offset + 1]];
-                if signed {
-                    i16::from_le_bytes(bytes) as f64
-                } else {
-                    u16::from_le_bytes(bytes) as f64
-                }
-            }
-            _ => unreachable!(),
-        };
+        let stored = stored_pixel_value(frame, index, bits_allocated, signed);
         values.push(stored * slope + intercept);
     }
 
@@ -226,11 +205,7 @@ pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomF
     let bits_allocated = info
         .bits_allocated
         .ok_or_else(|| "Bits Allocated is missing".to_string())?;
-    let bytes_per_sample = match bits_allocated {
-        8 => 1usize,
-        16 => 2usize,
-        other => return Err(format!("Bits Allocated {other} is not supported yet")),
-    };
+    let bytes_per_sample = bytes_per_sample(bits_allocated)?;
     let frame_sample_count = width as usize * height as usize * samples_per_pixel as usize;
     let frame_byte_len = frame_sample_count
         .checked_mul(bytes_per_sample)
@@ -255,8 +230,7 @@ pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomF
 
     let frame = &pixel_bytes[frame_offset..frame_offset + frame_byte_len];
     let signed = info.pixel_representation.unwrap_or(0) == 1;
-    let slope = info.rescale_slope.unwrap_or(1.0);
-    let intercept = info.rescale_intercept.unwrap_or(0.0);
+    let (slope, intercept) = pixel_value_transform(&info);
     let (min_value, max_value) =
         frame_min_max(frame, bits_allocated, signed, slope, intercept, frame_sample_count);
 
@@ -269,6 +243,7 @@ pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomF
         photometric_interpretation: info.photometric_interpretation,
         rescale_intercept: intercept,
         rescale_slope: slope,
+        dose_grid_scaling: info.dose_grid_scaling,
         pixel_base64: base64::engine::general_purpose::STANDARD.encode(frame),
         min_value,
         max_value,
@@ -581,6 +556,63 @@ fn grayscale_to_rgba(values: &[f64], center: f64, width: f64, invert: bool) -> V
     rgba
 }
 
+fn bytes_per_sample(bits_allocated: u32) -> Result<usize, String> {
+    match bits_allocated {
+        8 => Ok(1),
+        16 => Ok(2),
+        32 => Ok(4),
+        other => Err(format!("Bits Allocated {other} is not supported yet")),
+    }
+}
+
+fn pixel_value_transform(info: &DicomImageInfo) -> (f64, f64) {
+    if let Some(dose_grid_scaling) = info.dose_grid_scaling {
+        return (dose_grid_scaling, 0.0);
+    }
+
+    (
+        info.rescale_slope.unwrap_or(1.0),
+        info.rescale_intercept.unwrap_or(0.0),
+    )
+}
+
+fn stored_pixel_value(frame: &[u8], index: usize, bits_allocated: u32, signed: bool) -> f64 {
+    match bits_allocated {
+        8 => {
+            let value = frame[index];
+            if signed {
+                i8::from_le_bytes([value]) as f64
+            } else {
+                value as f64
+            }
+        }
+        16 => {
+            let offset = index * 2;
+            let bytes = [frame[offset], frame[offset + 1]];
+            if signed {
+                i16::from_le_bytes(bytes) as f64
+            } else {
+                u16::from_le_bytes(bytes) as f64
+            }
+        }
+        32 => {
+            let offset = index * 4;
+            let bytes = [
+                frame[offset],
+                frame[offset + 1],
+                frame[offset + 2],
+                frame[offset + 3],
+            ];
+            if signed {
+                i32::from_le_bytes(bytes) as f64
+            } else {
+                u32::from_le_bytes(bytes) as f64
+            }
+        }
+        _ => 0.0,
+    }
+}
+
 fn frame_min_max(
     frame: &[u8],
     bits_allocated: u32,
@@ -593,27 +625,7 @@ fn frame_min_max(
     let mut max_value = f64::NEG_INFINITY;
 
     for index in 0..sample_count {
-        let stored = match bits_allocated {
-            8 => {
-                let value = frame[index];
-                if signed {
-                    i8::from_le_bytes([value]) as f64
-                } else {
-                    value as f64
-                }
-            }
-            16 => {
-                let offset = index * 2;
-                let bytes = [frame[offset], frame[offset + 1]];
-                if signed {
-                    i16::from_le_bytes(bytes) as f64
-                } else {
-                    u16::from_le_bytes(bytes) as f64
-                }
-            }
-            _ => 0.0,
-        } * slope
-            + intercept;
+        let stored = stored_pixel_value(frame, index, bits_allocated, signed) * slope + intercept;
         min_value = min_value.min(stored);
         max_value = max_value.max(stored);
     }
@@ -622,5 +634,45 @@ fn frame_min_max(
         (min_value, max_value)
     } else {
         (0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_unsigned_32_bit_pixels() {
+        let frame = [
+            0x78, 0x56, 0x34, 0x12,
+            0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+
+        assert_eq!(stored_pixel_value(&frame, 0, 32, false), 0x1234_5678 as f64);
+        assert_eq!(stored_pixel_value(&frame, 1, 32, false), u32::MAX as f64);
+    }
+
+    #[test]
+    fn decodes_signed_32_bit_pixels() {
+        let frame = [
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0x00, 0x00, 0x00, 0x80,
+        ];
+
+        assert_eq!(stored_pixel_value(&frame, 0, 32, true), -1.0);
+        assert_eq!(stored_pixel_value(&frame, 1, 32, true), i32::MIN as f64);
+    }
+
+    #[test]
+    fn applies_dose_grid_scaling_to_min_max() {
+        let frame = [
+            0x00, 0x00, 0x00, 0x00,
+            0x10, 0x27, 0x00, 0x00,
+        ];
+
+        let (min, max) = frame_min_max(&frame, 32, false, 0.001, 0.0, 2);
+
+        assert_eq!(min, 0.0);
+        assert_eq!(max, 10.0);
     }
 }

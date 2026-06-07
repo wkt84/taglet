@@ -45,6 +45,7 @@ export type DicomImageInfo = {
   window_width: number[]
   rescale_intercept?: number | null
   rescale_slope?: number | null
+  dose_grid_scaling?: number | null
 }
 
 export type DicomFrameImage = {
@@ -63,6 +64,7 @@ export type DicomFramePixels = {
   photometric_interpretation?: string | null
   rescale_intercept: number
   rescale_slope: number
+  dose_grid_scaling?: number | null
   pixel_base64: string
   min_value: number
   max_value: number

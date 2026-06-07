@@ -57,6 +57,7 @@ pub struct DicomImageInfo {
     pub window_width: Vec<f64>,
     pub rescale_intercept: Option<f64>,
     pub rescale_slope: Option<f64>,
+    pub dose_grid_scaling: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -77,6 +78,7 @@ pub struct DicomFramePixels {
     pub photometric_interpretation: Option<String>,
     pub rescale_intercept: f64,
     pub rescale_slope: f64,
+    pub dose_grid_scaling: Option<f64>,
     pub pixel_base64: String,
     pub min_value: f64,
     pub max_value: f64,
