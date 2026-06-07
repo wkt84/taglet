@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use dicom_object::DefaultDicomObject;
@@ -15,6 +16,48 @@ struct StoredDicomObject {
 pub struct DicomStore {
     objects: Mutex<HashMap<String, StoredDicomObject>>,
     current_path: Mutex<Option<String>>,
+}
+
+pub struct LaunchFileStore {
+    paths: Mutex<Vec<String>>,
+}
+
+impl Default for LaunchFileStore {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl LaunchFileStore {
+    pub fn from_env() -> Self {
+        Self {
+            paths: Mutex::new(
+                std::env::args_os()
+                    .skip(1)
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_file())
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect(),
+            ),
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn push_paths(&self, paths: Vec<String>) -> Result<(), String> {
+        self.paths
+            .lock()
+            .map_err(|_| "Launch file store lock poisoned".to_string())?
+            .extend(paths);
+        Ok(())
+    }
+
+    pub fn take_paths(&self) -> Result<Vec<String>, String> {
+        let mut paths = self
+            .paths
+            .lock()
+            .map_err(|_| "Launch file store lock poisoned".to_string())?;
+        Ok(std::mem::take(&mut *paths))
+    }
 }
 
 impl DicomStore {
@@ -54,6 +97,13 @@ impl DicomStore {
             .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
         f(object)
     }
+}
+
+#[tauri::command]
+pub async fn take_launch_file_paths(
+    store: State<'_, LaunchFileStore>,
+) -> Result<Vec<String>, String> {
+    store.take_paths()
 }
 
 #[tauri::command]

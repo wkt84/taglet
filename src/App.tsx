@@ -1,4 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import AddTagDialog from './components/AddTagDialog'
 import ImageViewer from './components/ImageViewer'
 import TagTable from './components/TagTable'
@@ -54,6 +57,7 @@ export default function App() {
   const [addingTag, setAddingTag] = useState(false)
   const [showingImageViewer, setShowingImageViewer] = useState(false)
   const [selectedPath, setSelectedPath] = useState<string[]>()
+  const openPath = dicom.openPath
   const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
   const existingTagsForTarget = useMemo(
     () => tagsAtPath(dicom.nodes, addTargetPath),
@@ -63,6 +67,56 @@ export default function App() {
     const name = fileName(dicom.filePath)
     return name ? `Taglet - ${name}` : 'Taglet'
   }, [dicom.filePath])
+
+  useEffect(() => {
+    let canceled = false
+    let unlistenDrop: (() => void) | undefined
+    let unlistenOpenFiles: (() => void) | undefined
+
+    async function openFirstPath(paths: string[]) {
+      const path = paths.find(Boolean)
+      if (!path) return
+      const opened = await openPath(path)
+      if (opened) {
+        setSelectedPath(undefined)
+        setAddingTag(false)
+        setShowingImageViewer(false)
+      }
+    }
+
+    invoke<string[]>('take_launch_file_paths')
+      .then((paths) => {
+        if (!canceled) void openFirstPath(paths)
+      })
+      .catch(() => {})
+
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === 'drop') {
+          void openFirstPath(event.payload.paths)
+        }
+      })
+      .then((unlisten) => {
+        unlistenDrop = unlisten
+        if (canceled) unlisten()
+      })
+      .catch(() => {})
+
+    listen<string[]>('taglet://open-files', (event) => {
+      void openFirstPath(event.payload)
+    })
+      .then((unlisten) => {
+        unlistenOpenFiles = unlisten
+        if (canceled) unlisten()
+      })
+      .catch(() => {})
+
+    return () => {
+      canceled = true
+      unlistenDrop?.()
+      unlistenOpenFiles?.()
+    }
+  }, [openPath])
 
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">

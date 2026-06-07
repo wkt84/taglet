@@ -6,7 +6,7 @@ type Props = {
   nodes: DicomNode[]
   loading: boolean
   dirty: boolean
-  openFile: () => Promise<void>
+  openFile: () => Promise<boolean>
   closeFile: () => boolean
   openAddTagDialog: () => void
   openImageViewer: () => void

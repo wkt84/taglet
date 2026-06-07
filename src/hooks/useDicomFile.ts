@@ -100,27 +100,44 @@ export function useDicomFile() {
   const [dirty, setDirty] = useState(false)
   const [error, setError] = useState<string>()
 
+  const openPath = useCallback(async (path: string) => {
+    if (dirty && !window.confirm('Discard unsaved changes and open another file?')) return false
+
+    setError(undefined)
+    setLoading(true)
+    try {
+      const loaded = await invoke<DicomNode[]>('open_dicom_file', { path })
+      setFilePath(path)
+      setNodes(loaded)
+      setDirty(false)
+      return true
+    } catch (error) {
+      setError(String(error))
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }, [dirty])
+
   const openFile = useCallback(async () => {
     setError(undefined)
     setLoading(true)
     try {
       const selected = await open({
         multiple: false,
-        filters: [{ name: 'DICOM', extensions: ['dcm', 'dicom'] }],
+        title: 'Open DICOM file',
       })
 
-      if (typeof selected !== 'string') return
+      if (typeof selected !== 'string') return false
 
-      const loaded = await invoke<DicomNode[]>('open_dicom_file', { path: selected })
-      setFilePath(selected)
-      setNodes(loaded)
-      setDirty(false)
+      return await openPath(selected)
     } catch (error) {
       setError(String(error))
+      return false
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [openPath])
 
   const saveFile = useCallback(async () => {
     if (!filePath) return
@@ -203,6 +220,7 @@ export function useDicomFile() {
       dirty,
       error,
       openFile,
+      openPath,
       closeFile,
       saveFile,
       saveFileAs,
@@ -220,6 +238,7 @@ export function useDicomFile() {
       loading,
       nodes,
       openFile,
+      openPath,
       saveFile,
       saveFileAs,
       updateNodeValue,

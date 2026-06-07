@@ -35,14 +35,16 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
                 className={`mr-1 w-5 rounded ${
                   row.original.kind === 'Sequence'
                     ? 'text-slate-100 hover:bg-white/10'
-                    : 'text-slate-700 hover:bg-slate-200'
+                    : row.original.kind === 'Item'
+                      ? 'text-blue-800 hover:bg-blue-100'
+                      : 'text-slate-700 hover:bg-slate-200'
                 }`}
                 onClick={(event) => {
                   event.stopPropagation()
                   onSelect(row.original.path)
                   row.toggleExpanded()
                 }}
-                title={row.getIsExpanded() ? 'Collapse sequence' : 'Expand sequence'}
+                title={row.getIsExpanded() ? 'Collapse' : 'Expand'}
               >
                 {row.getIsExpanded() ? '▼' : '▶'}
               </button>
@@ -62,7 +64,9 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
         accessorKey: 'vr',
         header: 'VR',
         cell: ({ row }) => (
-          <span className="font-mono text-xs">{row.original.kind === 'Element' ? row.original.vr : 'SQ'}</span>
+          <span className="font-mono text-xs">
+            {row.original.kind === 'Element' ? row.original.vr : row.original.kind === 'Sequence' ? 'SQ' : ''}
+          </span>
         ),
       },
       {
@@ -74,6 +78,10 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
               element={row.original as DicomElement}
               onCommit={(value) => onChange(row.original.path, value)}
             />
+          ) : row.original.kind === 'Item' ? (
+            <span className="inline-flex items-center rounded bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
+              {row.original.childCount} {row.original.childCount === 1 ? 'tag' : 'tags'}
+            </span>
           ) : (
             <span className="inline-flex items-center rounded bg-white/15 px-2 py-0.5 text-xs font-medium text-white ring-1 ring-white/20">
               {row.original.items.length} {row.original.items.length === 1 ? 'item' : 'items'}
@@ -93,17 +101,24 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
         header: '',
         cell: ({ row }) => {
           const isPixelData = row.original.kind === 'Element' && row.original.tag === '(7FE0,0010)'
+          const isItem = row.original.kind === 'Item'
           return (
             <button
               className="rounded px-2 py-0.5 text-xs text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
-              disabled={isPixelData}
+              disabled={isPixelData || isItem}
               onClick={(event) => {
                 event.stopPropagation()
                 if (window.confirm(`Delete ${row.original.tag}?`)) {
                   onDelete(row.original.path)
                 }
               }}
-              title={isPixelData ? 'Pixel Data cannot be deleted here' : `Delete ${row.original.tag}`}
+              title={
+                isItem
+                  ? 'Sequence items cannot be deleted here yet'
+                  : isPixelData
+                    ? 'Pixel Data cannot be deleted here'
+                    : `Delete ${row.original.tag}`
+              }
             >
               Delete
             </button>
@@ -187,9 +202,21 @@ function toTableRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDi
       rowId,
       depth,
       itemIndex,
-      subRows: node.items.flatMap((item, sequenceItemIndex) =>
-        toTableRows(item, depth + 1, sequenceItemIndex),
-      ),
+      subRows: node.items.map((item, sequenceItemIndex) => {
+        const itemPath = [...node.path, `Item#${sequenceItemIndex}`]
+        return {
+          kind: 'Item',
+          tag: `Item #${sequenceItemIndex + 1}`,
+          description: `${node.description} item ${sequenceItemIndex + 1}`,
+          length: item.length,
+          path: itemPath,
+          rowId: `${itemPath.join('/')}`,
+          depth: depth + 1,
+          itemIndex: sequenceItemIndex,
+          childCount: item.length,
+          subRows: toTableRows(item, depth + 2, sequenceItemIndex),
+        }
+      }),
     }
   })
 }

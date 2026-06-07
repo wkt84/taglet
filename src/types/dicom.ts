@@ -77,6 +77,18 @@ export type TableDicomRow =
       itemIndex?: number
       subRows?: TableDicomRow[]
     })
+  | {
+      kind: 'Item'
+      tag: string
+      description: string
+      length: number
+      path: string[]
+      rowId: string
+      depth: number
+      itemIndex: number
+      childCount: number
+      subRows: TableDicomRow[]
+    }
   | (Omit<DicomSequence, 'items'> & {
       rowId: string
       depth: number
