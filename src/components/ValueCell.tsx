@@ -34,13 +34,13 @@ export default function ValueCell({ element, onCommit }: Props) {
   }, [draft, editing, element.editable, element.vr])
 
   if (!element.editable) {
-    return <span className="block truncate text-slate-500">{element.value}</span>
+    return <span className="dicom-value-font block truncate text-slate-500">{element.value}</span>
   }
 
   if (!editing) {
     return (
       <button
-        className="block w-full truncate rounded px-1 py-0.5 text-left hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-300"
+        className="dicom-value-font block w-full truncate rounded px-1 py-0.5 text-left hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-300"
         onClick={() => setEditing(true)}
         title={element.value}
       >
@@ -59,7 +59,7 @@ export default function ValueCell({ element, onCommit }: Props) {
     <div className="relative">
       <input
         autoFocus
-        className={`w-full rounded border px-2 py-1 text-sm outline-none ${
+        className={`dicom-value-font w-full rounded border px-2 py-1 text-sm outline-none ${
           validation.valid ? 'border-blue-300 ring-1 ring-blue-200' : 'border-red-500 ring-1 ring-red-300'
         }`}
         value={draft}

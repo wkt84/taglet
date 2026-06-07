@@ -32,7 +32,11 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
           <div className="flex items-center" style={{ paddingLeft: `${row.original.depth * 18}px` }}>
             {row.getCanExpand() ? (
               <button
-                className="mr-1 w-5 rounded text-slate-700 hover:bg-slate-200"
+                className={`mr-1 w-5 rounded ${
+                  row.original.kind === 'Sequence'
+                    ? 'text-slate-100 hover:bg-white/10'
+                    : 'text-slate-700 hover:bg-slate-200'
+                }`}
                 onClick={(event) => {
                   event.stopPropagation()
                   onSelect(row.original.path)
@@ -45,7 +49,7 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
             ) : (
               <span className="mr-1 w-5" />
             )}
-            <span className="font-mono text-xs">{String(getValue())}</span>
+            <span className="dicom-value-font text-xs">{String(getValue())}</span>
           </div>
         ),
       },
@@ -71,7 +75,7 @@ export default function TagTable({ nodes, selectedPath, onChange, onDelete, onSe
               onCommit={(value) => onChange(row.original.path, value)}
             />
           ) : (
-            <span className="inline-flex items-center rounded bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
+            <span className="inline-flex items-center rounded bg-white/15 px-2 py-0.5 text-xs font-medium text-white ring-1 ring-white/20">
               {row.original.items.length} {row.original.items.length === 1 ? 'item' : 'items'}
             </span>
           ),

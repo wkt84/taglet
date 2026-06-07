@@ -69,6 +69,15 @@ export default function App() {
       <Toolbar
         title={title}
         {...dicom}
+        closeFile={() => {
+          const closed = dicom.closeFile()
+          if (closed) {
+            setSelectedPath(undefined)
+            setAddingTag(false)
+            setShowingImageViewer(false)
+          }
+          return closed
+        }}
         openAddTagDialog={() => setAddingTag(true)}
         openImageViewer={() => setShowingImageViewer(true)}
       />

@@ -157,6 +157,16 @@ export function useDicomFile() {
     }
   }, [filePath, nodes])
 
+  const closeFile = useCallback(() => {
+    if (dirty && !window.confirm('Discard unsaved changes and close this file?')) return false
+
+    setFilePath(undefined)
+    setNodes([])
+    setDirty(false)
+    setError(undefined)
+    return true
+  }, [dirty])
+
   const updateNodeValue = useCallback((path: string[], value: string) => {
     setNodes((current) => updateNode(current, path, value))
     setDirty(true)
@@ -193,6 +203,7 @@ export function useDicomFile() {
       dirty,
       error,
       openFile,
+      closeFile,
       saveFile,
       saveFileAs,
       updateNodeValue,
@@ -201,6 +212,7 @@ export function useDicomFile() {
     }),
     [
       addTag,
+      closeFile,
       deleteNodeByPath,
       dirty,
       error,
