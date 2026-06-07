@@ -31,7 +31,14 @@ function addTargetPathFromSelection(path?: string[]) {
 }
 
 function targetLabel(path: string[]) {
-  return path.length === 0 ? 'Root dataset' : path.join(' / ')
+  if (path.length === 0) return 'Root dataset'
+
+  return path
+    .map((part) => {
+      const itemMatch = /^Item#(\d+)$/.exec(part)
+      return itemMatch ? `Item #${Number(itemMatch[1]) + 1}` : part
+    })
+    .join(' / ')
 }
 
 function tagsAtPath(nodes: DicomNode[], parentPath: string[]): string[] {
