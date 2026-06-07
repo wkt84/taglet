@@ -1,6 +1,6 @@
 [package]
 name = "taglet"
-version = "0.1.4"
+version = "0.1.5"
 description = "A DICOM tag editor"
 authors = ["Akihisa Wakita"]
 edition = "2021"

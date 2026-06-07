@@ -73,6 +73,16 @@ function zoomBy(value: number, factor: number) {
   return clamp(value * factor, 0.5, 8)
 }
 
+function gridValues(extent: number, step: number) {
+  const start = Math.ceil(-extent / step) * step
+  const end = Math.floor(extent / step) * step
+  const values = []
+  for (let value = start; value <= end; value += step) {
+    values.push(value)
+  }
+  return values
+}
+
 function boundaryPairs(
   definition: RtPlanBeamLimitingDeviceDefinition | undefined,
   pairCount: number,
@@ -114,6 +124,7 @@ function BevCanvas({ beam, controlPoint }: { beam: RtPlanBeam; controlPoint: RtP
   const viewBoxSize = size / zoom
   const viewBoxX = (size - viewBoxSize) / 2 - pan.x
   const viewBoxY = (size - viewBoxSize) / 2 - pan.y
+  const grid = gridValues(extent, 10)
 
   return (
     <div className="relative h-full w-full bg-slate-950">
@@ -163,15 +174,20 @@ function BevCanvas({ beam, controlPoint }: { beam: RtPlanBeam; controlPoint: RtP
           dragStartRef.current = undefined
         }}
       >
-        <defs>
-          <pattern id="bev-grid" width="28" height="28" patternUnits="userSpaceOnUse">
-            <path d="M 28 0 L 0 0 0 28" fill="none" stroke="#334155" strokeWidth="1" />
-          </pattern>
-        </defs>
-        <rect width={size} height={size} fill="url(#bev-grid)" />
-        <line x1={size / 2} y1="0" x2={size / 2} y2={size} stroke="#64748b" strokeWidth="1" />
-        <line x1="0" y1={size / 2} x2={size} y2={size / 2} stroke="#64748b" strokeWidth="1" />
+        <rect width={size} height={size} fill="#020617" />
         <g transform={`rotate(${svgRotationAngle} ${size / 2} ${size / 2})`}>
+          {grid.map((value) => {
+            const position = pointsToSvg(value, extent, size)
+            const major = value % 50 === 0
+            return (
+              <g key={`grid-${value}`}>
+                <line x1={position} y1="0" x2={position} y2={size} stroke={major ? '#475569' : '#1e293b'} strokeWidth={major ? 1 : 0.5} />
+                <line x1="0" y1={pointsToSvg(-value, extent, size)} x2={size} y2={pointsToSvg(-value, extent, size)} stroke={major ? '#475569' : '#1e293b'} strokeWidth={major ? 1 : 0.5} />
+              </g>
+            )
+          })}
+          <line x1={size / 2} y1="0" x2={size / 2} y2={size} stroke="#64748b" strokeWidth="1.5" />
+          <line x1="0" y1={size / 2} x2={size} y2={size / 2} stroke="#64748b" strokeWidth="1.5" />
           {mlcDevices.map((mlcDevice, deviceIndex) => {
             const normalizedType = mlcDevice.device_type.toUpperCase()
             const axis = mlcAxis(normalizedType)
