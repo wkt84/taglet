@@ -81,21 +81,32 @@ export type RtPlanBeam = {
   beam_index: number
   beam_number?: number | null
   beam_name?: string | null
+  devices: RtPlanBeamLimitingDeviceDefinition[]
   control_points: RtPlanControlPoint[]
+}
+
+export type RtPlanBeamLimitingDeviceDefinition = {
+  device_type: string
+  number_of_pairs?: number | null
+  leaf_position_boundaries: number[]
 }
 
 export type RtPlanControlPoint = {
   control_point_index: number
   nominal_index?: number | null
   gantry_angle?: number | null
+  gantry_angle_inherited: boolean
   collimator_angle?: number | null
+  collimator_angle_inherited: boolean
   couch_angle?: number | null
+  couch_angle_inherited: boolean
   devices: RtPlanBeamLimitingDevicePosition[]
 }
 
 export type RtPlanBeamLimitingDevicePosition = {
   device_type: string
   positions: number[]
+  inherited: boolean
 }
 
 export type TableDicomRow =

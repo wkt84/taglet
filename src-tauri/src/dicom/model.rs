@@ -97,7 +97,15 @@ pub struct RtPlanBeam {
     pub beam_index: usize,
     pub beam_number: Option<i32>,
     pub beam_name: Option<String>,
+    pub devices: Vec<RtPlanBeamLimitingDeviceDefinition>,
     pub control_points: Vec<RtPlanControlPoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtPlanBeamLimitingDeviceDefinition {
+    pub device_type: String,
+    pub number_of_pairs: Option<u32>,
+    pub leaf_position_boundaries: Vec<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -105,8 +113,11 @@ pub struct RtPlanControlPoint {
     pub control_point_index: usize,
     pub nominal_index: Option<i32>,
     pub gantry_angle: Option<f64>,
+    pub gantry_angle_inherited: bool,
     pub collimator_angle: Option<f64>,
+    pub collimator_angle_inherited: bool,
     pub couch_angle: Option<f64>,
+    pub couch_angle_inherited: bool,
     pub devices: Vec<RtPlanBeamLimitingDevicePosition>,
 }
 
@@ -114,6 +125,7 @@ pub struct RtPlanControlPoint {
 pub struct RtPlanBeamLimitingDevicePosition {
     pub device_type: String,
     pub positions: Vec<f64>,
+    pub inherited: bool,
 }
 
 impl ValidationResult {

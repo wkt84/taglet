@@ -34,7 +34,9 @@ fn validate_multi(vr: &str, value: &str) -> ValidationResult {
     for (index, component) in value.split('\\').enumerate() {
         let result = validate_single(vr, component);
         if !result.valid {
-            let detail = result.message.unwrap_or_else(|| "invalid value".to_string());
+            let detail = result
+                .message
+                .unwrap_or_else(|| "invalid value".to_string());
             return ValidationResult::invalid(format!("value #{}: {detail}", index + 1));
         }
     }
@@ -58,7 +60,10 @@ fn validate_single(vr: &str, value: &str) -> ValidationResult {
 }
 
 fn is_multi_value_vr(vr: &str) -> bool {
-    matches!(vr, "DA" | "TM" | "UI" | "IS" | "DS" | "CS" | "LO" | "SH" | "PN")
+    matches!(
+        vr,
+        "DA" | "TM" | "UI" | "IS" | "DS" | "CS" | "LO" | "SH" | "PN"
+    )
 }
 
 fn validate_da(value: &str) -> ValidationResult {
@@ -158,7 +163,9 @@ fn validate_pn(value: &str) -> ValidationResult {
     if value.split('=').all(|group| group.split('^').count() <= 5) {
         ValidationResult::valid()
     } else {
-        ValidationResult::invalid("PN name groups may contain at most five caret-separated components")
+        ValidationResult::invalid(
+            "PN name groups may contain at most five caret-separated components",
+        )
     }
 }
 

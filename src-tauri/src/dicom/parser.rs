@@ -1,16 +1,17 @@
+use base64::Engine;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
 use dicom_core::header::{HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
 use dicom_core::{Tag, VR};
 use dicom_dictionary_std::{tags, StandardDataDictionary};
 use dicom_object::{open_file, DefaultDicomObject, InMemDicomObject, OpenFileOptions};
-use base64::Engine;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use super::model::{
-    DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
-    RtPlanBeam, RtPlanBeamLimitingDevicePosition, RtPlanBevInfo, RtPlanControlPoint,
+    DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo, RtPlanBeam,
+    RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition, RtPlanBevInfo,
+    RtPlanControlPoint,
 };
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
@@ -18,10 +19,13 @@ const DOSE_GRID_SCALING: Tag = Tag(0x3004, 0x000E);
 const BEAM_SEQUENCE: Tag = Tag(0x300A, 0x00B0);
 const BEAM_NUMBER: Tag = Tag(0x300A, 0x00C0);
 const BEAM_NAME: Tag = Tag(0x300A, 0x00C2);
+const BEAM_LIMITING_DEVICE_SEQUENCE: Tag = Tag(0x300A, 0x00B6);
 const CONTROL_POINT_SEQUENCE: Tag = Tag(0x300A, 0x0111);
 const CONTROL_POINT_INDEX: Tag = Tag(0x300A, 0x0112);
 const BEAM_LIMITING_DEVICE_POSITION_SEQUENCE: Tag = Tag(0x300A, 0x011A);
 const RT_BEAM_LIMITING_DEVICE_TYPE: Tag = Tag(0x300A, 0x00B8);
+const NUMBER_OF_LEAF_JAW_PAIRS: Tag = Tag(0x300A, 0x00BC);
+const LEAF_POSITION_BOUNDARIES: Tag = Tag(0x300A, 0x00BE);
 const LEAF_JAW_POSITIONS: Tag = Tag(0x300A, 0x011C);
 const GANTRY_ANGLE: Tag = Tag(0x300A, 0x011E);
 const BEAM_LIMITING_DEVICE_ANGLE: Tag = Tag(0x300A, 0x0120);
@@ -61,7 +65,12 @@ pub fn tag_info(tag_text: &str) -> Result<DicomTagInfo, String> {
 }
 
 pub fn image_info(obj: &DefaultDicomObject) -> Result<DicomImageInfo, String> {
-    let transfer_syntax_uid = Some(obj.meta().transfer_syntax().trim_end_matches('\0').to_string());
+    let transfer_syntax_uid = Some(
+        obj.meta()
+            .transfer_syntax()
+            .trim_end_matches('\0')
+            .to_string(),
+    );
     let has_pixel_data = obj.get(tags::PIXEL_DATA).is_some();
     let rows = get_u32(obj, tags::ROWS);
     let columns = get_u32(obj, tags::COLUMNS);
@@ -76,7 +85,9 @@ pub fn image_info(obj: &DefaultDicomObject) -> Result<DicomImageInfo, String> {
     let sop_class_uid = get_string(obj, tags::SOP_CLASS_UID);
     let window_center = get_f64_values(obj, tags::WINDOW_CENTER);
     let window_width = get_f64_values(obj, tags::WINDOW_WIDTH);
-    let rescale_intercept = get_f64_values(obj, tags::RESCALE_INTERCEPT).into_iter().next();
+    let rescale_intercept = get_f64_values(obj, tags::RESCALE_INTERCEPT)
+        .into_iter()
+        .next();
     let rescale_slope = get_f64_values(obj, tags::RESCALE_SLOPE).into_iter().next();
     let dose_grid_scaling = get_f64_values(obj, DOSE_GRID_SCALING).into_iter().next();
 
@@ -128,7 +139,9 @@ pub fn frame_image(
             .unwrap_or_else(|| "Image is not supported".to_string()));
     }
 
-    let width = info.columns.ok_or_else(|| "Columns is missing".to_string())?;
+    let width = info
+        .columns
+        .ok_or_else(|| "Columns is missing".to_string())?;
     let height = info.rows.ok_or_else(|| "Rows is missing".to_string())?;
     let samples_per_pixel = info.samples_per_pixel.unwrap_or(1);
     if samples_per_pixel != 1 {
@@ -195,7 +208,10 @@ pub fn frame_image(
     })
 }
 
-pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomFramePixels, String> {
+pub fn frame_pixels(
+    obj: &DefaultDicomObject,
+    frame_index: u32,
+) -> Result<DicomFramePixels, String> {
     let info = image_info(obj)?;
     if !info.supported {
         return Err(info
@@ -203,7 +219,9 @@ pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomF
             .unwrap_or_else(|| "Image is not supported".to_string()));
     }
 
-    let width = info.columns.ok_or_else(|| "Columns is missing".to_string())?;
+    let width = info
+        .columns
+        .ok_or_else(|| "Columns is missing".to_string())?;
     let height = info.rows.ok_or_else(|| "Rows is missing".to_string())?;
     let samples_per_pixel = info.samples_per_pixel.unwrap_or(1);
     if samples_per_pixel != 1 {
@@ -245,8 +263,14 @@ pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomF
     let frame = &pixel_bytes[frame_offset..frame_offset + frame_byte_len];
     let signed = info.pixel_representation.unwrap_or(0) == 1;
     let (slope, intercept) = pixel_value_transform(&info);
-    let (min_value, max_value) =
-        frame_min_max(frame, bits_allocated, signed, slope, intercept, frame_sample_count);
+    let (min_value, max_value) = frame_min_max(
+        frame,
+        bits_allocated,
+        signed,
+        slope,
+        intercept,
+        frame_sample_count,
+    );
 
     Ok(DicomFramePixels {
         width,
@@ -289,30 +313,14 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
         .enumerate()
         .map(|(beam_index, beam)| {
             let control_points = sequence_items(beam, CONTROL_POINT_SEQUENCE)
-                .map(|items| {
-                    items
-                        .iter()
-                        .enumerate()
-                        .map(|(control_point_index, control_point)| RtPlanControlPoint {
-                            control_point_index,
-                            nominal_index: get_i32(control_point, CONTROL_POINT_INDEX),
-                            gantry_angle: get_f64_values(control_point, GANTRY_ANGLE).into_iter().next(),
-                            collimator_angle: get_f64_values(control_point, BEAM_LIMITING_DEVICE_ANGLE)
-                                .into_iter()
-                                .next(),
-                            couch_angle: get_f64_values(control_point, PATIENT_SUPPORT_ANGLE)
-                                .into_iter()
-                                .next(),
-                            devices: beam_limiting_device_positions(control_point),
-                        })
-                        .collect()
-                })
+                .map(effective_control_points)
                 .unwrap_or_default();
 
             RtPlanBeam {
                 beam_index,
                 beam_number: get_i32(beam, BEAM_NUMBER),
                 beam_name: get_string(beam, BEAM_NAME),
+                devices: beam_limiting_device_definitions(beam),
                 control_points,
             }
         })
@@ -381,7 +389,10 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
         .collect()
 }
 
-pub fn apply_nodes_to_object(obj: &mut InMemDicomObject, nodes: &[DicomNode]) -> Result<(), String> {
+pub fn apply_nodes_to_object(
+    obj: &mut InMemDicomObject,
+    nodes: &[DicomNode],
+) -> Result<(), String> {
     let desired_tags = nodes
         .iter()
         .map(node_tag)
@@ -591,11 +602,102 @@ fn beam_limiting_device_positions(
                     Some(RtPlanBeamLimitingDevicePosition {
                         device_type,
                         positions: get_f64_values(item, LEAF_JAW_POSITIONS),
+                        inherited: false,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn beam_limiting_device_definitions(
+    beam: &InMemDicomObject,
+) -> Vec<RtPlanBeamLimitingDeviceDefinition> {
+    sequence_items(beam, BEAM_LIMITING_DEVICE_SEQUENCE)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let device_type = get_string(item, RT_BEAM_LIMITING_DEVICE_TYPE)?;
+                    Some(RtPlanBeamLimitingDeviceDefinition {
+                        device_type,
+                        number_of_pairs: get_u32(item, NUMBER_OF_LEAF_JAW_PAIRS),
+                        leaf_position_boundaries: get_f64_values(item, LEAF_POSITION_BOUNDARIES),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn effective_control_points(items: &[InMemDicomObject]) -> Vec<RtPlanControlPoint> {
+    let mut gantry_angle = None;
+    let mut collimator_angle = None;
+    let mut couch_angle = None;
+    let mut devices = HashMap::<String, Vec<f64>>::new();
+
+    items
+        .iter()
+        .enumerate()
+        .map(|(control_point_index, control_point)| {
+            let raw_gantry_angle = get_f64_values(control_point, GANTRY_ANGLE)
+                .into_iter()
+                .next();
+            let raw_collimator_angle = get_f64_values(control_point, BEAM_LIMITING_DEVICE_ANGLE)
+                .into_iter()
+                .next();
+            let raw_couch_angle = get_f64_values(control_point, PATIENT_SUPPORT_ANGLE)
+                .into_iter()
+                .next();
+
+            let gantry_angle_inherited = raw_gantry_angle.is_none() && gantry_angle.is_some();
+            let collimator_angle_inherited =
+                raw_collimator_angle.is_none() && collimator_angle.is_some();
+            let couch_angle_inherited = raw_couch_angle.is_none() && couch_angle.is_some();
+
+            if raw_gantry_angle.is_some() {
+                gantry_angle = raw_gantry_angle;
+            }
+            if raw_collimator_angle.is_some() {
+                collimator_angle = raw_collimator_angle;
+            }
+            if raw_couch_angle.is_some() {
+                couch_angle = raw_couch_angle;
+            }
+
+            let updated_devices = beam_limiting_device_positions(control_point)
+                .into_iter()
+                .map(|device| {
+                    devices.insert(device.device_type.to_uppercase(), device.positions);
+                    device.device_type.to_uppercase()
+                })
+                .collect::<HashSet<_>>();
+
+            let mut effective_devices = devices
+                .iter()
+                .map(
+                    |(device_type, positions)| RtPlanBeamLimitingDevicePosition {
+                        device_type: device_type.clone(),
+                        positions: positions.clone(),
+                        inherited: !updated_devices.contains(device_type),
+                    },
+                )
+                .collect::<Vec<_>>();
+            effective_devices.sort_by(|left, right| left.device_type.cmp(&right.device_type));
+
+            RtPlanControlPoint {
+                control_point_index,
+                nominal_index: get_i32(control_point, CONTROL_POINT_INDEX),
+                gantry_angle,
+                gantry_angle_inherited,
+                collimator_angle,
+                collimator_angle_inherited,
+                couch_angle,
+                couch_angle_inherited,
+                devices: effective_devices,
+            }
+        })
+        .collect()
 }
 
 fn image_unsupported_reason(
@@ -623,11 +725,15 @@ fn image_unsupported_reason(
         transfer_syntax_uid,
         Some("1.2.840.10008.1.2") | Some("1.2.840.10008.1.2.1")
     ) {
-        return Some("Only uncompressed Little Endian transfer syntaxes are prepared for now".to_string());
+        return Some(
+            "Only uncompressed Little Endian transfer syntaxes are prepared for now".to_string(),
+        );
     }
     if let Some(photometric) = photometric_interpretation {
         if !matches!(photometric, "MONOCHROME1" | "MONOCHROME2" | "RGB") {
-            return Some(format!("Photometric Interpretation {photometric} is not prepared yet"));
+            return Some(format!(
+                "Photometric Interpretation {photometric} is not prepared yet"
+            ));
         }
     }
 
@@ -758,10 +864,7 @@ mod tests {
 
     #[test]
     fn decodes_unsigned_32_bit_pixels() {
-        let frame = [
-            0x78, 0x56, 0x34, 0x12,
-            0xFF, 0xFF, 0xFF, 0xFF,
-        ];
+        let frame = [0x78, 0x56, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF];
 
         assert_eq!(stored_pixel_value(&frame, 0, 32, false), 0x1234_5678 as f64);
         assert_eq!(stored_pixel_value(&frame, 1, 32, false), u32::MAX as f64);
@@ -769,10 +872,7 @@ mod tests {
 
     #[test]
     fn decodes_signed_32_bit_pixels() {
-        let frame = [
-            0xFF, 0xFF, 0xFF, 0xFF,
-            0x00, 0x00, 0x00, 0x80,
-        ];
+        let frame = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80];
 
         assert_eq!(stored_pixel_value(&frame, 0, 32, true), -1.0);
         assert_eq!(stored_pixel_value(&frame, 1, 32, true), i32::MIN as f64);
@@ -780,10 +880,7 @@ mod tests {
 
     #[test]
     fn applies_dose_grid_scaling_to_min_max() {
-        let frame = [
-            0x00, 0x00, 0x00, 0x00,
-            0x10, 0x27, 0x00, 0x00,
-        ];
+        let frame = [0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00];
 
         let (min, max) = frame_min_max(&frame, 32, false, 0.001, 0.0, 2);
 

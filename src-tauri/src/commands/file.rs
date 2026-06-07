@@ -116,12 +116,7 @@ pub async fn open_dicom_file(
         .objects
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())?
-        .insert(
-            path.clone(),
-            StoredDicomObject {
-                full: None,
-            },
-        );
+        .insert(path.clone(), StoredDicomObject { full: None });
     *store
         .current_path
         .lock()
@@ -181,12 +176,7 @@ fn save_to_path(
         .map_err(|error| error.to_string())?;
 
     if source_path != destination_path {
-        objects.insert(
-            destination_path.clone(),
-            StoredDicomObject {
-                full: None,
-            },
-        );
+        objects.insert(destination_path.clone(), StoredDicomObject { full: None });
     }
     *store
         .current_path

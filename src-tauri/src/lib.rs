@@ -48,12 +48,13 @@ fn handle_run_event(app_handle: &tauri::AppHandle, event: tauri::RunEvent) {
             .collect::<Vec<_>>();
 
         if !paths.is_empty() {
-            let _ = app_handle.state::<LaunchFileStore>().push_paths(paths.clone());
+            let _ = app_handle
+                .state::<LaunchFileStore>()
+                .push_paths(paths.clone());
             let _ = app_handle.emit("taglet://open-files", paths);
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn handle_run_event(_app_handle: &tauri::AppHandle, _event: tauri::RunEvent) {
-}
+fn handle_run_event(_app_handle: &tauri::AppHandle, _event: tauri::RunEvent) {}

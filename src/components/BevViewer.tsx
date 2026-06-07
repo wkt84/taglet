@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import type { RtPlanBeam, RtPlanBevInfo, RtPlanControlPoint } from '../types/dicom'
+import type {
+  RtPlanBeam,
+  RtPlanBeamLimitingDeviceDefinition,
+  RtPlanBevInfo,
+  RtPlanControlPoint,
+} from '../types/dicom'
 
 type Props = {
   onClose: () => void
@@ -9,6 +14,11 @@ type Props = {
 function valueText(value: unknown) {
   if (value === undefined || value === null || value === '') return '-'
   return String(value)
+}
+
+function inheritedText(value: unknown, inherited?: boolean) {
+  const text = valueText(value)
+  return inherited && text !== '-' ? `${text} (inherited)` : text
 }
 
 function beamLabel(beam: RtPlanBeam) {
@@ -25,6 +35,10 @@ function findDevice(controlPoint: RtPlanControlPoint, names: string[]) {
   return controlPoint.devices.find((device) => names.includes(device.device_type.toUpperCase()))
 }
 
+function findDeviceDefinition(beam: RtPlanBeam, names: string[]) {
+  return beam.devices.find((device) => names.includes(device.device_type.toUpperCase()))
+}
+
 function apertureExtent(controlPoint: RtPlanControlPoint) {
   const values = controlPoint.devices.flatMap((device) => device.positions)
   const maxAbs = Math.max(100, ...values.map((value) => Math.abs(value)))
@@ -35,21 +49,55 @@ function pointsToSvg(value: number, extent: number, size: number) {
   return size / 2 + (value / extent) * (size / 2)
 }
 
-function BevCanvas({ controlPoint }: { controlPoint: RtPlanControlPoint }) {
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function boundaryPairs(
+  definition: RtPlanBeamLimitingDeviceDefinition | undefined,
+  pairCount: number,
+  fallbackStart: number,
+  fallbackEnd: number,
+) {
+  const boundaries = definition?.leaf_position_boundaries
+  if (boundaries && boundaries.length >= pairCount + 1) {
+    return Array.from({ length: pairCount }, (_, index) => [
+      boundaries[index],
+      boundaries[index + 1],
+    ])
+  }
+
+  const step = (fallbackEnd - fallbackStart) / pairCount
+  return Array.from({ length: pairCount }, (_, index) => [
+    fallbackStart + index * step,
+    fallbackStart + (index + 1) * step,
+  ])
+}
+
+function BevCanvas({ beam, controlPoint }: { beam: RtPlanBeam; controlPoint: RtPlanControlPoint }) {
   const size = 560
   const extent = apertureExtent(controlPoint)
   const xDevice = findDevice(controlPoint, ['ASYMX', 'X'])
   const yDevice = findDevice(controlPoint, ['ASYMY', 'Y'])
   const mlcDevice = findDevice(controlPoint, ['MLCX', 'MLCY'])
   const mlcType = mlcDevice?.device_type.toUpperCase()
+  const mlcDefinition = mlcType ? findDeviceDefinition(beam, [mlcType]) : undefined
   const x = xDevice?.positions.length === 2 ? xDevice.positions : [-extent / 2, extent / 2]
   const y = yDevice?.positions.length === 2 ? yDevice.positions : [-extent / 2, extent / 2]
-  const left = pointsToSvg(x[0], extent, size)
-  const right = pointsToSvg(x[1], extent, size)
-  const top = pointsToSvg(-y[1], extent, size)
-  const bottom = pointsToSvg(-y[0], extent, size)
+  const left = Math.min(pointsToSvg(x[0], extent, size), pointsToSvg(x[1], extent, size))
+  const right = Math.max(pointsToSvg(x[0], extent, size), pointsToSvg(x[1], extent, size))
+  const top = Math.min(pointsToSvg(-y[0], extent, size), pointsToSvg(-y[1], extent, size))
+  const bottom = Math.max(pointsToSvg(-y[0], extent, size), pointsToSvg(-y[1], extent, size))
   const mlcPairs = mlcDevice ? Math.floor(mlcDevice.positions.length / 2) : 0
-  const leafHeight = mlcPairs > 0 ? (bottom - top) / mlcPairs : 0
+  const leafBoundaries = mlcPairs > 0
+    ? boundaryPairs(
+        mlcDefinition,
+        mlcPairs,
+        mlcType === 'MLCY' ? x[0] : y[0],
+        mlcType === 'MLCY' ? x[1] : y[1],
+      )
+    : []
+  const collimatorAngle = controlPoint.collimator_angle ?? 0
 
   return (
     <svg className="h-full w-full bg-slate-950" viewBox={`0 0 ${size} ${size}`} role="img">
@@ -61,39 +109,84 @@ function BevCanvas({ controlPoint }: { controlPoint: RtPlanControlPoint }) {
       <rect width={size} height={size} fill="url(#bev-grid)" />
       <line x1={size / 2} y1="0" x2={size / 2} y2={size} stroke="#64748b" strokeWidth="1" />
       <line x1="0" y1={size / 2} x2={size} y2={size / 2} stroke="#64748b" strokeWidth="1" />
-      <rect
-        x={left}
-        y={top}
-        width={Math.max(1, right - left)}
-        height={Math.max(1, bottom - top)}
-        fill="#38bdf833"
-        stroke="#38bdf8"
-        strokeWidth="2"
-      />
-      {mlcDevice && mlcPairs > 0
-        ? Array.from({ length: mlcPairs }, (_, index) => {
-            const first = mlcDevice.positions[index * 2]
-            const second = mlcDevice.positions[index * 2 + 1]
-            const leafLeft = mlcType === 'MLCY' ? left + index * ((right - left) / mlcPairs) : pointsToSvg(first, extent, size)
-            const leafRight = mlcType === 'MLCY' ? leafLeft + (right - left) / mlcPairs - 1 : pointsToSvg(second, extent, size)
-            const yPosition = mlcType === 'MLCY' ? pointsToSvg(-second, extent, size) : top + index * leafHeight
-            const height = mlcType === 'MLCY'
-              ? Math.max(1, pointsToSvg(-first, extent, size) - yPosition)
-              : Math.max(1, leafHeight - 1)
-            return (
-              <rect
-                key={index}
-                x={leafLeft}
-                y={yPosition}
-                width={Math.max(1, leafRight - leafLeft)}
-                height={height}
-                fill="#f59e0b55"
-                stroke="#fbbf24"
-                strokeWidth="0.5"
-              />
-            )
-          })
-        : null}
+      <g transform={`rotate(${collimatorAngle} ${size / 2} ${size / 2})`}>
+        <rect
+          x={left}
+          y={top}
+          width={Math.max(1, right - left)}
+          height={Math.max(1, bottom - top)}
+          fill="#38bdf833"
+          stroke="#38bdf8"
+          strokeWidth="2"
+        />
+        {mlcDevice && mlcPairs > 0
+          ? Array.from({ length: mlcPairs }, (_, index) => {
+              const bank1 = mlcDevice.positions[index]
+              const bank2 = mlcDevice.positions[index + mlcPairs]
+              const [boundary1, boundary2] = leafBoundaries[index]
+              if (mlcType === 'MLCY') {
+                const leafLeft = clamp(
+                  Math.min(pointsToSvg(boundary1, extent, size), pointsToSvg(boundary2, extent, size)),
+                  left,
+                  right,
+                )
+                const leafRight = clamp(
+                  Math.max(pointsToSvg(boundary1, extent, size), pointsToSvg(boundary2, extent, size)),
+                  left,
+                  right,
+                )
+                const apertureTop = clamp(
+                  Math.min(pointsToSvg(-bank1, extent, size), pointsToSvg(-bank2, extent, size)),
+                  top,
+                  bottom,
+                )
+                const apertureBottom = clamp(
+                  Math.max(pointsToSvg(-bank1, extent, size), pointsToSvg(-bank2, extent, size)),
+                  top,
+                  bottom,
+                )
+                return (
+                  <g key={index}>
+                    <rect x={leafLeft} y={top} width={Math.max(0, leafRight - leafLeft)} height={Math.max(0, apertureTop - top)} fill="#f59e0b66" />
+                    <rect x={leafLeft} y={apertureBottom} width={Math.max(0, leafRight - leafLeft)} height={Math.max(0, bottom - apertureBottom)} fill="#f59e0b66" />
+                  </g>
+                )
+              }
+
+              const leafTop = clamp(
+                Math.min(pointsToSvg(-boundary1, extent, size), pointsToSvg(-boundary2, extent, size)),
+                top,
+                bottom,
+              )
+              const leafBottom = clamp(
+                Math.max(pointsToSvg(-boundary1, extent, size), pointsToSvg(-boundary2, extent, size)),
+                top,
+                bottom,
+              )
+              const apertureLeft = clamp(
+                Math.min(pointsToSvg(bank1, extent, size), pointsToSvg(bank2, extent, size)),
+                left,
+                right,
+              )
+              const apertureRight = clamp(
+                Math.max(pointsToSvg(bank1, extent, size), pointsToSvg(bank2, extent, size)),
+                left,
+                right,
+              )
+              return (
+                <g key={index}>
+                  <rect x={left} y={leafTop} width={Math.max(0, apertureLeft - left)} height={Math.max(0, leafBottom - leafTop)} fill="#f59e0b66" />
+                  <rect x={apertureRight} y={leafTop} width={Math.max(0, right - apertureRight)} height={Math.max(0, leafBottom - leafTop)} fill="#f59e0b66" />
+                </g>
+              )
+            })
+          : null}
+      </g>
+      {collimatorAngle ? (
+        <text x="12" y="44" fill="#cbd5e1" fontSize="13">
+          Collimator {collimatorAngle} deg
+        </text>
+      ) : null}
       <text x="12" y="24" fill="#cbd5e1" fontSize="13">
         +/- {extent} mm
       </text>
@@ -135,7 +228,9 @@ export default function BevViewer({ onClose }: Props) {
   const selectedBeam = info?.beams[beamIndex]
   const selectedControlPoint = selectedBeam?.control_points[controlPointIndex]
   const deviceSummary = useMemo(
-    () => selectedControlPoint?.devices.map((device) => `${device.device_type}: ${device.positions.length}`).join(', '),
+    () => selectedControlPoint?.devices.map((device) => (
+      `${device.device_type}: ${device.positions.length}${device.inherited ? ' inherited' : ''}`
+    )).join(', '),
     [selectedControlPoint],
   )
 
@@ -156,7 +251,7 @@ export default function BevViewer({ onClose }: Props) {
             ) : error ? (
               <span className="max-w-md text-sm text-red-300">{error}</span>
             ) : info?.supported && selectedControlPoint ? (
-              <BevCanvas controlPoint={selectedControlPoint} />
+              <BevCanvas beam={selectedBeam} controlPoint={selectedControlPoint} />
             ) : (
               <div className="max-w-md text-center text-sm">
                 <div className="font-medium">BEV is not available.</div>
@@ -215,11 +310,26 @@ export default function BevViewer({ onClose }: Props) {
                   <dt className="text-slate-500">Beam Name</dt>
                   <dd>{valueText(selectedBeam?.beam_name)}</dd>
                   <dt className="text-slate-500">Gantry</dt>
-                  <dd>{valueText(selectedControlPoint?.gantry_angle)}</dd>
+                  <dd>
+                    {inheritedText(
+                      selectedControlPoint?.gantry_angle,
+                      selectedControlPoint?.gantry_angle_inherited,
+                    )}
+                  </dd>
                   <dt className="text-slate-500">Collimator</dt>
-                  <dd>{valueText(selectedControlPoint?.collimator_angle)}</dd>
+                  <dd>
+                    {inheritedText(
+                      selectedControlPoint?.collimator_angle,
+                      selectedControlPoint?.collimator_angle_inherited,
+                    )}
+                  </dd>
                   <dt className="text-slate-500">Couch</dt>
-                  <dd>{valueText(selectedControlPoint?.couch_angle)}</dd>
+                  <dd>
+                    {inheritedText(
+                      selectedControlPoint?.couch_angle,
+                      selectedControlPoint?.couch_angle_inherited,
+                    )}
+                  </dd>
                   <dt className="text-slate-500">Devices</dt>
                   <dd>{valueText(deviceSummary)}</dd>
                 </dl>
