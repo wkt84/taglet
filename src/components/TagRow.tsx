@@ -11,16 +11,16 @@ export default function TagRow({ row, selected, onSelect }: Props) {
   const isSequence = row.original.kind === 'Sequence'
   const isItem = row.original.kind === 'Item'
   const isElementInItem = row.original.kind === 'Element' && row.original.itemIndex !== undefined
-  const itemClass = isItem ? 'border-t border-blue-200 bg-blue-50 font-medium text-blue-950' : ''
+  const itemClass = isItem ? 'border-t border-blue-300 bg-blue-100 font-medium text-blue-950' : ''
   const itemChildClass = isElementInItem ? 'bg-blue-50/30' : ''
   const sequenceClass = isSequence ? 'bg-slate-700 font-semibold text-white shadow-inner' : ''
-  const stripeClass = isSequence ? '' : row.index % 2 === 0 ? 'bg-white' : 'bg-slate-50'
+  const stripeClass = isSequence || isItem ? '' : row.index % 2 === 0 ? 'bg-white' : 'bg-slate-50'
   const selectedClass = selected
     ? isSequence || isItem
       ? 'outline outline-2 outline-amber-300 outline-offset-[-2px]'
       : 'outline outline-2 outline-blue-400 outline-offset-[-2px]'
     : ''
-  const hoverClass = isSequence ? 'hover:bg-slate-600' : isItem ? 'hover:bg-blue-100' : 'hover:bg-blue-100/60'
+  const hoverClass = isSequence ? 'hover:bg-slate-600' : isItem ? 'hover:bg-blue-200' : 'hover:bg-blue-100/60'
   const canToggle = isSequence || isItem
 
   return (
