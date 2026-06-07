@@ -8,10 +8,24 @@ use base64::Engine;
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use super::model::{DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo};
+use super::model::{
+    DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
+    RtPlanBeam, RtPlanBeamLimitingDevicePosition, RtPlanBevInfo, RtPlanControlPoint,
+};
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 const DOSE_GRID_SCALING: Tag = Tag(0x3004, 0x000E);
+const BEAM_SEQUENCE: Tag = Tag(0x300A, 0x00B0);
+const BEAM_NUMBER: Tag = Tag(0x300A, 0x00C0);
+const BEAM_NAME: Tag = Tag(0x300A, 0x00C2);
+const CONTROL_POINT_SEQUENCE: Tag = Tag(0x300A, 0x0111);
+const CONTROL_POINT_INDEX: Tag = Tag(0x300A, 0x0112);
+const BEAM_LIMITING_DEVICE_POSITION_SEQUENCE: Tag = Tag(0x300A, 0x011A);
+const RT_BEAM_LIMITING_DEVICE_TYPE: Tag = Tag(0x300A, 0x00B8);
+const LEAF_JAW_POSITIONS: Tag = Tag(0x300A, 0x011C);
+const GANTRY_ANGLE: Tag = Tag(0x300A, 0x011E);
+const BEAM_LIMITING_DEVICE_ANGLE: Tag = Tag(0x300A, 0x0120);
+const PATIENT_SUPPORT_ANGLE: Tag = Tag(0x300A, 0x0122);
 
 pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, Vec<DicomNode>), String> {
     let obj = OpenFileOptions::new()
@@ -250,6 +264,72 @@ pub fn frame_pixels(obj: &DefaultDicomObject, frame_index: u32) -> Result<DicomF
     })
 }
 
+pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, String> {
+    let modality = get_string(obj, tags::MODALITY);
+    if modality.as_deref() != Some("RTPLAN") {
+        return Ok(RtPlanBevInfo {
+            supported: false,
+            unsupported_reason: Some("BEV is available for RT Plan objects only".to_string()),
+            modality,
+            beams: Vec::new(),
+        });
+    }
+
+    let Some(beam_items) = sequence_items(obj, BEAM_SEQUENCE) else {
+        return Ok(RtPlanBevInfo {
+            supported: false,
+            unsupported_reason: Some("Beam Sequence is missing".to_string()),
+            modality,
+            beams: Vec::new(),
+        });
+    };
+
+    let beams = beam_items
+        .iter()
+        .enumerate()
+        .map(|(beam_index, beam)| {
+            let control_points = sequence_items(beam, CONTROL_POINT_SEQUENCE)
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(control_point_index, control_point)| RtPlanControlPoint {
+                            control_point_index,
+                            nominal_index: get_i32(control_point, CONTROL_POINT_INDEX),
+                            gantry_angle: get_f64_values(control_point, GANTRY_ANGLE).into_iter().next(),
+                            collimator_angle: get_f64_values(control_point, BEAM_LIMITING_DEVICE_ANGLE)
+                                .into_iter()
+                                .next(),
+                            couch_angle: get_f64_values(control_point, PATIENT_SUPPORT_ANGLE)
+                                .into_iter()
+                                .next(),
+                            devices: beam_limiting_device_positions(control_point),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            RtPlanBeam {
+                beam_index,
+                beam_number: get_i32(beam, BEAM_NUMBER),
+                beam_name: get_string(beam, BEAM_NAME),
+                control_points,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RtPlanBevInfo {
+        supported: !beams.is_empty(),
+        unsupported_reason: if beams.is_empty() {
+            Some("Beam Sequence is empty".to_string())
+        } else {
+            None
+        },
+        modality,
+        beams,
+    })
+}
+
 pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<DicomNode> {
     obj.iter()
         .map(|element| {
@@ -477,9 +557,44 @@ fn get_u32(obj: &InMemDicomObject, tag: Tag) -> Option<u32> {
     })
 }
 
+fn get_i32(obj: &InMemDicomObject, tag: Tag) -> Option<i32> {
+    obj.get(tag).and_then(|element| {
+        element
+            .to_int::<i32>()
+            .ok()
+            .or_else(|| element.to_str().ok()?.trim().parse::<i32>().ok())
+    })
+}
+
 fn get_f64_values(obj: &InMemDicomObject, tag: Tag) -> Vec<f64> {
     obj.get(tag)
         .and_then(|element| element.to_multi_float64().ok())
+        .unwrap_or_default()
+}
+
+fn sequence_items(obj: &InMemDicomObject, tag: Tag) -> Option<&[InMemDicomObject]> {
+    obj.get(tag).and_then(|element| match element.value() {
+        Value::Sequence(sequence) => Some(sequence.items()),
+        _ => None,
+    })
+}
+
+fn beam_limiting_device_positions(
+    control_point: &InMemDicomObject,
+) -> Vec<RtPlanBeamLimitingDevicePosition> {
+    sequence_items(control_point, BEAM_LIMITING_DEVICE_POSITION_SEQUENCE)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let device_type = get_string(item, RT_BEAM_LIMITING_DEVICE_TYPE)?;
+                    Some(RtPlanBeamLimitingDevicePosition {
+                        device_type,
+                        positions: get_f64_values(item, LEAF_JAW_POSITIONS),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 

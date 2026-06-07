@@ -70,6 +70,34 @@ export type DicomFramePixels = {
   max_value: number
 }
 
+export type RtPlanBevInfo = {
+  supported: boolean
+  unsupported_reason?: string | null
+  modality?: string | null
+  beams: RtPlanBeam[]
+}
+
+export type RtPlanBeam = {
+  beam_index: number
+  beam_number?: number | null
+  beam_name?: string | null
+  control_points: RtPlanControlPoint[]
+}
+
+export type RtPlanControlPoint = {
+  control_point_index: number
+  nominal_index?: number | null
+  gantry_angle?: number | null
+  collimator_angle?: number | null
+  couch_angle?: number | null
+  devices: RtPlanBeamLimitingDevicePosition[]
+}
+
+export type RtPlanBeamLimitingDevicePosition = {
+  device_type: string
+  positions: number[]
+}
+
 export type TableDicomRow =
   | (DicomElement & {
       rowId: string

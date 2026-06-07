@@ -84,6 +84,38 @@ pub struct DicomFramePixels {
     pub max_value: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtPlanBevInfo {
+    pub supported: bool,
+    pub unsupported_reason: Option<String>,
+    pub modality: Option<String>,
+    pub beams: Vec<RtPlanBeam>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtPlanBeam {
+    pub beam_index: usize,
+    pub beam_number: Option<i32>,
+    pub beam_name: Option<String>,
+    pub control_points: Vec<RtPlanControlPoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtPlanControlPoint {
+    pub control_point_index: usize,
+    pub nominal_index: Option<i32>,
+    pub gantry_angle: Option<f64>,
+    pub collimator_angle: Option<f64>,
+    pub couch_angle: Option<f64>,
+    pub devices: Vec<RtPlanBeamLimitingDevicePosition>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtPlanBeamLimitingDevicePosition {
+    pub device_type: String,
+    pub positions: Vec<f64>,
+}
+
 impl ValidationResult {
     pub fn valid() -> Self {
         Self {

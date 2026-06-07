@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import AddTagDialog from './components/AddTagDialog'
+import BevViewer from './components/BevViewer'
 import ImageViewer from './components/ImageViewer'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
@@ -63,6 +64,7 @@ export default function App() {
   const dicom = useDicomFile()
   const [addingTag, setAddingTag] = useState(false)
   const [showingImageViewer, setShowingImageViewer] = useState(false)
+  const [showingBevViewer, setShowingBevViewer] = useState(false)
   const [selectedPath, setSelectedPath] = useState<string[]>()
   const openPath = dicom.openPath
   const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
@@ -88,6 +90,7 @@ export default function App() {
         setSelectedPath(undefined)
         setAddingTag(false)
         setShowingImageViewer(false)
+        setShowingBevViewer(false)
       }
     }
 
@@ -136,11 +139,13 @@ export default function App() {
             setSelectedPath(undefined)
             setAddingTag(false)
             setShowingImageViewer(false)
+            setShowingBevViewer(false)
           }
           return closed
         }}
         openAddTagDialog={() => setAddingTag(true)}
         openImageViewer={() => setShowingImageViewer(true)}
+        openBevViewer={() => setShowingBevViewer(true)}
       />
       {dicom.error ? (
         <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
@@ -169,6 +174,7 @@ export default function App() {
         />
       ) : null}
       {showingImageViewer ? <ImageViewer onClose={() => setShowingImageViewer(false)} /> : null}
+      {showingBevViewer ? <BevViewer onClose={() => setShowingBevViewer(false)} /> : null}
     </main>
   )
 }

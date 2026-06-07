@@ -6,6 +6,7 @@ use commands::file::{
     LaunchFileStore,
 };
 use commands::image::{get_dicom_frame_image, get_dicom_frame_pixels, get_dicom_image_info};
+use commands::plan::get_rt_plan_bev_info;
 use commands::tags::lookup_dicom_tag;
 use commands::validate::validate_value;
 
@@ -26,6 +27,7 @@ pub fn run() {
             get_dicom_image_info,
             get_dicom_frame_image,
             get_dicom_frame_pixels,
+            get_rt_plan_bev_info,
             lookup_dicom_tag,
             validate_value
         ])
