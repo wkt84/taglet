@@ -1,7 +1,7 @@
 {
   "name": "taglet",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,7 @@
     "tauri:dev": "tauri dev",
     "tauri:dev:wsl": "WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1 tauri dev",
     "tauri:build": "tauri build",
-    "version": "node scripts/sync-version.mjs",
+    "version": "node scripts/sync-version.mjs --stage",
     "version:sync": "node scripts/sync-version.mjs"
   },
   "dependencies": {
