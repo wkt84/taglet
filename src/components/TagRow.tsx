@@ -13,18 +13,19 @@ export default function TagRow({ row, selected, onSelect }: Props) {
   const isElementInItem = row.original.kind === 'Element' && row.original.itemIndex !== undefined
   const itemClass = isItem ? 'border-t border-blue-300 bg-blue-100 font-medium text-blue-950' : ''
   const itemChildClass = isElementInItem ? 'bg-blue-50/30' : ''
-  const sequenceClass = isSequence ? 'bg-slate-700 font-semibold text-white shadow-inner' : ''
+  const sequenceClass = isSequence ? 'bg-sky-900 font-semibold text-white shadow-inner' : ''
   const stripeClass = isSequence || isItem ? '' : row.index % 2 === 0 ? 'bg-white' : 'bg-slate-50'
   const selectedClass = selected
     ? isSequence || isItem
       ? 'outline outline-2 outline-amber-300 outline-offset-[-2px]'
       : 'outline outline-2 outline-blue-400 outline-offset-[-2px]'
     : ''
-  const hoverClass = isSequence ? 'hover:bg-slate-600' : isItem ? 'hover:bg-blue-200' : 'hover:bg-blue-100/60'
+  const hoverClass = isSequence ? 'hover:bg-sky-800' : isItem ? 'hover:bg-blue-200' : 'hover:bg-blue-100/60'
   const canToggle = isSequence || isItem
 
   return (
     <tr
+      data-row-path={rowPathKey(row.original.path)}
       className={`${stripeClass} ${itemClass} ${itemChildClass} ${sequenceClass} ${selectedClass} ${hoverClass} ${
         canToggle ? 'cursor-pointer' : ''
       }`}
@@ -38,7 +39,7 @@ export default function TagRow({ row, selected, onSelect }: Props) {
         <td
           key={cell.id}
           className={`border-b border-r px-3 py-1.5 align-top last:border-r-0 ${
-            isSequence ? 'border-slate-600' : isItem ? 'border-blue-200' : 'border-slate-200'
+            isSequence ? 'border-sky-800' : isItem ? 'border-blue-200' : 'border-slate-200'
           }`}
         >
           {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -46,4 +47,8 @@ export default function TagRow({ row, selected, onSelect }: Props) {
       ))}
     </tr>
   )
+}
+
+function rowPathKey(path: string[]) {
+  return path.map((part) => encodeURIComponent(part)).join('/')
 }

@@ -155,6 +155,7 @@ export default function App() {
       <section className="min-h-0 flex-1 overflow-hidden p-4">
         <TagTable
           nodes={dicom.nodes}
+          filePath={dicom.filePath}
           selectedPath={selectedPath}
           onChange={dicom.updateNodeValue}
           onDelete={dicom.deleteNodeByPath}
