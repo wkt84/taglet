@@ -71,6 +71,42 @@ For WSLg environments where GPU/EGL warnings are noisy, try:
 npm run tauri:dev:wsl
 ```
 
+## Versioning
+
+Use `package.json` as the version source of truth.
+
+```bash
+npm version patch
+```
+
+The npm `version` lifecycle runs `scripts/sync-version.mjs`, which syncs the new version to:
+
+- `package-lock.json`
+- `src-tauri/Cargo.toml`
+
+If the files ever drift, run:
+
+```bash
+npm run version:sync
+```
+
+## Updates
+
+Taglet is intended to use GitHub Releases from `wkt84/taglet` for app updates.
+
+For Tauri updater support, generate a signing key pair locally, keep the private key out of git, and store it in GitHub Actions secrets. Only the public key should be embedded in the app configuration.
+
+Recommended GitHub Actions secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+
+Planned updater endpoint:
+
+```text
+https://github.com/wkt84/taglet/releases/latest/download/latest.json
+```
+
 ## Tech Stack
 
 - Rust

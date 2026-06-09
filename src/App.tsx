@@ -7,6 +7,7 @@ import BevViewer from './components/BevViewer'
 import ImageViewer from './components/ImageViewer'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
+import UpdateChecker from './components/UpdateChecker'
 import { useDicomFile } from './hooks/useDicomFile'
 import type { DicomNode } from './types/dicom'
 
@@ -130,6 +131,7 @@ export default function App() {
 
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">
+      <UpdateChecker />
       <Toolbar
         title={title}
         {...dicom}
