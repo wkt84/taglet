@@ -11,6 +11,7 @@ type Props = {
   openAddTagDialog: () => void
   openImageViewer: () => void
   openBevViewer: () => void
+  openRtStructViewer: () => void
   saveFile: () => Promise<void>
   saveFileAs: () => Promise<void>
 }
@@ -25,6 +26,7 @@ export default function Toolbar({
   openAddTagDialog,
   openImageViewer,
   openBevViewer,
+  openRtStructViewer,
   saveFile,
   saveFileAs,
 }: Props) {
@@ -52,6 +54,9 @@ export default function Toolbar({
         </button>
         <button className="toolbar-button" disabled={!filePath || loading} onClick={openBevViewer}>
           BEV Viewer
+        </button>
+        <button className="toolbar-button" disabled={!filePath || loading} onClick={openRtStructViewer}>
+          RTSTRUCT Viewer
         </button>
       </nav>
 

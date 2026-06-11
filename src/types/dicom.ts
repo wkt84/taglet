@@ -15,6 +15,8 @@ export type DicomSequence = {
   description: string
   length: number
   path: string[]
+  item_count: number
+  items_truncated: boolean
   items: DicomNode[][]
 }
 
@@ -107,6 +109,56 @@ export type RtPlanBeamLimitingDevicePosition = {
   device_type: string
   positions: number[]
   inherited: boolean
+}
+
+export type RtStructInfo = {
+  supported: boolean
+  unsupported_reason?: string | null
+  modality?: string | null
+  structure_set_label?: string | null
+  rois: RtStructRoi[]
+  slices: RtStructSlice[]
+  bounds?: RtStructBounds | null
+}
+
+export type RtStructRoi = {
+  roi_number: number
+  name?: string | null
+  color?: [number, number, number] | null
+  contour_count: number
+}
+
+export type RtStructSlice = {
+  z: number
+  contour_count: number
+}
+
+export type RtStructBounds = {
+  min_x: number
+  max_x: number
+  min_y: number
+  max_y: number
+  min_z: number
+  max_z: number
+}
+
+export type RtStructSliceContours = {
+  z: number
+  contours: RtStructContour[]
+}
+
+export type RtStructContour = {
+  roi_number: number
+  roi_name?: string | null
+  color?: [number, number, number] | null
+  geometric_type?: string | null
+  points: RtStructPoint[]
+}
+
+export type RtStructPoint = {
+  x: number
+  y: number
+  z: number
 }
 
 export type TableDicomRow =

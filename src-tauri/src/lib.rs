@@ -7,6 +7,7 @@ use commands::file::{
 };
 use commands::image::{get_dicom_frame_image, get_dicom_frame_pixels, get_dicom_image_info};
 use commands::plan::get_rt_plan_bev_info;
+use commands::structure::{get_rt_struct_info, get_rt_struct_slice_contours};
 use commands::tags::lookup_dicom_tag;
 use commands::validate::validate_value;
 
@@ -31,6 +32,8 @@ pub fn run() {
             get_dicom_frame_image,
             get_dicom_frame_pixels,
             get_rt_plan_bev_info,
+            get_rt_struct_info,
+            get_rt_struct_slice_contours,
             lookup_dicom_tag,
             validate_value
         ])

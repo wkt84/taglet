@@ -11,7 +11,8 @@ use std::str::FromStr;
 use super::model::{
     DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo, RtPlanBeam,
     RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition, RtPlanBevInfo,
-    RtPlanControlPoint,
+    RtPlanControlPoint, RtStructBounds, RtStructContour, RtStructInfo, RtStructPoint, RtStructRoi,
+    RtStructSlice, RtStructSliceContours,
 };
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
@@ -30,6 +31,19 @@ const LEAF_JAW_POSITIONS: Tag = Tag(0x300A, 0x011C);
 const GANTRY_ANGLE: Tag = Tag(0x300A, 0x011E);
 const BEAM_LIMITING_DEVICE_ANGLE: Tag = Tag(0x300A, 0x0120);
 const PATIENT_SUPPORT_ANGLE: Tag = Tag(0x300A, 0x0122);
+const STRUCTURE_SET_LABEL: Tag = Tag(0x3006, 0x0002);
+const STRUCTURE_SET_ROI_SEQUENCE: Tag = Tag(0x3006, 0x0020);
+const ROI_NUMBER: Tag = Tag(0x3006, 0x0022);
+const ROI_NAME: Tag = Tag(0x3006, 0x0026);
+const ROI_DISPLAY_COLOR: Tag = Tag(0x3006, 0x002A);
+const ROI_CONTOUR_SEQUENCE: Tag = Tag(0x3006, 0x0039);
+const CONTOUR_SEQUENCE: Tag = Tag(0x3006, 0x0040);
+const CONTOUR_GEOMETRIC_TYPE: Tag = Tag(0x3006, 0x0042);
+const NUMBER_OF_CONTOUR_POINTS: Tag = Tag(0x3006, 0x0046);
+const CONTOUR_DATA: Tag = Tag(0x3006, 0x0050);
+const REFERENCED_ROI_NUMBER: Tag = Tag(0x3006, 0x0084);
+const RTSTRUCT_Z_TOLERANCE: f64 = 0.01;
+const MAX_CONTOUR_SEQUENCE_ITEMS_IN_TAG_TREE: usize = 80;
 
 pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, Vec<DicomNode>), String> {
     let obj = OpenFileOptions::new()
@@ -338,6 +352,90 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
     })
 }
 
+pub fn rt_struct_info(obj: &DefaultDicomObject) -> Result<RtStructInfo, String> {
+    let modality = get_string(obj, tags::MODALITY);
+    if modality.as_deref() != Some("RTSTRUCT") {
+        return Ok(RtStructInfo {
+            supported: false,
+            unsupported_reason: Some(
+                "RT Structure Set viewer is available for RTSTRUCT objects only".to_string(),
+            ),
+            modality,
+            structure_set_label: get_string(obj, STRUCTURE_SET_LABEL),
+            rois: Vec::new(),
+            slices: Vec::new(),
+            bounds: None,
+        });
+    }
+
+    let roi_names = structure_set_roi_names(obj);
+    let roi_contours = rt_struct_contours(obj, &roi_names);
+    let rois = rt_struct_rois(obj, &roi_names, &roi_contours);
+    let slices = rt_struct_slices(&roi_contours);
+    let bounds = rt_struct_bounds(&roi_contours);
+    let supported = !roi_contours.is_empty();
+
+    Ok(RtStructInfo {
+        supported,
+        unsupported_reason: if supported {
+            None
+        } else {
+            Some("ROI Contour Sequence is missing or contains no contour data".to_string())
+        },
+        modality,
+        structure_set_label: get_string(obj, STRUCTURE_SET_LABEL),
+        rois,
+        slices,
+        bounds,
+    })
+}
+
+pub fn rt_struct_slice_contours(
+    obj: &DefaultDicomObject,
+    z: f64,
+    roi_numbers: Vec<i32>,
+) -> Result<RtStructSliceContours, String> {
+    let info = rt_struct_info(obj)?;
+    if !info.supported {
+        return Err(info
+            .unsupported_reason
+            .unwrap_or_else(|| "RT Structure Set is not supported".to_string()));
+    }
+
+    let selected_z = info
+        .slices
+        .iter()
+        .min_by(|left, right| {
+            (left.z - z)
+                .abs()
+                .partial_cmp(&(right.z - z).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|slice| slice.z)
+        .ok_or_else(|| "No contour slices are available".to_string())?;
+    if roi_numbers.is_empty() {
+        return Ok(RtStructSliceContours {
+            z: selected_z,
+            contours: Vec::new(),
+        });
+    }
+
+    let roi_filter = roi_numbers.into_iter().collect::<HashSet<_>>();
+    let roi_names = structure_set_roi_names(obj);
+    let contours = rt_struct_contours(obj, &roi_names)
+        .into_iter()
+        .filter(|contour| {
+            same_slice_z(contour_slice_z(contour).unwrap_or(selected_z), selected_z)
+                && roi_filter.contains(&contour.roi_number)
+        })
+        .collect();
+
+    Ok(RtStructSliceContours {
+        z: selected_z,
+        contours,
+    })
+}
+
 pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<DicomNode> {
     obj.iter()
         .map(|element| {
@@ -347,22 +445,38 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
             path.push(tag_text.clone());
 
             match element.value() {
-                Value::Sequence(sequence) => DicomNode::Sequence {
-                    tag: tag_text,
-                    description: description_for(tag),
-                    length: length_to_u32(element.length()),
-                    path: path.clone(),
-                    items: sequence
-                        .items()
-                        .iter()
-                        .enumerate()
-                        .map(|(index, item)| {
-                            let mut item_path = path.clone();
-                            item_path.push(format!("Item#{index}"));
-                            object_to_nodes(item, item_path)
-                        })
-                        .collect(),
-                },
+                Value::Sequence(sequence) => {
+                    let item_count = sequence.items().len();
+                    let items_truncated = tag == CONTOUR_SEQUENCE
+                        && item_count > MAX_CONTOUR_SEQUENCE_ITEMS_IN_TAG_TREE;
+                    let rendered_items = if items_truncated {
+                        &sequence.items()[..MAX_CONTOUR_SEQUENCE_ITEMS_IN_TAG_TREE]
+                    } else {
+                        sequence.items()
+                    };
+
+                    DicomNode::Sequence {
+                        tag: tag_text,
+                        description: description_for(tag),
+                        length: length_to_u32(element.length()),
+                        path: path.clone(),
+                        item_count,
+                        items_truncated,
+                        items: rendered_items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                let mut item_path = path.clone();
+                                item_path.push(format!("Item#{index}"));
+                                if tag == CONTOUR_SEQUENCE {
+                                    contour_item_to_nodes(item, item_path)
+                                } else {
+                                    object_to_nodes(item, item_path)
+                                }
+                            })
+                            .collect(),
+                    }
+                }
                 Value::PixelSequence(_) if tag == PIXEL_DATA => DicomNode::Element {
                     tag: tag_text,
                     vr: element.header().vr().to_string().to_owned(),
@@ -378,7 +492,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                         tag: tag_text,
                         vr: vr.to_string().to_owned(),
                         description: description_for(tag),
-                        value: display_value(element.value()),
+                        value: display_value(tag, element.value()),
                         length: length_to_u32(element.length()),
                         path,
                         editable: tag != PIXEL_DATA && is_text_editable(vr),
@@ -473,7 +587,11 @@ fn pixel_data_placeholder_node() -> DicomNode {
     }
 }
 
-fn display_value(value: &Value<InMemDicomObject>) -> String {
+fn display_value(tag: Tag, value: &Value<InMemDicomObject>) -> String {
+    if tag == CONTOUR_DATA {
+        return "[Contour Data]".to_string();
+    }
+
     match value {
         Value::Primitive(PrimitiveValue::Empty) => String::new(),
         Value::Primitive(_) => value
@@ -483,6 +601,47 @@ fn display_value(value: &Value<InMemDicomObject>) -> String {
         Value::PixelSequence(_) => "[Binary Data]".to_string(),
         Value::Sequence(sequence) => format!("[Sequence: {} item(s)]", sequence.items().len()),
     }
+}
+
+fn contour_item_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<DicomNode> {
+    let contour_point_count = get_u32(obj, NUMBER_OF_CONTOUR_POINTS);
+
+    obj.iter()
+        .filter_map(|element| {
+            let tag = element.tag();
+            if !matches!(
+                tag,
+                CONTOUR_GEOMETRIC_TYPE | NUMBER_OF_CONTOUR_POINTS | CONTOUR_DATA
+            ) {
+                return None;
+            }
+
+            let tag_text = format_tag(tag);
+            let mut path = parent_path.clone();
+            path.push(tag_text.clone());
+            let vr = element.header().vr();
+            let value = if tag == CONTOUR_DATA {
+                contour_data_summary(contour_point_count)
+            } else {
+                display_value(tag, element.value())
+            };
+            Some(DicomNode::Element {
+                tag: tag_text,
+                vr: vr.to_string().to_owned(),
+                description: description_for(tag),
+                value,
+                length: length_to_u32(element.length()),
+                path,
+                editable: false,
+            })
+        })
+        .collect()
+}
+
+fn contour_data_summary(point_count: Option<u32>) -> String {
+    point_count
+        .map(|count| format!("[Contour Data: {count} point(s)]"))
+        .unwrap_or_else(|| "[Contour Data]".to_string())
 }
 
 fn description_for(tag: Tag) -> String {
@@ -568,6 +727,12 @@ fn get_u32(obj: &InMemDicomObject, tag: Tag) -> Option<u32> {
     })
 }
 
+fn get_u32_values(obj: &InMemDicomObject, tag: Tag) -> Vec<u32> {
+    obj.get(tag)
+        .and_then(|element| element.to_multi_int::<u32>().ok())
+        .unwrap_or_default()
+}
+
 fn get_i32(obj: &InMemDicomObject, tag: Tag) -> Option<i32> {
     obj.get(tag).and_then(|element| {
         element
@@ -588,6 +753,199 @@ fn sequence_items(obj: &InMemDicomObject, tag: Tag) -> Option<&[InMemDicomObject
         Value::Sequence(sequence) => Some(sequence.items()),
         _ => None,
     })
+}
+
+fn structure_set_roi_names(obj: &InMemDicomObject) -> HashMap<i32, String> {
+    sequence_items(obj, STRUCTURE_SET_ROI_SEQUENCE)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let roi_number = get_i32(item, ROI_NUMBER)?;
+                    let name = get_string(item, ROI_NAME)?;
+                    Some((roi_number, name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn rt_struct_rois(
+    obj: &InMemDicomObject,
+    roi_names: &HashMap<i32, String>,
+    contours: &[RtStructContour],
+) -> Vec<RtStructRoi> {
+    let contour_counts =
+        contours
+            .iter()
+            .fold(HashMap::<i32, usize>::new(), |mut counts, contour| {
+                *counts.entry(contour.roi_number).or_default() += 1;
+                counts
+            });
+    let colors = contours
+        .iter()
+        .fold(HashMap::<i32, [u8; 3]>::new(), |mut colors, contour| {
+            if let Some(color) = contour.color {
+                colors.entry(contour.roi_number).or_insert(color);
+            }
+            colors
+        });
+
+    let mut rois = sequence_items(obj, STRUCTURE_SET_ROI_SEQUENCE)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let roi_number = get_i32(item, ROI_NUMBER)?;
+                    Some(RtStructRoi {
+                        roi_number,
+                        name: get_string(item, ROI_NAME),
+                        color: colors.get(&roi_number).copied(),
+                        contour_count: *contour_counts.get(&roi_number).unwrap_or(&0),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for contour in contours {
+        if !rois.iter().any(|roi| roi.roi_number == contour.roi_number) {
+            rois.push(RtStructRoi {
+                roi_number: contour.roi_number,
+                name: roi_names.get(&contour.roi_number).cloned(),
+                color: contour.color,
+                contour_count: *contour_counts.get(&contour.roi_number).unwrap_or(&0),
+            });
+        }
+    }
+
+    rois.sort_by_key(|roi| roi.roi_number);
+    rois
+}
+
+fn rt_struct_contours(
+    obj: &InMemDicomObject,
+    roi_names: &HashMap<i32, String>,
+) -> Vec<RtStructContour> {
+    sequence_items(obj, ROI_CONTOUR_SEQUENCE)
+        .map(|roi_items| {
+            roi_items
+                .iter()
+                .flat_map(|roi_item| {
+                    let roi_number = get_i32(roi_item, REFERENCED_ROI_NUMBER).unwrap_or_default();
+                    let roi_name = roi_names.get(&roi_number).cloned();
+                    let color = get_rgb_color(roi_item, ROI_DISPLAY_COLOR);
+                    sequence_items(roi_item, CONTOUR_SEQUENCE)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(move |contour_item| {
+                            let points = contour_points(contour_item);
+                            if points.len() < 2 {
+                                return None;
+                            }
+
+                            Some(RtStructContour {
+                                roi_number,
+                                roi_name: roi_name.clone(),
+                                color,
+                                geometric_type: get_string(contour_item, CONTOUR_GEOMETRIC_TYPE),
+                                points,
+                            })
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn contour_points(obj: &InMemDicomObject) -> Vec<RtStructPoint> {
+    get_f64_values(obj, CONTOUR_DATA)
+        .chunks_exact(3)
+        .map(|point| RtStructPoint {
+            x: point[0],
+            y: point[1],
+            z: point[2],
+        })
+        .collect()
+}
+
+fn get_rgb_color(obj: &InMemDicomObject, tag: Tag) -> Option<[u8; 3]> {
+    let values = get_u32_values(obj, tag);
+    if values.len() < 3 {
+        return None;
+    }
+
+    Some([
+        values[0].min(255) as u8,
+        values[1].min(255) as u8,
+        values[2].min(255) as u8,
+    ])
+}
+
+fn rt_struct_slices(contours: &[RtStructContour]) -> Vec<RtStructSlice> {
+    let mut slices = Vec::<RtStructSlice>::new();
+
+    for z in contours.iter().filter_map(contour_slice_z) {
+        if let Some(slice) = slices.iter_mut().find(|slice| same_slice_z(slice.z, z)) {
+            slice.contour_count += 1;
+        } else {
+            slices.push(RtStructSlice {
+                z,
+                contour_count: 1,
+            });
+        }
+    }
+
+    slices.sort_by(|left, right| {
+        left.z
+            .partial_cmp(&right.z)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    slices
+}
+
+fn rt_struct_bounds(contours: &[RtStructContour]) -> Option<RtStructBounds> {
+    let mut bounds = RtStructBounds {
+        min_x: f64::INFINITY,
+        max_x: f64::NEG_INFINITY,
+        min_y: f64::INFINITY,
+        max_y: f64::NEG_INFINITY,
+        min_z: f64::INFINITY,
+        max_z: f64::NEG_INFINITY,
+    };
+
+    for point in contours.iter().flat_map(|contour| contour.points.iter()) {
+        bounds.min_x = bounds.min_x.min(point.x);
+        bounds.max_x = bounds.max_x.max(point.x);
+        bounds.min_y = bounds.min_y.min(point.y);
+        bounds.max_y = bounds.max_y.max(point.y);
+        bounds.min_z = bounds.min_z.min(point.z);
+        bounds.max_z = bounds.max_z.max(point.z);
+    }
+
+    if bounds.min_x.is_finite()
+        && bounds.max_x.is_finite()
+        && bounds.min_y.is_finite()
+        && bounds.max_y.is_finite()
+        && bounds.min_z.is_finite()
+        && bounds.max_z.is_finite()
+    {
+        Some(bounds)
+    } else {
+        None
+    }
+}
+
+fn contour_slice_z(contour: &RtStructContour) -> Option<f64> {
+    if contour.points.is_empty() {
+        return None;
+    }
+
+    Some(contour.points.iter().map(|point| point.z).sum::<f64>() / contour.points.len() as f64)
+}
+
+fn same_slice_z(left: f64, right: f64) -> bool {
+    (left - right).abs() <= RTSTRUCT_Z_TOLERANCE
 }
 
 fn beam_limiting_device_positions(

@@ -6,6 +6,7 @@ import AddTagDialog from './components/AddTagDialog'
 import BevViewer from './components/BevViewer'
 import DocumentTabs from './components/DocumentTabs'
 import ImageViewer from './components/ImageViewer'
+import RtStructViewer from './components/RtStructViewer'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
 import UpdateChecker from './components/UpdateChecker'
@@ -67,6 +68,7 @@ export default function App() {
   const [addingTag, setAddingTag] = useState(false)
   const [showingImageViewer, setShowingImageViewer] = useState(false)
   const [showingBevViewer, setShowingBevViewer] = useState(false)
+  const [showingRtStructViewer, setShowingRtStructViewer] = useState(false)
   const openPaths = dicom.openPaths
   const selectedPath = dicom.selectedPath
   const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
@@ -90,6 +92,7 @@ export default function App() {
         setAddingTag(false)
         setShowingImageViewer(false)
         setShowingBevViewer(false)
+        setShowingRtStructViewer(false)
       }
     }
 
@@ -139,12 +142,14 @@ export default function App() {
             setAddingTag(false)
             setShowingImageViewer(false)
             setShowingBevViewer(false)
+            setShowingRtStructViewer(false)
           }
           return closed
         }}
         openAddTagDialog={() => setAddingTag(true)}
         openImageViewer={() => setShowingImageViewer(true)}
         openBevViewer={() => setShowingBevViewer(true)}
+        openRtStructViewer={() => setShowingRtStructViewer(true)}
       />
       <DocumentTabs
         documents={dicom.documents}
@@ -156,6 +161,7 @@ export default function App() {
               setAddingTag(false)
               setShowingImageViewer(false)
               setShowingBevViewer(false)
+              setShowingRtStructViewer(false)
             }
           })
         }}
@@ -165,6 +171,7 @@ export default function App() {
             setAddingTag(false)
             setShowingImageViewer(false)
             setShowingBevViewer(false)
+            setShowingRtStructViewer(false)
           }
         }}
       />
@@ -197,6 +204,7 @@ export default function App() {
       ) : null}
       {showingImageViewer ? <ImageViewer onClose={() => setShowingImageViewer(false)} /> : null}
       {showingBevViewer ? <BevViewer onClose={() => setShowingBevViewer(false)} /> : null}
+      {showingRtStructViewer ? <RtStructViewer onClose={() => setShowingRtStructViewer(false)} /> : null}
     </main>
   )
 }

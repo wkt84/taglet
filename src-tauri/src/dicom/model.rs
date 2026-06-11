@@ -17,6 +17,8 @@ pub enum DicomNode {
         description: String,
         length: u32,
         path: Vec<String>,
+        item_count: usize,
+        items_truncated: bool,
         items: Vec<Vec<DicomNode>>,
     },
 }
@@ -126,6 +128,63 @@ pub struct RtPlanBeamLimitingDevicePosition {
     pub device_type: String,
     pub positions: Vec<f64>,
     pub inherited: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructInfo {
+    pub supported: bool,
+    pub unsupported_reason: Option<String>,
+    pub modality: Option<String>,
+    pub structure_set_label: Option<String>,
+    pub rois: Vec<RtStructRoi>,
+    pub slices: Vec<RtStructSlice>,
+    pub bounds: Option<RtStructBounds>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructRoi {
+    pub roi_number: i32,
+    pub name: Option<String>,
+    pub color: Option<[u8; 3]>,
+    pub contour_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructSlice {
+    pub z: f64,
+    pub contour_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructBounds {
+    pub min_x: f64,
+    pub max_x: f64,
+    pub min_y: f64,
+    pub max_y: f64,
+    pub min_z: f64,
+    pub max_z: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructSliceContours {
+    pub z: f64,
+    pub contours: Vec<RtStructContour>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructContour {
+    pub roi_number: i32,
+    pub roi_name: Option<String>,
+    pub color: Option<[u8; 3]>,
+    pub geometric_type: Option<String>,
+    pub points: Vec<RtStructPoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RtStructPoint {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
 }
 
 impl ValidationResult {
