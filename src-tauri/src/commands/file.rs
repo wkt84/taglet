@@ -5,11 +5,12 @@ use std::sync::Mutex;
 use dicom_object::DefaultDicomObject;
 use tauri::State;
 
-use crate::dicom::model::DicomNode;
-use crate::dicom::parser::{apply_nodes_to_object, open_full_object, open_nodes};
+use crate::dicom::model::{DicomNode, RtStructData};
+use crate::dicom::parser::{apply_nodes_to_object, open_full_object, open_nodes, rt_struct_data};
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
+    rt_struct: Option<RtStructData>,
 }
 
 #[derive(Default)]
@@ -97,6 +98,54 @@ impl DicomStore {
             .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
         f(object)
     }
+
+    pub fn with_current_rt_struct_data<R>(
+        &self,
+        f: impl FnOnce(&RtStructData) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let current_path = self
+            .current_path
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "No DICOM file is currently open".to_string())?;
+        let mut objects = self
+            .objects
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?;
+        let stored = objects
+            .get(&current_path)
+            .ok_or_else(|| "Original DICOM object is not loaded in this session".to_string())?;
+        if stored.full.is_none() {
+            drop(objects);
+            let full = open_full_object(&current_path)?;
+            objects = self
+                .objects
+                .lock()
+                .map_err(|_| "DICOM store lock poisoned".to_string())?;
+            let stored = objects
+                .get_mut(&current_path)
+                .ok_or_else(|| "Original DICOM object is not loaded in this session".to_string())?;
+            stored.full = Some(full);
+        }
+
+        let stored = objects
+            .get_mut(&current_path)
+            .ok_or_else(|| "Original DICOM object is not loaded in this session".to_string())?;
+        if stored.rt_struct.is_none() {
+            let object = stored
+                .full
+                .as_ref()
+                .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
+            stored.rt_struct = Some(rt_struct_data(object)?);
+        }
+
+        let data = stored
+            .rt_struct
+            .as_ref()
+            .ok_or_else(|| "RT Structure data is not loaded in this session".to_string())?;
+        f(data)
+    }
 }
 
 #[tauri::command]
@@ -138,7 +187,13 @@ pub async fn open_dicom_file(
         .objects
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())?
-        .insert(path.clone(), StoredDicomObject { full: None });
+        .insert(
+            path.clone(),
+            StoredDicomObject {
+                full: None,
+                rt_struct: None,
+            },
+        );
     *store
         .current_path
         .lock()
@@ -193,12 +248,19 @@ fn save_to_path(
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
     apply_nodes_to_object(object, &nodes)?;
+    stored.rt_struct = None;
     object
         .write_to_file(&destination_path)
         .map_err(|error| error.to_string())?;
 
     if source_path != destination_path {
-        objects.insert(destination_path.clone(), StoredDicomObject { full: None });
+        objects.insert(
+            destination_path.clone(),
+            StoredDicomObject {
+                full: None,
+                rt_struct: None,
+            },
+        );
     }
     *store
         .current_path

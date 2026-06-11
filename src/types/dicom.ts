@@ -15,8 +15,6 @@ export type DicomSequence = {
   description: string
   length: number
   path: string[]
-  item_count: number
-  items_truncated: boolean
   items: DicomNode[][]
 }
 

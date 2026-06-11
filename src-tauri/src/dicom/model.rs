@@ -17,8 +17,6 @@ pub enum DicomNode {
         description: String,
         length: u32,
         path: Vec<String>,
-        item_count: usize,
-        items_truncated: bool,
         items: Vec<Vec<DicomNode>>,
     },
 }
@@ -139,6 +137,12 @@ pub struct RtStructInfo {
     pub rois: Vec<RtStructRoi>,
     pub slices: Vec<RtStructSlice>,
     pub bounds: Option<RtStructBounds>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RtStructData {
+    pub info: RtStructInfo,
+    pub contours: Vec<RtStructContour>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

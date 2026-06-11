@@ -108,7 +108,7 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
             </span>
           ) : (
             <span className="inline-flex items-center rounded bg-white/15 px-2 py-0.5 text-xs font-medium text-white ring-1 ring-white/20">
-              {sequenceItemText(row.original)}
+              {row.original.items.length} {row.original.items.length === 1 ? 'item' : 'items'}
             </span>
           ),
       },
@@ -325,14 +325,8 @@ function rowPathKey(path: string[]) {
 
 function rowValue(row: TableDicomRow) {
   if (row.kind === 'Element') return row.value || '-'
-  if (row.kind === 'Sequence') return sequenceItemText(row)
+  if (row.kind === 'Sequence') return `${row.items.length} item${row.items.length === 1 ? '' : 's'}`
   return `${row.childCount} tag${row.childCount === 1 ? '' : 's'}`
-}
-
-function sequenceItemText(row: Extract<TableDicomRow, { kind: 'Sequence' }>) {
-  const count = row.item_count ?? row.items.length
-  const base = `${count} item${count === 1 ? '' : 's'}`
-  return row.items_truncated ? `${base} (showing first ${row.items.length})` : base
 }
 
 function searchRows(rows: TableDicomRow[], query: string) {

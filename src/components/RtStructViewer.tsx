@@ -64,9 +64,9 @@ function boundsExtent(bounds: RtStructBounds) {
 function contourPath(contour: RtStructContour) {
   if (contour.points.length === 0) return ''
   const [first, ...rest] = contour.points
-  const parts = [`M ${first.x} ${-first.y}`]
+  const parts = [`M ${first.x} ${first.y}`]
   for (const point of rest) {
-    parts.push(`L ${point.x} ${-point.y}`)
+    parts.push(`L ${point.x} ${point.y}`)
   }
   if (contour.geometric_type === 'CLOSED_PLANAR') {
     parts.push('Z')
@@ -78,11 +78,17 @@ function zoomBy(value: number, factor: number) {
   return Math.min(12, Math.max(0.5, value * factor))
 }
 
+function sliceCacheKey(z: number, roiNumbers: number[]) {
+  return `${z}:${roiNumbers.join(',')}`
+}
+
 export default function RtStructViewer({ onClose }: Props) {
   const dragStartRef = useRef<{ x: number; y: number }>()
+  const sliceCacheRef = useRef<Map<string, RtStructSliceContours>>(new Map())
   const [info, setInfo] = useState<RtStructInfo>()
   const [sliceContours, setSliceContours] = useState<RtStructSliceContours>()
   const [sliceIndex, setSliceIndex] = useState(0)
+  const [debouncedSliceIndex, setDebouncedSliceIndex] = useState(0)
   const [selectedRois, setSelectedRois] = useState<number[]>([])
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
@@ -100,7 +106,9 @@ export default function RtStructViewer({ onClose }: Props) {
         if (canceled) return
         setInfo(value)
         setSliceIndex(0)
+        setDebouncedSliceIndex(0)
         setSelectedRois(value.rois.map((roi) => roi.roi_number))
+        sliceCacheRef.current.clear()
         setZoom(1)
         setPan({ x: 0, y: 0 })
       })
@@ -117,19 +125,39 @@ export default function RtStructViewer({ onClose }: Props) {
   }, [])
 
   const selectedSlice = info?.slices[sliceIndex]
+  const contourSlice = info?.slices[debouncedSliceIndex]
   useEffect(() => {
-    if (!info?.supported || !selectedSlice) return
+    const timer = window.setTimeout(() => {
+      setDebouncedSliceIndex(sliceIndex)
+    }, 140)
+
+    return () => window.clearTimeout(timer)
+  }, [sliceIndex])
+
+  useEffect(() => {
+    if (!info?.supported || !contourSlice) return
+
+    const cacheKey = sliceCacheKey(contourSlice.z, selectedRois)
+    const cached = sliceCacheRef.current.get(cacheKey)
+    if (cached) {
+      setSliceContours(cached)
+      setContoursLoading(false)
+      return
+    }
 
     let canceled = false
     setContoursLoading(true)
     setError(undefined)
 
     invoke<RtStructSliceContours>('get_rt_struct_slice_contours', {
-      z: selectedSlice.z,
+      z: contourSlice.z,
       roiNumbers: selectedRois,
     })
       .then((value) => {
-        if (!canceled) setSliceContours(value)
+        if (!canceled) {
+          sliceCacheRef.current.set(cacheKey, value)
+          setSliceContours(value)
+        }
       })
       .catch((error) => {
         if (!canceled) setError(String(error))
@@ -141,7 +169,7 @@ export default function RtStructViewer({ onClose }: Props) {
     return () => {
       canceled = true
     }
-  }, [info?.supported, selectedRois, selectedSlice?.z])
+  }, [info?.supported, selectedRois, contourSlice?.z])
 
   const roiColorByNumber = useMemo(
     () => new Map(info?.rois.map((roi, index) => [roi.roi_number, colorCss(roi.color, index)]) ?? []),
@@ -151,7 +179,7 @@ export default function RtStructViewer({ onClose }: Props) {
   const center = bounds ? boundsCenter(bounds) : { x: 0, y: 0 }
   const extent = bounds ? boundsExtent(bounds) : 200
   const viewSize = extent / zoom
-  const viewBox = `${center.x - viewSize / 2 - pan.x} ${-center.y - viewSize / 2 - pan.y} ${viewSize} ${viewSize}`
+  const viewBox = `${center.x - viewSize / 2 - pan.x} ${center.y - viewSize / 2 - pan.y} ${viewSize} ${viewSize}`
   const strokeWidth = Math.max(viewSize / 360, 0.2)
 
   function fit() {
@@ -229,7 +257,7 @@ export default function RtStructViewer({ onClose }: Props) {
                   }}
                 >
                   <line x1={bounds.min_x} y1={0} x2={bounds.max_x} y2={0} stroke="#334155" strokeWidth={strokeWidth} />
-                  <line x1={0} y1={-bounds.min_y} x2={0} y2={-bounds.max_y} stroke="#334155" strokeWidth={strokeWidth} />
+                  <line x1={0} y1={bounds.min_y} x2={0} y2={bounds.max_y} stroke="#334155" strokeWidth={strokeWidth} />
                   {sliceContours?.contours.map((contour, index) => (
                     <path
                       key={`${contour.roi_number}-${index}`}

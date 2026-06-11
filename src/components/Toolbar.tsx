@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from 'react'
 import type { DicomNode } from '../types/dicom'
 
 type Props = {
@@ -30,6 +31,26 @@ export default function Toolbar({
   saveFile,
   saveFileAs,
 }: Props) {
+  const [viewerMenuOpen, setViewerMenuOpen] = useState(false)
+  const viewerMenuRef = useRef<HTMLDivElement>(null)
+  const viewerDisabled = !filePath || loading
+
+  useEffect(() => {
+    function closeViewerMenu(event: MouseEvent) {
+      if (!viewerMenuRef.current?.contains(event.target as Node)) {
+        setViewerMenuOpen(false)
+      }
+    }
+
+    window.addEventListener('mousedown', closeViewerMenu)
+    return () => window.removeEventListener('mousedown', closeViewerMenu)
+  }, [])
+
+  function openViewer(action: () => void) {
+    setViewerMenuOpen(false)
+    action()
+  }
+
   return (
     <header className="flex min-h-16 items-center gap-4 border-b border-slate-950 bg-gradient-to-r from-slate-950 via-slate-900 to-slate-800 px-4 text-white shadow-sm">
       <div className="min-w-0 flex-1">
@@ -49,15 +70,28 @@ export default function Toolbar({
         <button className="toolbar-button" disabled={!filePath || loading} onClick={openAddTagDialog}>
           Add Tag
         </button>
-        <button className="toolbar-button" disabled={!filePath || loading} onClick={openImageViewer}>
-          Image Viewer
-        </button>
-        <button className="toolbar-button" disabled={!filePath || loading} onClick={openBevViewer}>
-          BEV Viewer
-        </button>
-        <button className="toolbar-button" disabled={!filePath || loading} onClick={openRtStructViewer}>
-          RTSTRUCT Viewer
-        </button>
+        <div ref={viewerMenuRef} className="relative">
+          <button
+            className="toolbar-button"
+            disabled={viewerDisabled}
+            onClick={() => setViewerMenuOpen((open) => !open)}
+          >
+            Viewers
+          </button>
+          {viewerMenuOpen ? (
+            <div className="absolute right-0 top-full z-40 mt-2 w-44 overflow-hidden rounded-md border border-slate-700 bg-slate-950 py-1 text-sm text-slate-100 shadow-xl">
+              <button className="block w-full px-3 py-2 text-left hover:bg-slate-800" onClick={() => openViewer(openImageViewer)}>
+                Image Viewer
+              </button>
+              <button className="block w-full px-3 py-2 text-left hover:bg-slate-800" onClick={() => openViewer(openBevViewer)}>
+                BEV Viewer
+              </button>
+              <button className="block w-full px-3 py-2 text-left hover:bg-slate-800" onClick={() => openViewer(openRtStructViewer)}>
+                RTSTRUCT Viewer
+              </button>
+            </div>
+          ) : null}
+        </div>
       </nav>
 
       <div className="h-8 w-px bg-white/10" />
