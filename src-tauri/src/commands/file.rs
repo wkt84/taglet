@@ -100,6 +100,28 @@ impl DicomStore {
 }
 
 #[tauri::command]
+pub async fn set_current_dicom_file(
+    path: Option<String>,
+    store: State<'_, DicomStore>,
+) -> Result<(), String> {
+    if let Some(path) = path.as_ref() {
+        let objects = store
+            .objects
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?;
+        if !objects.contains_key(path) {
+            return Err("DICOM object is not loaded in this session".to_string());
+        }
+    }
+
+    *store
+        .current_path
+        .lock()
+        .map_err(|_| "DICOM store lock poisoned".to_string())? = path;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn take_launch_file_paths(
     store: State<'_, LaunchFileStore>,
 ) -> Result<Vec<String>, String> {

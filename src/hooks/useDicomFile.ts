@@ -1,7 +1,15 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import type { DicomElement, DicomNode } from '../types/dicom'
+
+export type DicomDocument = {
+  id: string
+  filePath: string
+  nodes: DicomNode[]
+  dirty: boolean
+  selectedPath?: string[]
+}
 
 function updateNode(nodes: DicomNode[], path: string[], nextValue: string): DicomNode[] {
   return nodes.map((node) => {
@@ -94,22 +102,74 @@ function insertNode(
 }
 
 export function useDicomFile() {
-  const [filePath, setFilePath] = useState<string>()
-  const [nodes, setNodes] = useState<DicomNode[]>([])
+  const [documents, setDocuments] = useState<DicomDocument[]>([])
+  const documentsRef = useRef<DicomDocument[]>([])
+  const [activeDocumentId, setActiveDocumentId] = useState<string>()
   const [loading, setLoading] = useState(false)
-  const [dirty, setDirty] = useState(false)
   const [error, setError] = useState<string>()
+  const activeDocument = useMemo(
+    () => documents.find((document) => document.id === activeDocumentId),
+    [activeDocumentId, documents],
+  )
+  const filePath = activeDocument?.filePath
+  const nodes = activeDocument?.nodes ?? []
+  const dirty = activeDocument?.dirty ?? false
+
+  useEffect(() => {
+    documentsRef.current = documents
+  }, [documents])
+
+  const updateDocument = useCallback((id: string, update: (document: DicomDocument) => DicomDocument) => {
+    setDocuments((current) => {
+      const next = current.map((document) => (
+        document.id === id ? update(document) : document
+      ))
+      documentsRef.current = next
+      return next
+    })
+  }, [])
+
+  const setBackendCurrentPath = useCallback(async (path?: string) => {
+    await invoke('set_current_dicom_file', { path: path ?? null })
+  }, [])
+
+  const selectDocument = useCallback(async (id: string) => {
+    const document = documentsRef.current.find((current) => current.id === id)
+    if (!document) return false
+
+    setError(undefined)
+    try {
+      await setBackendCurrentPath(document.filePath)
+      setActiveDocumentId(id)
+      return true
+    } catch (error) {
+      setError(String(error))
+      return false
+    }
+  }, [setBackendCurrentPath])
 
   const openPath = useCallback(async (path: string) => {
-    if (dirty && !window.confirm('Discard unsaved changes and open another file?')) return false
-
     setError(undefined)
     setLoading(true)
     try {
+      const existing = documentsRef.current.find((document) => document.filePath === path)
+      if (existing) {
+        await setBackendCurrentPath(existing.filePath)
+        setActiveDocumentId(existing.id)
+        return true
+      }
+
       const loaded = await invoke<DicomNode[]>('open_dicom_file', { path })
-      setFilePath(path)
-      setNodes(loaded)
-      setDirty(false)
+      const id = crypto.randomUUID()
+      setDocuments((current) => {
+        const next = [
+          ...current,
+          { id, filePath: path, nodes: loaded, dirty: false },
+        ]
+        documentsRef.current = next
+        return next
+      })
+      setActiveDocumentId(id)
       return true
     } catch (error) {
       setError(String(error))
@@ -117,81 +177,119 @@ export function useDicomFile() {
     } finally {
       setLoading(false)
     }
-  }, [dirty])
+  }, [setBackendCurrentPath])
+
+  const openPaths = useCallback(async (paths: string[]) => {
+    let opened = false
+    for (const path of paths) {
+      if (await openPath(path)) opened = true
+    }
+    return opened
+  }, [openPath])
 
   const openFile = useCallback(async () => {
     setError(undefined)
     setLoading(true)
     try {
       const selected = await open({
-        multiple: false,
+        multiple: true,
         title: 'Open DICOM file',
       })
 
-      if (typeof selected !== 'string') return false
+      const paths = Array.isArray(selected)
+        ? selected
+        : typeof selected === 'string'
+          ? [selected]
+          : []
+      if (paths.length === 0) return false
 
-      return await openPath(selected)
+      return await openPaths(paths)
     } catch (error) {
       setError(String(error))
       return false
     } finally {
       setLoading(false)
     }
-  }, [openPath])
+  }, [openPaths])
 
   const saveFile = useCallback(async () => {
-    if (!filePath) return
+    if (!activeDocument) return
     setError(undefined)
     setLoading(true)
     try {
-      await invoke('save_dicom_file', { path: filePath, nodes })
-      setDirty(false)
+      await setBackendCurrentPath(activeDocument.filePath)
+      await invoke('save_dicom_file', {
+        path: activeDocument.filePath,
+        nodes: activeDocument.nodes,
+      })
+      updateDocument(activeDocument.id, (document) => ({ ...document, dirty: false }))
     } catch (error) {
       setError(String(error))
     } finally {
       setLoading(false)
     }
-  }, [filePath, nodes])
+  }, [activeDocument, setBackendCurrentPath, updateDocument])
 
   const saveFileAs = useCallback(async () => {
-    if (!filePath) return
+    if (!activeDocument) return
     setError(undefined)
     setLoading(true)
     try {
       const destination = await save({
-        defaultPath: filePath,
+        defaultPath: activeDocument.filePath,
         filters: [{ name: 'DICOM', extensions: ['dcm', 'dicom'] }],
       })
       if (!destination) return
 
-      await invoke('save_dicom_file_as', { path: destination, nodes })
-      setFilePath(destination)
-      setDirty(false)
+      await setBackendCurrentPath(activeDocument.filePath)
+      await invoke('save_dicom_file_as', { path: destination, nodes: activeDocument.nodes })
+      updateDocument(activeDocument.id, (document) => ({
+        ...document,
+        filePath: destination,
+        dirty: false,
+      }))
     } catch (error) {
       setError(String(error))
     } finally {
       setLoading(false)
     }
-  }, [filePath, nodes])
+  }, [activeDocument, setBackendCurrentPath, updateDocument])
 
-  const closeFile = useCallback(() => {
-    if (dirty && !window.confirm('Discard unsaved changes and close this file?')) return false
+  const closeDocument = useCallback((id = activeDocumentId) => {
+    if (!id) return false
+    const closingIndex = documents.findIndex((document) => document.id === id)
+    const closing = documents[closingIndex]
+    if (!closing) return false
+    if (closing.dirty && !window.confirm('Discard unsaved changes and close this file?')) return false
 
-    setFilePath(undefined)
-    setNodes([])
-    setDirty(false)
+    const nextDocuments = documents.filter((document) => document.id !== id)
+    const nextActive = id === activeDocumentId
+      ? nextDocuments[Math.min(closingIndex, nextDocuments.length - 1)]
+      : activeDocument
+
+    documentsRef.current = nextDocuments
+    setDocuments(nextDocuments)
+    setActiveDocumentId(nextActive?.id)
     setError(undefined)
+    void setBackendCurrentPath(nextActive?.filePath)
     return true
-  }, [dirty])
+  }, [activeDocument, activeDocumentId, documents, setBackendCurrentPath])
+
+  const closeFile = useCallback(() => closeDocument(), [closeDocument])
 
   const updateNodeValue = useCallback((path: string[], value: string) => {
-    setNodes((current) => updateNode(current, path, value))
-    setDirty(true)
-  }, [])
+    if (!activeDocumentId) return
+    updateDocument(activeDocumentId, (document) => ({
+      ...document,
+      nodes: updateNode(document.nodes, path, value),
+      dirty: true,
+    }))
+  }, [activeDocumentId, updateDocument])
 
   const addTag = useCallback((parentPath: string[], node: DicomElement) => {
+    if (!activeDocument) return false
     setError(undefined)
-    const result = insertNode(nodes, parentPath, node)
+    const result = insertNode(activeDocument.nodes, parentPath, node)
 
     if (result.duplicate) {
       setError(`${node.tag} already exists in the selected target.`)
@@ -202,18 +300,33 @@ export function useDicomFile() {
       return false
     }
 
-    setNodes(result.nodes)
-    setDirty(true)
+    updateDocument(activeDocument.id, (document) => ({
+      ...document,
+      nodes: result.nodes,
+      dirty: true,
+    }))
     return true
-  }, [nodes])
+  }, [activeDocument, updateDocument])
 
   const deleteNodeByPath = useCallback((path: string[]) => {
-    setNodes((current) => deleteNode(current, path))
-    setDirty(true)
-  }, [])
+    if (!activeDocumentId) return
+    updateDocument(activeDocumentId, (document) => ({
+      ...document,
+      nodes: deleteNode(document.nodes, path),
+      dirty: true,
+    }))
+  }, [activeDocumentId, updateDocument])
+
+  const setSelectedPath = useCallback((path?: string[]) => {
+    if (!activeDocumentId) return
+    updateDocument(activeDocumentId, (document) => ({ ...document, selectedPath: path }))
+  }, [activeDocumentId, updateDocument])
 
   return useMemo(
     () => ({
+      documents,
+      activeDocument,
+      activeDocumentId,
       filePath,
       nodes,
       loading,
@@ -221,17 +334,26 @@ export function useDicomFile() {
       error,
       openFile,
       openPath,
+      openPaths,
+      selectDocument,
+      closeDocument,
       closeFile,
       saveFile,
       saveFileAs,
       updateNodeValue,
       addTag,
       deleteNodeByPath,
+      selectedPath: activeDocument?.selectedPath,
+      setSelectedPath,
     }),
     [
+      activeDocument,
+      activeDocumentId,
       addTag,
+      closeDocument,
       closeFile,
       deleteNodeByPath,
+      documents,
       dirty,
       error,
       filePath,
@@ -239,8 +361,11 @@ export function useDicomFile() {
       nodes,
       openFile,
       openPath,
+      openPaths,
       saveFile,
       saveFileAs,
+      selectDocument,
+      setSelectedPath,
       updateNodeValue,
     ],
   )

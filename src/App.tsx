@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import AddTagDialog from './components/AddTagDialog'
 import BevViewer from './components/BevViewer'
+import DocumentTabs from './components/DocumentTabs'
 import ImageViewer from './components/ImageViewer'
 import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
@@ -66,8 +67,8 @@ export default function App() {
   const [addingTag, setAddingTag] = useState(false)
   const [showingImageViewer, setShowingImageViewer] = useState(false)
   const [showingBevViewer, setShowingBevViewer] = useState(false)
-  const [selectedPath, setSelectedPath] = useState<string[]>()
-  const openPath = dicom.openPath
+  const openPaths = dicom.openPaths
+  const selectedPath = dicom.selectedPath
   const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
   const existingTagsForTarget = useMemo(
     () => tagsAtPath(dicom.nodes, addTargetPath),
@@ -83,12 +84,9 @@ export default function App() {
     let unlistenDrop: (() => void) | undefined
     let unlistenOpenFiles: (() => void) | undefined
 
-    async function openFirstPath(paths: string[]) {
-      const path = paths.find(Boolean)
-      if (!path) return
-      const opened = await openPath(path)
+    async function openDroppedPaths(paths: string[]) {
+      const opened = await openPaths(paths.filter(Boolean))
       if (opened) {
-        setSelectedPath(undefined)
         setAddingTag(false)
         setShowingImageViewer(false)
         setShowingBevViewer(false)
@@ -97,14 +95,14 @@ export default function App() {
 
     invoke<string[]>('take_launch_file_paths')
       .then((paths) => {
-        if (!canceled) void openFirstPath(paths)
+        if (!canceled) void openDroppedPaths(paths)
       })
       .catch(() => {})
 
     getCurrentWebview()
       .onDragDropEvent((event) => {
         if (event.payload.type === 'drop') {
-          void openFirstPath(event.payload.paths)
+          void openDroppedPaths(event.payload.paths)
         }
       })
       .then((unlisten) => {
@@ -114,7 +112,7 @@ export default function App() {
       .catch(() => {})
 
     listen<string[]>('taglet://open-files', (event) => {
-      void openFirstPath(event.payload)
+      void openDroppedPaths(event.payload)
     })
       .then((unlisten) => {
         unlistenOpenFiles = unlisten
@@ -127,7 +125,7 @@ export default function App() {
       unlistenDrop?.()
       unlistenOpenFiles?.()
     }
-  }, [openPath])
+  }, [openPaths])
 
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">
@@ -138,7 +136,6 @@ export default function App() {
         closeFile={() => {
           const closed = dicom.closeFile()
           if (closed) {
-            setSelectedPath(undefined)
             setAddingTag(false)
             setShowingImageViewer(false)
             setShowingBevViewer(false)
@@ -148,6 +145,28 @@ export default function App() {
         openAddTagDialog={() => setAddingTag(true)}
         openImageViewer={() => setShowingImageViewer(true)}
         openBevViewer={() => setShowingBevViewer(true)}
+      />
+      <DocumentTabs
+        documents={dicom.documents}
+        activeDocumentId={dicom.activeDocumentId}
+        loading={dicom.loading}
+        onSelect={(id) => {
+          void dicom.selectDocument(id).then((selected) => {
+            if (selected) {
+              setAddingTag(false)
+              setShowingImageViewer(false)
+              setShowingBevViewer(false)
+            }
+          })
+        }}
+        onClose={(id) => {
+          const closed = dicom.closeDocument(id)
+          if (closed) {
+            setAddingTag(false)
+            setShowingImageViewer(false)
+            setShowingBevViewer(false)
+          }
+        }}
       />
       {dicom.error ? (
         <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
@@ -161,7 +180,7 @@ export default function App() {
           selectedPath={selectedPath}
           onChange={dicom.updateNodeValue}
           onDelete={dicom.deleteNodeByPath}
-          onSelect={setSelectedPath}
+          onSelect={dicom.setSelectedPath}
         />
       </section>
       {addingTag ? (
