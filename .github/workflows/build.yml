@@ -15,10 +15,16 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact_name: taglet-windows-x64
+            release_asset_name_pattern: Taglet_[version]_Windows_x64[setup][ext]
           - os: macos-latest
             target: x86_64-apple-darwin
+            artifact_name: taglet-macos-intel
+            release_asset_name_pattern: Taglet_[version]_macOS_Intel[ext]
           - os: macos-latest
             target: aarch64-apple-darwin
+            artifact_name: taglet-macos-apple-silicon
+            release_asset_name_pattern: Taglet_[version]_macOS_AppleSilicon[ext]
 
     runs-on: ${{ matrix.os }}
 
@@ -48,10 +54,11 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: Taglet ${{ github.ref_name }}
           uploadUpdaterJson: true
+          releaseAssetNamePattern: ${{ matrix.release_asset_name_pattern }}
           args: --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: taglet-${{ matrix.os }}-${{ matrix.target }}
+          name: ${{ matrix.artifact_name }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/
