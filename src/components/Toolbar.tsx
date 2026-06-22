@@ -13,6 +13,7 @@ type Props = {
   openImageViewer: () => void
   openBevViewer: () => void
   openRtStructViewer: () => void
+  openAboutDialog: () => void
   saveFile: () => Promise<void>
   saveFileAs: () => Promise<void>
 }
@@ -28,6 +29,7 @@ export default function Toolbar({
   openImageViewer,
   openBevViewer,
   openRtStructViewer,
+  openAboutDialog,
   saveFile,
   saveFileAs,
 }: Props) {
@@ -105,6 +107,9 @@ export default function Toolbar({
         </button>
         <button className="toolbar-button toolbar-button-danger" disabled={!filePath || loading} onClick={closeFile}>
           Close
+        </button>
+        <button className="toolbar-button" onClick={openAboutDialog}>
+          About
         </button>
       </nav>
     </header>

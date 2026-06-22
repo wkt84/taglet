@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
+import { getVersion } from '@tauri-apps/api/app'
 import AddTagDialog from './components/AddTagDialog'
+import AboutDialog from './components/AboutDialog'
 import BevViewer from './components/BevViewer'
 import DocumentTabs from './components/DocumentTabs'
 import ImageViewer from './components/ImageViewer'
@@ -69,6 +71,8 @@ export default function App() {
   const [showingImageViewer, setShowingImageViewer] = useState(false)
   const [showingBevViewer, setShowingBevViewer] = useState(false)
   const [showingRtStructViewer, setShowingRtStructViewer] = useState(false)
+  const [showingAbout, setShowingAbout] = useState(false)
+  const [appVersion, setAppVersion] = useState<string>()
   const openPaths = dicom.openPaths
   const selectedPath = dicom.selectedPath
   const addTargetPath = useMemo(() => addTargetPathFromSelection(selectedPath), [selectedPath])
@@ -80,6 +84,12 @@ export default function App() {
     const name = fileName(dicom.filePath)
     return name ? `Taglet - ${name}` : 'Taglet'
   }, [dicom.filePath])
+
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {})
+  }, [])
 
   useEffect(() => {
     let canceled = false
@@ -150,6 +160,7 @@ export default function App() {
         openImageViewer={() => setShowingImageViewer(true)}
         openBevViewer={() => setShowingBevViewer(true)}
         openRtStructViewer={() => setShowingRtStructViewer(true)}
+        openAboutDialog={() => setShowingAbout(true)}
       />
       <DocumentTabs
         documents={dicom.documents}
@@ -205,6 +216,7 @@ export default function App() {
       {showingImageViewer ? <ImageViewer onClose={() => setShowingImageViewer(false)} /> : null}
       {showingBevViewer ? <BevViewer onClose={() => setShowingBevViewer(false)} /> : null}
       {showingRtStructViewer ? <RtStructViewer onClose={() => setShowingRtStructViewer(false)} /> : null}
+      {showingAbout ? <AboutDialog version={appVersion} onClose={() => setShowingAbout(false)} /> : null}
     </main>
   )
 }
