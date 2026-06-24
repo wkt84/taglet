@@ -1,5 +1,6 @@
 import {
   ColumnDef,
+  ColumnSizingState,
   ExpandedState,
   flexRender,
   getCoreRowModel,
@@ -13,6 +14,8 @@ import type { DicomElement, DicomNode, TableDicomRow } from '../types/dicom'
 
 const SEARCH_DEBOUNCE_MS = 150
 const MAX_SEARCH_RESULTS = 200
+const INDENT_WIDTH = 18
+const MAX_TAG_INDENT_DEPTH = 8
 
 type Props = {
   nodes: DicomNode[]
@@ -29,6 +32,7 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [pendingScrollPath, setPendingScrollPath] = useState<string[]>()
+  const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({})
   const rows = useMemo(() => toTableRows(nodes), [nodes])
   const searchResults = useMemo(() => searchRows(rows, debouncedQuery), [debouncedQuery, rows])
   const searching = query.trim() !== debouncedQuery.trim()
@@ -52,11 +56,17 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'tag',
         header: 'Tag',
+        size: 220,
+        minSize: 150,
+        maxSize: 520,
         cell: ({ row, getValue }) => (
-          <div className="flex items-center" style={{ paddingLeft: `${row.original.depth * 18}px` }}>
+          <div
+            className="flex min-w-0 items-center"
+            style={{ paddingLeft: `${tagIndent(row.original.depth)}px` }}
+          >
             {row.getCanExpand() ? (
               <button
-                className={`mr-1 w-5 rounded ${
+                className={`mr-1 h-5 w-5 shrink-0 rounded ${
                   row.original.kind === 'Sequence'
                     ? 'text-slate-100 hover:bg-white/10'
                     : row.original.kind === 'Item'
@@ -73,20 +83,28 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
                 {row.getIsExpanded() ? '▼' : '▶'}
               </button>
             ) : (
-              <span className="mr-1 w-5" />
+              <span className="mr-1 w-5 shrink-0" />
             )}
-            <span className="dicom-value-font text-xs">{String(getValue())}</span>
+            <span className="dicom-value-font min-w-0 truncate text-xs" title={String(getValue())}>
+              {String(getValue())}
+            </span>
           </div>
         ),
       },
       {
         accessorKey: 'description',
         header: 'Description',
+        size: 280,
+        minSize: 160,
+        maxSize: 640,
         cell: ({ getValue }) => <span className="block truncate">{String(getValue())}</span>,
       },
       {
         accessorKey: 'vr',
         header: 'VR',
+        size: 80,
+        minSize: 60,
+        maxSize: 120,
         cell: ({ row }) => (
           <span className="font-mono text-xs">
             {row.original.kind === 'Element' ? row.original.vr : row.original.kind === 'Sequence' ? 'SQ' : ''}
@@ -96,6 +114,9 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'value',
         header: 'Value',
+        size: 520,
+        minSize: 240,
+        maxSize: 1200,
         cell: ({ row }) =>
           row.original.kind === 'Element' ? (
             <ValueCell
@@ -115,6 +136,9 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'length',
         header: 'Length',
+        size: 120,
+        minSize: 90,
+        maxSize: 180,
         cell: ({ getValue }) => {
           const value = Number(getValue())
           return <span className="font-mono text-xs">{value === 4294967295 ? 'Undefined' : value}</span>
@@ -123,6 +147,9 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         id: 'actions',
         header: '',
+        size: 96,
+        minSize: 82,
+        maxSize: 140,
         cell: ({ row }) => {
           const isPixelData = row.original.kind === 'Element' && row.original.tag === '(7FE0,0010)'
           const isItem = row.original.kind === 'Item'
@@ -156,8 +183,10 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
   const table = useReactTable({
     data: rows,
     columns,
-    state: { expanded },
+    state: { expanded, columnSizing },
     onExpandedChange: setExpanded,
+    onColumnSizingChange: setColumnSizing,
+    columnResizeMode: 'onChange',
     getRowId: (row) => row.rowId,
     getSubRows: (row) => row.subRows,
     getCoreRowModel: getCoreRowModel(),
@@ -257,21 +286,35 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
         ) : null}
       </div>
       <div ref={tableScrollRef} className="min-h-0 flex-1 overflow-auto">
-        <table className="w-full table-fixed border-collapse text-sm">
+        <table className="table-fixed border-collapse text-sm" style={{ width: `${table.getTotalSize()}px` }}>
           <colgroup>
-            <col className="w-48" />
-            <col className="w-72" />
-            <col className="w-20" />
-            <col />
-            <col className="w-28" />
-            <col className="w-24" />
+            {table.getVisibleLeafColumns().map((column) => (
+              <col key={column.id} style={{ width: `${column.getSize()}px` }} />
+            ))}
           </colgroup>
           <thead className="sticky top-0 z-10 bg-slate-900 text-left text-xs uppercase tracking-wide text-white">
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>
                 {headerGroup.headers.map((header) => (
-                  <th key={header.id} className="border-r border-slate-700 px-3 py-2 last:border-r-0">
-                    {flexRender(header.column.columnDef.header, header.getContext())}
+                  <th
+                    key={header.id}
+                    className="relative select-none border-r border-slate-700 px-3 py-2 last:border-r-0"
+                    style={{ width: `${header.getSize()}px` }}
+                  >
+                    <div className="truncate pr-2">
+                      {flexRender(header.column.columnDef.header, header.getContext())}
+                    </div>
+                    {header.column.getCanResize() ? (
+                      <div
+                        className={`absolute right-0 top-0 h-full w-1 cursor-col-resize touch-none bg-transparent hover:bg-blue-400 ${
+                          header.column.getIsResizing() ? 'bg-blue-400' : ''
+                        }`}
+                        onDoubleClick={() => header.column.resetSize()}
+                        onMouseDown={header.getResizeHandler()}
+                        onTouchStart={header.getResizeHandler()}
+                        title="Drag to resize. Double click to reset."
+                      />
+                    ) : null}
                   </th>
                 ))}
               </tr>
@@ -321,6 +364,10 @@ function displayPath(path: string[]) {
 
 function rowPathKey(path: string[]) {
   return path.map((part) => encodeURIComponent(part)).join('/')
+}
+
+function tagIndent(depth: number) {
+  return Math.min(depth, MAX_TAG_INDENT_DEPTH) * INDENT_WIDTH
 }
 
 function rowValue(row: TableDicomRow) {
