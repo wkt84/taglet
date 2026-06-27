@@ -22,11 +22,10 @@ type Props = {
   filePath?: string
   selectedPath?: string[]
   onChange: (path: string[], value: string) => void
-  onDelete: (path: string[]) => void
   onSelect: (path: string[]) => void
 }
 
-export default function TagTable({ nodes, filePath, selectedPath, onChange, onDelete, onSelect }: Props) {
+export default function TagTable({ nodes, filePath, selectedPath, onChange, onSelect }: Props) {
   const tableScrollRef = useRef<HTMLDivElement>(null)
   const [expanded, setExpanded] = useState<ExpandedState>({})
   const [query, setQuery] = useState('')
@@ -56,8 +55,8 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'tag',
         header: 'Tag',
-        size: 220,
-        minSize: 150,
+        size: 200,
+        minSize: 130,
         maxSize: 520,
         cell: ({ row, getValue }) => (
           <div
@@ -94,16 +93,16 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'description',
         header: 'Description',
-        size: 280,
-        minSize: 160,
+        size: 260,
+        minSize: 140,
         maxSize: 640,
         cell: ({ getValue }) => <span className="block truncate">{String(getValue())}</span>,
       },
       {
         accessorKey: 'vr',
         header: 'VR',
-        size: 80,
-        minSize: 60,
+        size: 70,
+        minSize: 52,
         maxSize: 120,
         cell: ({ row }) => (
           <span className="font-mono text-xs">
@@ -114,8 +113,8 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'value',
         header: 'Value',
-        size: 520,
-        minSize: 240,
+        size: 500,
+        minSize: 220,
         maxSize: 1200,
         cell: ({ row }) =>
           row.original.kind === 'Element' ? (
@@ -136,48 +135,16 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
       {
         accessorKey: 'length',
         header: 'Length',
-        size: 120,
-        minSize: 90,
+        size: 110,
+        minSize: 78,
         maxSize: 180,
         cell: ({ getValue }) => {
           const value = Number(getValue())
           return <span className="font-mono text-xs">{value === 4294967295 ? 'Undefined' : value}</span>
         },
       },
-      {
-        id: 'actions',
-        header: '',
-        size: 96,
-        minSize: 82,
-        maxSize: 140,
-        cell: ({ row }) => {
-          const isPixelData = row.original.kind === 'Element' && row.original.tag === '(7FE0,0010)'
-          const isItem = row.original.kind === 'Item'
-          return (
-            <button
-              className="rounded px-2 py-0.5 text-xs text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
-              disabled={isPixelData || isItem}
-              onClick={(event) => {
-                event.stopPropagation()
-                if (window.confirm(`Delete ${row.original.tag}?`)) {
-                  onDelete(row.original.path)
-                }
-              }}
-              title={
-                isItem
-                  ? 'Sequence items cannot be deleted here yet'
-                  : isPixelData
-                    ? 'Pixel Data cannot be deleted here'
-                    : `Delete ${row.original.tag}`
-              }
-            >
-              Delete
-            </button>
-          )
-        },
-      },
     ],
-    [onChange, onDelete],
+    [onChange],
   )
 
   const table = useReactTable({
@@ -286,7 +253,10 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onDe
         ) : null}
       </div>
       <div ref={tableScrollRef} className="min-h-0 flex-1 overflow-auto">
-        <table className="table-fixed border-collapse text-sm" style={{ width: `${table.getTotalSize()}px` }}>
+        <table
+          className="table-fixed border-collapse text-sm"
+          style={{ width: `${table.getTotalSize()}px` }}
+        >
           <colgroup>
             {table.getVisibleLeafColumns().map((column) => (
               <col key={column.id} style={{ width: `${column.getSize()}px` }} />

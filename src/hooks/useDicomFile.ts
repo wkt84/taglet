@@ -313,6 +313,7 @@ export function useDicomFile() {
     updateDocument(activeDocumentId, (document) => ({
       ...document,
       nodes: deleteNode(document.nodes, path),
+      selectedPath: undefined,
       dirty: true,
     }))
   }, [activeDocumentId, updateDocument])

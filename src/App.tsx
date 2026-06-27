@@ -6,6 +6,7 @@ import { getVersion } from '@tauri-apps/api/app'
 import AddTagDialog from './components/AddTagDialog'
 import AboutDialog from './components/AboutDialog'
 import BevViewer from './components/BevViewer'
+import ConfirmDeleteDialog from './components/ConfirmDeleteDialog'
 import DocumentTabs from './components/DocumentTabs'
 import ImageViewer from './components/ImageViewer'
 import RtStructViewer from './components/RtStructViewer'
@@ -65,6 +66,34 @@ function tagsAtPath(nodes: DicomNode[], parentPath: string[]): string[] {
   return []
 }
 
+function findNodeByPath(nodes: DicomNode[], path?: string[]): DicomNode | { kind: 'Item'; path: string[] } | undefined {
+  if (!path) return undefined
+
+  for (const node of nodes) {
+    if (samePath(node.path, path)) return node
+    if (node.kind === 'Element') continue
+
+    for (const [index, item] of node.items.entries()) {
+      const itemPath = [...node.path, `Item#${index}`]
+      if (samePath(itemPath, path)) return { kind: 'Item', path: itemPath }
+      const nested = findNodeByPath(item, path)
+      if (nested) return nested
+    }
+  }
+
+  return undefined
+}
+
+function nodeDeleteLabel(node: DicomNode | { kind: 'Item'; path: string[] } | undefined) {
+  if (!node || node.kind === 'Item') return undefined
+  return node.kind === 'Sequence' ? `${node.tag} ${node.description}` : `${node.tag} ${node.description}`
+}
+
+type PendingDelete = {
+  path: string[]
+  label: string
+}
+
 export default function App() {
   const dicom = useDicomFile()
   const [addingTag, setAddingTag] = useState(false)
@@ -72,6 +101,7 @@ export default function App() {
   const [showingBevViewer, setShowingBevViewer] = useState(false)
   const [showingRtStructViewer, setShowingRtStructViewer] = useState(false)
   const [showingAbout, setShowingAbout] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete>()
   const [appVersion, setAppVersion] = useState<string>()
   const openPaths = dicom.openPaths
   const selectedPath = dicom.selectedPath
@@ -79,6 +109,16 @@ export default function App() {
   const existingTagsForTarget = useMemo(
     () => tagsAtPath(dicom.nodes, addTargetPath),
     [addTargetPath, dicom.nodes],
+  )
+  const selectedNode = useMemo(
+    () => findNodeByPath(dicom.nodes, selectedPath),
+    [dicom.nodes, selectedPath],
+  )
+  const canDeleteSelected = Boolean(
+    selectedPath
+      && selectedNode
+      && selectedNode.kind !== 'Item'
+      && selectedNode.tag !== '(7FE0,0010)',
   )
   const title = useMemo(() => {
     const name = fileName(dicom.filePath)
@@ -157,6 +197,15 @@ export default function App() {
           return closed
         }}
         openAddTagDialog={() => setAddingTag(true)}
+        deleteSelectedTag={() => {
+          if (!selectedPath || !canDeleteSelected) return
+          const label = nodeDeleteLabel(selectedNode)
+          setPendingDelete({
+            path: selectedPath,
+            label: label ?? 'selected tag',
+          })
+        }}
+        canDeleteSelectedTag={canDeleteSelected}
         openImageViewer={() => setShowingImageViewer(true)}
         openBevViewer={() => setShowingBevViewer(true)}
         openRtStructViewer={() => setShowingRtStructViewer(true)}
@@ -197,7 +246,6 @@ export default function App() {
           filePath={dicom.filePath}
           selectedPath={selectedPath}
           onChange={dicom.updateNodeValue}
-          onDelete={dicom.deleteNodeByPath}
           onSelect={dicom.setSelectedPath}
         />
       </section>
@@ -217,6 +265,16 @@ export default function App() {
       {showingBevViewer ? <BevViewer onClose={() => setShowingBevViewer(false)} /> : null}
       {showingRtStructViewer ? <RtStructViewer onClose={() => setShowingRtStructViewer(false)} /> : null}
       {showingAbout ? <AboutDialog version={appVersion} onClose={() => setShowingAbout(false)} /> : null}
+      {pendingDelete ? (
+        <ConfirmDeleteDialog
+          label={pendingDelete.label}
+          onCancel={() => setPendingDelete(undefined)}
+          onConfirm={() => {
+            dicom.deleteNodeByPath(pendingDelete.path)
+            setPendingDelete(undefined)
+          }}
+        />
+      ) : null}
     </main>
   )
 }

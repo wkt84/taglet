@@ -10,6 +10,8 @@ type Props = {
   openFile: () => Promise<boolean>
   closeFile: () => boolean
   openAddTagDialog: () => void
+  deleteSelectedTag: () => void
+  canDeleteSelectedTag: boolean
   openImageViewer: () => void
   openBevViewer: () => void
   openRtStructViewer: () => void
@@ -26,6 +28,8 @@ export default function Toolbar({
   openFile,
   closeFile,
   openAddTagDialog,
+  deleteSelectedTag,
+  canDeleteSelectedTag,
   openImageViewer,
   openBevViewer,
   openRtStructViewer,
@@ -34,22 +38,32 @@ export default function Toolbar({
   saveFileAs,
 }: Props) {
   const [viewerMenuOpen, setViewerMenuOpen] = useState(false)
+  const [helpMenuOpen, setHelpMenuOpen] = useState(false)
   const viewerMenuRef = useRef<HTMLDivElement>(null)
+  const helpMenuRef = useRef<HTMLDivElement>(null)
   const viewerDisabled = !filePath || loading
 
   useEffect(() => {
-    function closeViewerMenu(event: MouseEvent) {
+    function closeMenus(event: MouseEvent) {
       if (!viewerMenuRef.current?.contains(event.target as Node)) {
         setViewerMenuOpen(false)
       }
+      if (!helpMenuRef.current?.contains(event.target as Node)) {
+        setHelpMenuOpen(false)
+      }
     }
 
-    window.addEventListener('mousedown', closeViewerMenu)
-    return () => window.removeEventListener('mousedown', closeViewerMenu)
+    window.addEventListener('mousedown', closeMenus)
+    return () => window.removeEventListener('mousedown', closeMenus)
   }, [])
 
   function openViewer(action: () => void) {
     setViewerMenuOpen(false)
+    action()
+  }
+
+  function openHelpAction(action: () => void) {
+    setHelpMenuOpen(false)
     action()
   }
 
@@ -71,6 +85,13 @@ export default function Toolbar({
         </button>
         <button className="toolbar-button" disabled={!filePath || loading} onClick={openAddTagDialog}>
           Add Tag
+        </button>
+        <button
+          className="toolbar-button toolbar-button-danger"
+          disabled={!filePath || loading || !canDeleteSelectedTag}
+          onClick={deleteSelectedTag}
+        >
+          Delete Tag
         </button>
         <div ref={viewerMenuRef} className="relative">
           <button
@@ -108,9 +129,23 @@ export default function Toolbar({
         <button className="toolbar-button toolbar-button-danger" disabled={!filePath || loading} onClick={closeFile}>
           Close
         </button>
-        <button className="toolbar-button" onClick={openAboutDialog}>
-          About
-        </button>
+        <div ref={helpMenuRef} className="relative">
+          <button
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/10 text-sm font-semibold text-slate-100 shadow-sm transition hover:border-white/20 hover:bg-white/15"
+            aria-label="Help"
+            title="Help"
+            onClick={() => setHelpMenuOpen((open) => !open)}
+          >
+            ?
+          </button>
+          {helpMenuOpen ? (
+            <div className="absolute right-0 top-full z-40 mt-2 w-40 overflow-hidden rounded-md border border-slate-700 bg-slate-950 py-1 text-sm text-slate-100 shadow-xl">
+              <button className="block w-full px-3 py-2 text-left hover:bg-slate-800" onClick={() => openHelpAction(openAboutDialog)}>
+                About Taglet
+              </button>
+            </div>
+          ) : null}
+        </div>
       </nav>
     </header>
   )
