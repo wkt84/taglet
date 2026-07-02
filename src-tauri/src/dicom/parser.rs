@@ -471,6 +471,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                 Value::PixelSequence(_) if tag == PIXEL_DATA => DicomNode::Element {
                     tag: tag_text,
                     vr: element.header().vr().to_string().to_owned(),
+                    inferred_vr: None,
                     description: description_for(tag),
                     value: "[Binary Data]".to_string(),
                     length: length_to_u32(element.length()),
@@ -479,11 +480,13 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                 },
                 _ => {
                     let vr = element.header().vr();
+                    let (value, inferred_vr) = display_element_value(tag, vr, element.value());
                     DicomNode::Element {
                         tag: tag_text,
                         vr: vr.to_string().to_owned(),
+                        inferred_vr,
                         description: description_for(tag),
-                        value: display_value(element.value()),
+                        value,
                         length: length_to_u32(element.length()),
                         path,
                         editable: tag != PIXEL_DATA && is_text_editable(vr),
@@ -570,6 +573,7 @@ fn pixel_data_placeholder_node() -> DicomNode {
     DicomNode::Element {
         tag: format_tag(PIXEL_DATA),
         vr: "OB/OW".to_string(),
+        inferred_vr: None,
         description: "PixelData".to_string(),
         value: "[Binary Data]".to_string(),
         length: u32::MAX,
@@ -588,6 +592,74 @@ fn display_value(value: &Value<InMemDicomObject>) -> String {
         Value::PixelSequence(_) => "[Binary Data]".to_string(),
         Value::Sequence(sequence) => format!("[Sequence: {} item(s)]", sequence.items().len()),
     }
+}
+
+fn display_element_value(
+    tag: Tag,
+    vr: VR,
+    value: &Value<InMemDicomObject>,
+) -> (String, Option<String>) {
+    if tag.group() % 2 == 1 && vr == VR::UN {
+        if let Some(text) = private_un_text_value(value) {
+            let inferred_vr = infer_text_vr(&text).map(|vr| format!("{vr}?"));
+            return (text, inferred_vr);
+        }
+    }
+
+    (display_value(value), None)
+}
+
+fn private_un_text_value(value: &Value<InMemDicomObject>) -> Option<String> {
+    let Value::Primitive(PrimitiveValue::U8(bytes)) = value else {
+        return None;
+    };
+    let trimmed = trim_dicom_padding(bytes.as_slice());
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return None;
+    }
+    if !trimmed.iter().all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\\') {
+        return None;
+    }
+
+    String::from_utf8(trimmed.to_vec()).ok()
+}
+
+fn trim_dicom_padding(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b'\0' || bytes[end - 1] == b' ') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+fn infer_text_vr(value: &str) -> Option<&'static str> {
+    let components = value.split('\\').collect::<Vec<_>>();
+    if components.is_empty() {
+        return None;
+    }
+
+    if components
+        .iter()
+        .all(|component| !component.is_empty() && component.len() <= 16 && is_code_string(component))
+    {
+        return Some("CS");
+    }
+
+    if components.iter().all(|component| component.len() <= 16) {
+        return Some("SH");
+    }
+
+    if components.iter().all(|component| component.len() <= 64) {
+        return Some("LO");
+    }
+
+    None
+}
+
+fn is_code_string(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_' || byte == b' ')
 }
 
 fn description_for(tag: Tag) -> String {
@@ -1190,5 +1262,12 @@ mod tests {
 
         assert_eq!(min, 0.0);
         assert_eq!(max, 10.0);
+    }
+
+    #[test]
+    fn infers_private_un_text_vr_from_value_shape() {
+        assert_eq!(infer_text_vr("HF1"), Some("CS"));
+        assert_eq!(infer_text_vr("d10"), Some("SH"));
+        assert_eq!(infer_text_vr("LongerThanSixteenChars"), Some("LO"));
     }
 }

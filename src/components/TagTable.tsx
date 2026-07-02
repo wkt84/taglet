@@ -105,8 +105,19 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onSe
         minSize: 52,
         maxSize: 120,
         cell: ({ row }) => (
-          <span className="font-mono text-xs">
-            {row.original.kind === 'Element' ? row.original.vr : row.original.kind === 'Sequence' ? 'SQ' : ''}
+          <span
+            className="font-mono text-xs"
+            title={
+              row.original.kind === 'Element' && row.original.inferred_vr
+                ? `Stored VR: ${row.original.vr}. Inferred from printable private value.`
+                : undefined
+            }
+          >
+            {row.original.kind === 'Element'
+              ? row.original.inferred_vr ?? row.original.vr
+              : row.original.kind === 'Sequence'
+                ? 'SQ'
+                : ''}
           </span>
         ),
       },

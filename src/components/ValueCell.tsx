@@ -34,7 +34,11 @@ export default function ValueCell({ element, onCommit }: Props) {
   }, [draft, editing, element.editable, element.vr])
 
   if (!element.editable) {
-    return <span className="dicom-value-font block truncate text-slate-500">{element.value}</span>
+    return (
+      <span className="dicom-value-font block truncate text-slate-500" title={element.value}>
+        {element.value}
+      </span>
+    )
   }
 
   if (!editing) {

@@ -2,6 +2,7 @@ export type DicomElement = {
   kind: 'Element'
   tag: string
   vr: string
+  inferred_vr?: string
   description: string
   value: string
   length: number
