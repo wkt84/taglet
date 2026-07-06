@@ -242,6 +242,7 @@ export default function App() {
       ) : null}
       <section className="min-h-0 flex-1 overflow-hidden p-4">
         <TagTable
+          fileMeta={dicom.fileMeta}
           nodes={dicom.nodes}
           filePath={dicom.filePath}
           selectedPath={selectedPath}

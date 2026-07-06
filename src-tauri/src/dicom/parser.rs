@@ -4,15 +4,17 @@ use dicom_core::header::{HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
 use dicom_core::{Tag, VR};
 use dicom_dictionary_std::{tags, StandardDataDictionary};
-use dicom_object::{open_file, DefaultDicomObject, InMemDicomObject, OpenFileOptions};
+use dicom_object::{
+    open_file, DefaultDicomObject, FileMetaTable, InMemDicomObject, OpenFileOptions,
+};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use super::model::{
-    DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo, RtPlanBeam,
-    RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition, RtPlanBevInfo,
-    RtPlanControlPoint, RtStructBounds, RtStructContour, RtStructData, RtStructInfo, RtStructPoint,
-    RtStructRoi, RtStructSlice, RtStructSliceContours,
+    DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
+    RtPlanBeam, RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition,
+    RtPlanBevInfo, RtPlanControlPoint, RtStructBounds, RtStructContour, RtStructData, RtStructInfo,
+    RtStructPoint, RtStructRoi, RtStructSlice, RtStructSliceContours,
 };
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
@@ -43,16 +45,17 @@ const CONTOUR_DATA: Tag = Tag(0x3006, 0x0050);
 const REFERENCED_ROI_NUMBER: Tag = Tag(0x3006, 0x0084);
 const RTSTRUCT_Z_TOLERANCE: f64 = 0.01;
 
-pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, Vec<DicomNode>), String> {
+pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, DicomFileContent), String> {
     let obj = OpenFileOptions::new()
         .read_until(tags::PIXEL_DATA)
         .open_file(path)
         .map_err(|error| error.to_string())?;
+    let file_meta = file_meta_to_nodes(obj.meta());
     let mut nodes = object_to_nodes(&obj, Vec::new());
     if pixel_data_likely_present(&obj) && !nodes.iter().any(is_pixel_data_node) {
         nodes.push(pixel_data_placeholder_node());
     }
-    Ok((obj, nodes))
+    Ok((obj, DicomFileContent { file_meta, nodes }))
 }
 
 pub fn open_full_object(path: &str) -> Result<DefaultDicomObject, String> {
@@ -551,6 +554,49 @@ pub fn apply_nodes_to_object(
     Ok(())
 }
 
+pub fn sync_file_meta_from_dataset(obj: &mut DefaultDicomObject) {
+    let sop_class_uid = get_uid_string(obj, tags::SOP_CLASS_UID);
+    let sop_instance_uid = get_uid_string(obj, tags::SOP_INSTANCE_UID);
+    let meta = obj.meta_mut();
+
+    if let Some(uid) = sop_class_uid {
+        meta.media_storage_sop_class_uid = ui_padded(uid);
+    }
+    if let Some(uid) = sop_instance_uid {
+        meta.media_storage_sop_instance_uid = ui_padded(uid);
+    }
+    meta.update_information_group_length();
+}
+
+fn file_meta_to_nodes(meta: &FileMetaTable) -> Vec<DicomNode> {
+    meta.to_element_iter()
+        .map(|element| {
+            let tag = element.tag();
+            let tag_text = format_tag(tag);
+            let value = element
+                .value()
+                .to_str()
+                .map(|value| {
+                    value
+                        .trim_end_matches(|c| c == '\0' || c == ' ')
+                        .to_string()
+                })
+                .unwrap_or_else(|_| "[Binary Data]".to_string());
+
+            DicomNode::Element {
+                tag: tag_text.clone(),
+                vr: element.header().vr().to_string().to_owned(),
+                inferred_vr: None,
+                description: description_for(tag),
+                value,
+                length: length_to_u32(element.length()),
+                path: vec!["FileMetaInformation".to_string(), tag_text],
+                editable: false,
+            }
+        })
+        .collect()
+}
+
 fn node_tag(node: &DicomNode) -> Result<Tag, String> {
     match node {
         DicomNode::Element { tag, .. } | DicomNode::Sequence { tag, .. } => parse_tag(tag),
@@ -734,6 +780,25 @@ fn get_string(obj: &InMemDicomObject, tag: Tag) -> Option<String> {
     obj.get(tag)
         .and_then(|element| element.to_str().ok())
         .map(|value| value.trim_end_matches('\0').to_string())
+}
+
+fn get_uid_string(obj: &InMemDicomObject, tag: Tag) -> Option<String> {
+    obj.get(tag)
+        .and_then(|element| element.to_str().ok())
+        .map(|value| {
+            value
+                .trim_end_matches(|c| c == '\0' || c == ' ')
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn ui_padded(value: String) -> String {
+    if value.len() % 2 == 0 {
+        value
+    } else {
+        format!("{value}\0")
+    }
 }
 
 fn get_u32(obj: &InMemDicomObject, tag: Tag) -> Option<u32> {

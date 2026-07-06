@@ -9,19 +9,20 @@ type Props = {
 
 export default function TagRow({ row, selected, onSelect }: Props) {
   const isSequence = row.original.kind === 'Sequence'
+  const isFileMeta = row.original.kind === 'FileMeta'
   const isItem = row.original.kind === 'Item'
   const isElementInItem = row.original.kind === 'Element' && row.original.itemIndex !== undefined
   const itemClass = isItem ? 'border-t border-blue-300 bg-blue-100 font-medium text-blue-950' : ''
   const itemChildClass = isElementInItem ? 'bg-blue-50/30' : ''
-  const sequenceClass = isSequence ? 'bg-sky-900 font-semibold text-white shadow-inner' : ''
-  const stripeClass = isSequence || isItem ? '' : row.index % 2 === 0 ? 'bg-white' : 'bg-slate-50'
+  const sequenceClass = isSequence || isFileMeta ? 'bg-sky-900 font-semibold text-white shadow-inner' : ''
+  const stripeClass = isSequence || isFileMeta || isItem ? '' : row.index % 2 === 0 ? 'bg-white' : 'bg-slate-50'
   const selectedClass = selected
-    ? isSequence || isItem
+    ? isSequence || isFileMeta || isItem
       ? 'outline outline-2 outline-amber-300 outline-offset-[-2px]'
       : 'outline outline-2 outline-blue-400 outline-offset-[-2px]'
     : ''
-  const hoverClass = isSequence ? 'hover:bg-sky-800' : isItem ? 'hover:bg-blue-200' : 'hover:bg-blue-100/60'
-  const canToggle = isSequence || isItem
+  const hoverClass = isSequence || isFileMeta ? 'hover:bg-sky-800' : isItem ? 'hover:bg-blue-200' : 'hover:bg-blue-100/60'
+  const canToggle = isSequence || isFileMeta || isItem
 
   return (
     <tr
@@ -39,7 +40,7 @@ export default function TagRow({ row, selected, onSelect }: Props) {
         <td
           key={cell.id}
           className={`border-b border-r px-3 py-1.5 align-top last:border-r-0 ${
-            isSequence ? 'border-sky-800' : isItem ? 'border-blue-200' : 'border-slate-200'
+            isSequence || isFileMeta ? 'border-sky-800' : isItem ? 'border-blue-200' : 'border-slate-200'
           }`}
         >
           {flexRender(cell.column.columnDef.cell, cell.getContext())}

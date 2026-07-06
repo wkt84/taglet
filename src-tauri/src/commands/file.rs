@@ -5,8 +5,11 @@ use std::sync::Mutex;
 use dicom_object::DefaultDicomObject;
 use tauri::State;
 
-use crate::dicom::model::{DicomNode, RtStructData};
-use crate::dicom::parser::{apply_nodes_to_object, open_full_object, open_nodes, rt_struct_data};
+use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
+use crate::dicom::parser::{
+    apply_nodes_to_object, open_full_object, open_nodes, rt_struct_data,
+    sync_file_meta_from_dataset,
+};
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
@@ -181,8 +184,8 @@ pub async fn take_launch_file_paths(
 pub async fn open_dicom_file(
     path: String,
     store: State<'_, DicomStore>,
-) -> Result<Vec<DicomNode>, String> {
-    let (_preview, nodes) = open_nodes(&path)?;
+) -> Result<DicomFileContent, String> {
+    let (_preview, content) = open_nodes(&path)?;
     store
         .objects
         .lock()
@@ -198,7 +201,7 @@ pub async fn open_dicom_file(
         .current_path
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())? = Some(path);
-    Ok(nodes)
+    Ok(content)
 }
 
 #[tauri::command]
@@ -248,6 +251,7 @@ fn save_to_path(
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
     apply_nodes_to_object(object, &nodes)?;
+    sync_file_meta_from_dataset(object);
     stored.rt_struct = None;
     object
         .write_to_file(&destination_path)

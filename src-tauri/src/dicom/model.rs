@@ -24,6 +24,12 @@ pub enum DicomNode {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DicomFileContent {
+    pub file_meta: Vec<DicomNode>,
+    pub nodes: Vec<DicomNode>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ValidationResult {
     pub valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -18,6 +18,7 @@ const INDENT_WIDTH = 18
 const MAX_TAG_INDENT_DEPTH = 8
 
 type Props = {
+  fileMeta: DicomNode[]
   nodes: DicomNode[]
   filePath?: string
   selectedPath?: string[]
@@ -25,14 +26,14 @@ type Props = {
   onSelect: (path: string[]) => void
 }
 
-export default function TagTable({ nodes, filePath, selectedPath, onChange, onSelect }: Props) {
+export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onChange, onSelect }: Props) {
   const tableScrollRef = useRef<HTMLDivElement>(null)
   const [expanded, setExpanded] = useState<ExpandedState>({})
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [pendingScrollPath, setPendingScrollPath] = useState<string[]>()
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({})
-  const rows = useMemo(() => toTableRows(nodes), [nodes])
+  const rows = useMemo(() => toTableRows(nodes, fileMeta), [fileMeta, nodes])
   const searchResults = useMemo(() => searchRows(rows, debouncedQuery), [debouncedQuery, rows])
   const searching = query.trim() !== debouncedQuery.trim()
 
@@ -66,7 +67,7 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onSe
             {row.getCanExpand() ? (
               <button
                 className={`mr-1 h-5 w-5 shrink-0 rounded ${
-                  row.original.kind === 'Sequence'
+                  row.original.kind === 'Sequence' || row.original.kind === 'FileMeta'
                     ? 'text-slate-100 hover:bg-white/10'
                     : row.original.kind === 'Item'
                       ? 'text-blue-800 hover:bg-blue-100'
@@ -137,9 +138,13 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onSe
             <span className="inline-flex items-center rounded bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
               {row.original.childCount} {row.original.childCount === 1 ? 'tag' : 'tags'}
             </span>
-          ) : (
+          ) : row.original.kind === 'Sequence' ? (
             <span className="inline-flex items-center rounded bg-white/15 px-2 py-0.5 text-xs font-medium text-white ring-1 ring-white/20">
               {row.original.items.length} {row.original.items.length === 1 ? 'item' : 'items'}
+            </span>
+          ) : (
+            <span className="inline-flex items-center rounded bg-white/15 px-2 py-0.5 text-xs font-medium text-white ring-1 ring-white/20">
+              {row.original.subRows.length} element{row.original.subRows.length === 1 ? '' : 's'}
             </span>
           ),
       },
@@ -151,6 +156,7 @@ export default function TagTable({ nodes, filePath, selectedPath, onChange, onSe
         maxSize: 180,
         cell: ({ getValue }) => {
           const value = Number(getValue())
+          if (!Number.isFinite(value)) return null
           return <span className="font-mono text-xs">{value === 4294967295 ? 'Undefined' : value}</span>
         },
       },
@@ -354,6 +360,7 @@ function tagIndent(depth: number) {
 function rowValue(row: TableDicomRow) {
   if (row.kind === 'Element') return row.value || '-'
   if (row.kind === 'Sequence') return `${row.items.length} item${row.items.length === 1 ? '' : 's'}`
+  if (row.kind === 'FileMeta') return `${row.subRows.length} element${row.subRows.length === 1 ? '' : 's'}`
   return `${row.childCount} tag${row.childCount === 1 ? '' : 's'}`
 }
 
@@ -416,7 +423,26 @@ function expandedStateForPath(rows: TableDicomRow[], path: string[]) {
   return next
 }
 
-function toTableRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDicomRow[] {
+function toTableRows(nodes: DicomNode[], fileMeta: DicomNode[]): TableDicomRow[] {
+  const rows = toDatasetRows(nodes)
+  if (fileMeta.length === 0) return rows
+
+  return [
+    {
+      kind: 'FileMeta',
+      tag: 'File Meta',
+      description: 'File Meta Information',
+      length: Number.NaN,
+      path: ['FileMetaInformation'],
+      rowId: 'FileMetaInformation',
+      depth: 0,
+      subRows: toDatasetRows(fileMeta, 1),
+    },
+    ...rows,
+  ]
+}
+
+function toDatasetRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDicomRow[] {
   return nodes.map((node, index) => {
     const rowId = `${node.path.join('/')}:${index}`
     if (node.kind === 'Element') {
@@ -440,7 +466,7 @@ function toTableRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDi
           depth: depth + 1,
           itemIndex: sequenceItemIndex,
           childCount: item.length,
-          subRows: toTableRows(item, depth + 2, sequenceItemIndex),
+          subRows: toDatasetRows(item, depth + 2, sequenceItemIndex),
         }
       }),
     }

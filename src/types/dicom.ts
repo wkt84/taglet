@@ -21,6 +21,11 @@ export type DicomSequence = {
 
 export type DicomNode = DicomElement | DicomSequence
 
+export type DicomFileContent = {
+  file_meta: DicomNode[]
+  nodes: DicomNode[]
+}
+
 export type ValidationResult = {
   valid: boolean
   message?: string
@@ -161,6 +166,16 @@ export type RtStructPoint = {
 }
 
 export type TableDicomRow =
+  | {
+      kind: 'FileMeta'
+      tag: string
+      description: string
+      length: number
+      path: string[]
+      rowId: string
+      depth: number
+      subRows: TableDicomRow[]
+    }
   | (DicomElement & {
       rowId: string
       depth: number

@@ -1,15 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { DicomElement, DicomNode } from '../types/dicom'
+import type { DicomElement, DicomFileContent, DicomNode } from '../types/dicom'
 
 export type DicomDocument = {
   id: string
   filePath: string
+  fileMeta: DicomNode[]
   nodes: DicomNode[]
   dirty: boolean
   selectedPath?: string[]
 }
+
+const SOP_CLASS_UID = '(0008,0016)'
+const SOP_INSTANCE_UID = '(0008,0018)'
+const FILE_META_INFORMATION_GROUP_LENGTH = '(0002,0000)'
+const MEDIA_STORAGE_SOP_CLASS_UID = '(0002,0002)'
+const MEDIA_STORAGE_SOP_INSTANCE_UID = '(0002,0003)'
+const LONG_VR_HEADER_BYTES = new Set(['OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'SQ', 'SV', 'UC', 'UN', 'UR', 'UT', 'UV'])
 
 function updateNode(nodes: DicomNode[], path: string[], nextValue: string): DicomNode[] {
   return nodes.map((node) => {
@@ -22,6 +30,49 @@ function updateNode(nodes: DicomNode[], path: string[], nextValue: string): Dico
       items: node.items.map((item) => updateNode(item, path, nextValue)),
     }
   })
+}
+
+function rootElementValue(nodes: DicomNode[], tag: string) {
+  const node = nodes.find((current): current is DicomElement => (
+    current.kind === 'Element' && current.tag === tag
+  ))
+  return node?.value
+}
+
+function dicomUiLength(value: string) {
+  return value.length + (value.length % 2)
+}
+
+function fileMetaGroupLength(fileMeta: DicomNode[]) {
+  return fileMeta.reduce((total, node) => {
+    if (node.kind !== 'Element' || node.tag === FILE_META_INFORMATION_GROUP_LENGTH) return total
+
+    const headerLength = LONG_VR_HEADER_BYTES.has(node.vr) ? 12 : 8
+    return total + headerLength + node.length
+  }, 0)
+}
+
+function syncFileMetaFromNodes(fileMeta: DicomNode[], nodes: DicomNode[]) {
+  const sopClassUid = rootElementValue(nodes, SOP_CLASS_UID)
+  const sopInstanceUid = rootElementValue(nodes, SOP_INSTANCE_UID)
+
+  const updated = fileMeta.map((node) => {
+    if (node.kind === 'Sequence') return node
+    if (node.tag === MEDIA_STORAGE_SOP_CLASS_UID && sopClassUid !== undefined) {
+      return { ...node, value: sopClassUid, length: dicomUiLength(sopClassUid) }
+    }
+    if (node.tag === MEDIA_STORAGE_SOP_INSTANCE_UID && sopInstanceUid !== undefined) {
+      return { ...node, value: sopInstanceUid, length: dicomUiLength(sopInstanceUid) }
+    }
+    return node
+  })
+
+  const groupLength = fileMetaGroupLength(updated)
+  return updated.map((node) => (
+    node.kind === 'Element' && node.tag === FILE_META_INFORMATION_GROUP_LENGTH
+      ? { ...node, value: String(groupLength), length: 4 }
+      : node
+  ))
 }
 
 function samePath(left: string[], right: string[]) {
@@ -112,6 +163,7 @@ export function useDicomFile() {
     [activeDocumentId, documents],
   )
   const filePath = activeDocument?.filePath
+  const fileMeta = activeDocument?.fileMeta ?? []
   const nodes = activeDocument?.nodes ?? []
   const dirty = activeDocument?.dirty ?? false
 
@@ -159,12 +211,12 @@ export function useDicomFile() {
         return true
       }
 
-      const loaded = await invoke<DicomNode[]>('open_dicom_file', { path })
+      const loaded = await invoke<DicomFileContent>('open_dicom_file', { path })
       const id = crypto.randomUUID()
       setDocuments((current) => {
         const next = [
           ...current,
-          { id, filePath: path, nodes: loaded, dirty: false },
+          { id, filePath: path, fileMeta: loaded.file_meta, nodes: loaded.nodes, dirty: false },
         ]
         documentsRef.current = next
         return next
@@ -279,11 +331,15 @@ export function useDicomFile() {
 
   const updateNodeValue = useCallback((path: string[], value: string) => {
     if (!activeDocumentId) return
-    updateDocument(activeDocumentId, (document) => ({
-      ...document,
-      nodes: updateNode(document.nodes, path, value),
-      dirty: true,
-    }))
+    updateDocument(activeDocumentId, (document) => {
+      const nodes = updateNode(document.nodes, path, value)
+      return {
+        ...document,
+        nodes,
+        fileMeta: syncFileMetaFromNodes(document.fileMeta, nodes),
+        dirty: true,
+      }
+    })
   }, [activeDocumentId, updateDocument])
 
   const addTag = useCallback((parentPath: string[], node: DicomElement) => {
@@ -303,6 +359,7 @@ export function useDicomFile() {
     updateDocument(activeDocument.id, (document) => ({
       ...document,
       nodes: result.nodes,
+      fileMeta: syncFileMetaFromNodes(document.fileMeta, result.nodes),
       dirty: true,
     }))
     return true
@@ -310,12 +367,16 @@ export function useDicomFile() {
 
   const deleteNodeByPath = useCallback((path: string[]) => {
     if (!activeDocumentId) return
-    updateDocument(activeDocumentId, (document) => ({
-      ...document,
-      nodes: deleteNode(document.nodes, path),
-      selectedPath: undefined,
-      dirty: true,
-    }))
+    updateDocument(activeDocumentId, (document) => {
+      const nodes = deleteNode(document.nodes, path)
+      return {
+        ...document,
+        nodes,
+        fileMeta: syncFileMetaFromNodes(document.fileMeta, nodes),
+        selectedPath: undefined,
+        dirty: true,
+      }
+    })
   }, [activeDocumentId, updateDocument])
 
   const setSelectedPath = useCallback((path?: string[]) => {
@@ -329,6 +390,7 @@ export function useDicomFile() {
       activeDocument,
       activeDocumentId,
       filePath,
+      fileMeta,
       nodes,
       loading,
       dirty,
@@ -358,6 +420,7 @@ export function useDicomFile() {
       dirty,
       error,
       filePath,
+      fileMeta,
       loading,
       nodes,
       openFile,
