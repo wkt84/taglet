@@ -158,6 +158,7 @@ export function useDicomFile() {
   const [activeDocumentId, setActiveDocumentId] = useState<string>()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string>()
+  const [warnings, setWarnings] = useState<string[]>([])
   const activeDocument = useMemo(
     () => documents.find((document) => document.id === activeDocumentId),
     [activeDocumentId, documents],
@@ -222,6 +223,9 @@ export function useDicomFile() {
         return next
       })
       setActiveDocumentId(id)
+      if (loaded.warnings.length > 0) {
+        setWarnings((current) => [...current, ...loaded.warnings])
+      }
       return true
     } catch (error) {
       setError(String(error))
@@ -384,6 +388,10 @@ export function useDicomFile() {
     updateDocument(activeDocumentId, (document) => ({ ...document, selectedPath: path }))
   }, [activeDocumentId, updateDocument])
 
+  const dismissWarning = useCallback(() => {
+    setWarnings((current) => current.slice(1))
+  }, [])
+
   return useMemo(
     () => ({
       documents,
@@ -395,6 +403,8 @@ export function useDicomFile() {
       loading,
       dirty,
       error,
+      warning: warnings[0],
+      dismissWarning,
       openFile,
       openPath,
       openPaths,
@@ -416,6 +426,7 @@ export function useDicomFile() {
       closeDocument,
       closeFile,
       deleteNodeByPath,
+      dismissWarning,
       documents,
       dirty,
       error,
@@ -431,6 +442,7 @@ export function useDicomFile() {
       selectDocument,
       setSelectedPath,
       updateNodeValue,
+      warnings,
     ],
   )
 }

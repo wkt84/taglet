@@ -185,7 +185,7 @@ pub async fn open_dicom_file(
     path: String,
     store: State<'_, DicomStore>,
 ) -> Result<DicomFileContent, String> {
-    let (_preview, content) = open_nodes(&path)?;
+    let content = open_nodes(&path)?;
     store
         .objects
         .lock()

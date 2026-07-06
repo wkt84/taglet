@@ -3,11 +3,19 @@ use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
 use dicom_core::header::{HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
 use dicom_core::{Tag, VR};
-use dicom_dictionary_std::{tags, StandardDataDictionary};
+use dicom_dictionary_std::{tags, uids, StandardDataDictionary};
+use dicom_encoding::text::SpecificCharacterSet;
+use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{
-    open_file, DefaultDicomObject, FileMetaTable, InMemDicomObject, OpenFileOptions,
+    DefaultDicomObject, FileMetaTable, FileMetaTableBuilder, InMemDicomObject, OpenFileOptions,
 };
+use dicom_parser::dataset::lazy_read::LazyDataSetReader;
+use dicom_parser::dataset::{DataToken, LazyDataToken};
+use dicom_parser::stateful::decode::StatefulDecode;
+use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::str::FromStr;
 
 use super::model::{
@@ -44,22 +52,48 @@ const CONTOUR_GEOMETRIC_TYPE: Tag = Tag(0x3006, 0x0042);
 const CONTOUR_DATA: Tag = Tag(0x3006, 0x0050);
 const REFERENCED_ROI_NUMBER: Tag = Tag(0x3006, 0x0084);
 const RTSTRUCT_Z_TOLERANCE: f64 = 0.01;
+const MISSING_FILE_META_WARNING: &str =
+    "File meta information header is missing. The dataset was read as Implicit VR Little Endian.";
+const MAX_RAW_DISPLAY_VALUE_LENGTH: u32 = 1_048_576;
+const MAX_RAW_DISPLAY_ELEMENTS: usize = 20_000;
+const RAW_DATASET_START_GROUPS: &[u16] = &[
+    0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x3006, 0x300A, 0x300C,
+];
 
-pub fn open_nodes(path: &str) -> Result<(DefaultDicomObject, DicomFileContent), String> {
-    let obj = OpenFileOptions::new()
+pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
+    match OpenFileOptions::new()
         .read_until(tags::PIXEL_DATA)
         .open_file(path)
-        .map_err(|error| error.to_string())?;
-    let file_meta = file_meta_to_nodes(obj.meta());
-    let mut nodes = object_to_nodes(&obj, Vec::new());
-    if pixel_data_likely_present(&obj) && !nodes.iter().any(is_pixel_data_node) {
-        nodes.push(pixel_data_placeholder_node());
+    {
+        Ok(obj) => {
+            let file_meta = file_meta_to_nodes(obj.meta());
+            let mut nodes = object_to_nodes(&obj, Vec::new());
+            if pixel_data_likely_present(&obj) && !nodes.iter().any(is_pixel_data_node) {
+                nodes.push(pixel_data_placeholder_node());
+            }
+            Ok(DicomFileContent {
+                file_meta,
+                nodes,
+                warnings: Vec::new(),
+            })
+        }
+        Err(standard_error) => {
+            let nodes = read_raw_implicit_vr_little_endian_nodes(path).map_err(|raw_error| {
+                format!(
+                    "Could not read as DICOM Part 10 ({standard_error}) or raw Implicit VR Little Endian dataset ({raw_error})"
+                )
+            })?;
+            Ok(DicomFileContent {
+                file_meta: Vec::new(),
+                nodes,
+                warnings: vec![MISSING_FILE_META_WARNING.to_string()],
+            })
+        }
     }
-    Ok((obj, DicomFileContent { file_meta, nodes }))
 }
 
 pub fn open_full_object(path: &str) -> Result<DefaultDicomObject, String> {
-    open_file(path).map_err(|error| error.to_string())
+    open_object_with_fallback(path, false).map(|(obj, _)| obj)
 }
 
 pub fn tag_info(tag_text: &str) -> Result<DicomTagInfo, String> {
@@ -597,6 +631,269 @@ fn file_meta_to_nodes(meta: &FileMetaTable) -> Vec<DicomNode> {
         .collect()
 }
 
+fn open_object_with_fallback(
+    path: &str,
+    read_until_pixel_data: bool,
+) -> Result<(DefaultDicomObject, bool), String> {
+    let options = if read_until_pixel_data {
+        OpenFileOptions::new().read_until(tags::PIXEL_DATA)
+    } else {
+        OpenFileOptions::new()
+    };
+
+    match options.open_file(path) {
+        Ok(obj) => Ok((obj, false)),
+        Err(standard_error) => read_raw_implicit_vr_little_endian(path)
+            .map(|obj| (obj, true))
+            .map_err(|raw_error| {
+                format!(
+                    "Could not read as DICOM Part 10 ({standard_error}) or raw Implicit VR Little Endian dataset ({raw_error})"
+                )
+            }),
+    }
+}
+
+fn read_raw_implicit_vr_little_endian(path: &str) -> Result<DefaultDicomObject, String> {
+    ensure_raw_dataset_candidate(path)?;
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(uids::IMPLICIT_VR_LITTLE_ENDIAN)
+        .ok_or_else(|| "Implicit VR Little Endian transfer syntax is not available".to_string())?;
+    let obj = InMemDicomObject::read_dataset_with_ts(BufReader::new(file), transfer_syntax)
+        .map_err(|error| error.to_string())?;
+
+    obj.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::IMPLICIT_VR_LITTLE_ENDIAN))
+        .map_err(|error| error.to_string())
+}
+
+fn read_raw_implicit_vr_little_endian_nodes(path: &str) -> Result<Vec<DicomNode>, String> {
+    ensure_raw_dataset_candidate(path)?;
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(uids::IMPLICIT_VR_LITTLE_ENDIAN)
+        .ok_or_else(|| "Implicit VR Little Endian transfer syntax is not available".to_string())?;
+    let mut reader =
+        LazyDataSetReader::new_with_ts_cs(file, transfer_syntax, SpecificCharacterSet::default())
+            .map_err(|error| error.to_string())?;
+    let (mut nodes, found_pixel_data) = read_dataset_nodes(&mut reader, Vec::new(), false)?;
+    if found_pixel_data && !nodes.iter().any(is_pixel_data_node) {
+        nodes.push(pixel_data_placeholder_node());
+    }
+    Ok(nodes)
+}
+
+fn ensure_raw_dataset_candidate(path: &str) -> Result<(), String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("Could not read raw dataset header: {error}"))?;
+
+    let group = u16::from_le_bytes([header[0], header[1]]);
+    let element = u16::from_le_bytes([header[2], header[3]]);
+    let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let tag = Tag(group, element);
+
+    if !RAW_DATASET_START_GROUPS.contains(&group) || tag >= PIXEL_DATA {
+        return Err(format!(
+            "Raw dataset fallback rejected first tag {} as unlikely to be a DICOM dataset",
+            format_tag(tag)
+        ));
+    }
+    if length == u32::MAX || length > MAX_RAW_DISPLAY_VALUE_LENGTH {
+        return Err(format!(
+            "Raw dataset fallback rejected first element {} with unsafe length {}",
+            format_tag(tag),
+            length
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_dataset_nodes<S>(
+    reader: &mut LazyDataSetReader<S>,
+    parent_path: Vec<String>,
+    stop_at_item_end: bool,
+) -> Result<(Vec<DicomNode>, bool), String>
+where
+    S: StatefulDecode,
+{
+    let mut nodes = Vec::new();
+
+    loop {
+        let Some(token) = next_data_token(reader)? else {
+            break;
+        };
+
+        match token {
+            LazyDataToken::ElementHeader(header) => {
+                if header.tag == PIXEL_DATA {
+                    nodes.push(pixel_data_placeholder_node_with_length(length_to_u32(
+                        header.len,
+                    )));
+                    return Ok((nodes, true));
+                }
+
+                let Some(value_token) = next_data_token(reader)? else {
+                    return Err(format!(
+                        "Missing value for element {}",
+                        format_tag(header.tag)
+                    ));
+                };
+                let value_token = value_token
+                    .into_owned()
+                    .map_err(|error| error.to_string())?;
+                let DataToken::PrimitiveValue(value) = value_token else {
+                    return Err(format!(
+                        "Unexpected value token after element {}",
+                        format_tag(header.tag)
+                    ));
+                };
+                nodes.push(primitive_token_to_node(
+                    header.tag,
+                    header.vr,
+                    header.len,
+                    value,
+                    &parent_path,
+                ));
+            }
+            token @ LazyDataToken::LazyValue { header, .. } => {
+                let tag = header.tag;
+                let vr = header.vr;
+                let length = header.len;
+                if tag == PIXEL_DATA {
+                    nodes.push(pixel_data_placeholder_node_with_length(length_to_u32(
+                        length,
+                    )));
+                    token.skip().map_err(|error| error.to_string())?;
+                    return Ok((nodes, true));
+                }
+                if length.0 > MAX_RAW_DISPLAY_VALUE_LENGTH {
+                    return Err(format!(
+                        "Raw dataset element {} has a value length of {} bytes, which exceeds the safe fallback display limit",
+                        format_tag(tag),
+                        length.0
+                    ));
+                }
+                let value_token = token.into_owned().map_err(|error| error.to_string())?;
+                let DataToken::PrimitiveValue(value) = value_token else {
+                    return Err(format!("Unexpected DICOM value token {value_token}"));
+                };
+                nodes.push(primitive_token_to_node(
+                    tag,
+                    vr,
+                    length,
+                    value,
+                    &parent_path,
+                ));
+            }
+            LazyDataToken::SequenceStart { tag, len } => {
+                let tag_text = format_tag(tag);
+                let mut path = parent_path.clone();
+                path.push(tag_text.clone());
+                let (items, found_pixel_data) = read_sequence_items(reader, path.clone())?;
+                nodes.push(DicomNode::Sequence {
+                    tag: tag_text,
+                    description: description_for(tag),
+                    length: length_to_u32(len),
+                    path,
+                    items,
+                });
+                if found_pixel_data {
+                    return Ok((nodes, true));
+                }
+            }
+            LazyDataToken::PixelSequenceStart => {
+                nodes.push(pixel_data_placeholder_node());
+                return Ok((nodes, true));
+            }
+            LazyDataToken::ItemEnd if stop_at_item_end => break,
+            LazyDataToken::SequenceEnd if !stop_at_item_end => break,
+            LazyDataToken::ItemEnd | LazyDataToken::SequenceEnd => break,
+            LazyDataToken::ItemStart { .. } | LazyDataToken::LazyItemValue { .. } => {
+                return Err("Unexpected DICOM token in raw dataset".to_string());
+            }
+            _ => return Err("Unsupported DICOM token in raw dataset".to_string()),
+        }
+        if nodes.len() > MAX_RAW_DISPLAY_ELEMENTS {
+            return Err(format!(
+                "Raw dataset has more than {MAX_RAW_DISPLAY_ELEMENTS} display elements before Pixel Data"
+            ));
+        }
+    }
+
+    Ok((nodes, false))
+}
+
+fn read_sequence_items<S>(
+    reader: &mut LazyDataSetReader<S>,
+    sequence_path: Vec<String>,
+) -> Result<(Vec<Vec<DicomNode>>, bool), String>
+where
+    S: StatefulDecode,
+{
+    let mut items = Vec::new();
+
+    loop {
+        let Some(token) = next_data_token(reader)? else {
+            break;
+        };
+
+        match token {
+            LazyDataToken::ItemStart { .. } => {
+                let mut item_path = sequence_path.clone();
+                item_path.push(format!("Item#{}", items.len()));
+                let (nodes, found_pixel_data) = read_dataset_nodes(reader, item_path, true)?;
+                items.push(nodes);
+                if found_pixel_data {
+                    return Ok((items, true));
+                }
+            }
+            LazyDataToken::SequenceEnd => break,
+            _ => return Err("Unexpected DICOM sequence token in raw dataset".to_string()),
+        }
+    }
+
+    Ok((items, false))
+}
+
+fn next_data_token<S>(
+    reader: &mut LazyDataSetReader<S>,
+) -> Result<Option<LazyDataToken<&mut S>>, String>
+where
+    S: StatefulDecode,
+{
+    reader
+        .advance()
+        .transpose()
+        .map_err(|error| error.to_string())
+}
+
+fn primitive_token_to_node(
+    tag: Tag,
+    vr: VR,
+    length: Length,
+    value: PrimitiveValue,
+    parent_path: &[String],
+) -> DicomNode {
+    let tag_text = format_tag(tag);
+    let mut path = parent_path.to_vec();
+    path.push(tag_text.clone());
+    let value = Value::Primitive(value);
+    let (value, inferred_vr) = display_element_value(tag, vr, &value);
+
+    DicomNode::Element {
+        tag: tag_text,
+        vr: vr.to_string().to_owned(),
+        inferred_vr,
+        description: description_for(tag),
+        value,
+        length: length_to_u32(length),
+        path,
+        editable: tag != PIXEL_DATA && is_text_editable(vr),
+    }
+}
+
 fn node_tag(node: &DicomNode) -> Result<Tag, String> {
     match node {
         DicomNode::Element { tag, .. } | DicomNode::Sequence { tag, .. } => parse_tag(tag),
@@ -616,13 +913,17 @@ fn is_pixel_data_node(node: &DicomNode) -> bool {
 }
 
 fn pixel_data_placeholder_node() -> DicomNode {
+    pixel_data_placeholder_node_with_length(u32::MAX)
+}
+
+fn pixel_data_placeholder_node_with_length(length: u32) -> DicomNode {
     DicomNode::Element {
         tag: format_tag(PIXEL_DATA),
         vr: "OB/OW".to_string(),
         inferred_vr: None,
         description: "PixelData".to_string(),
         value: "[Binary Data]".to_string(),
-        length: u32::MAX,
+        length,
         path: vec![format_tag(PIXEL_DATA)],
         editable: false,
     }
@@ -663,7 +964,10 @@ fn private_un_text_value(value: &Value<InMemDicomObject>) -> Option<String> {
     if trimmed.is_empty() || trimmed.len() > 256 {
         return None;
     }
-    if !trimmed.iter().all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\\') {
+    if !trimmed
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ' || *byte == b'\\')
+    {
         return None;
     }
 
@@ -684,10 +988,9 @@ fn infer_text_vr(value: &str) -> Option<&'static str> {
         return None;
     }
 
-    if components
-        .iter()
-        .all(|component| !component.is_empty() && component.len() <= 16 && is_code_string(component))
-    {
+    if components.iter().all(|component| {
+        !component.is_empty() && component.len() <= 16 && is_code_string(component)
+    }) {
         return Some("CS");
     }
 
@@ -703,9 +1006,9 @@ fn infer_text_vr(value: &str) -> Option<&'static str> {
 }
 
 fn is_code_string(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_' || byte == b' ')
+    value.bytes().all(|byte| {
+        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_' || byte == b' '
+    })
 }
 
 fn description_for(tag: Tag) -> String {

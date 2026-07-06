@@ -276,6 +276,26 @@ export default function App() {
           }}
         />
       ) : null}
+      {dicom.warning ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+          <div className="w-full max-w-md rounded bg-white shadow-xl">
+            <div className="border-b border-amber-200 bg-amber-50 px-4 py-3">
+              <h2 className="text-base font-semibold text-amber-950">DICOM Warning</h2>
+            </div>
+            <div className="px-4 py-4 text-sm leading-6 text-slate-700">
+              {dicom.warning}
+            </div>
+            <div className="flex justify-end border-t border-slate-200 px-4 py-3">
+              <button
+                className="rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700"
+                onClick={dicom.dismissWarning}
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   )
 }

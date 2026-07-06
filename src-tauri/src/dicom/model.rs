@@ -27,6 +27,7 @@ pub enum DicomNode {
 pub struct DicomFileContent {
     pub file_meta: Vec<DicomNode>,
     pub nodes: Vec<DicomNode>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

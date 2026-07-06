@@ -24,6 +24,7 @@ export type DicomNode = DicomElement | DicomSequence
 export type DicomFileContent = {
   file_meta: DicomNode[]
   nodes: DicomNode[]
+  warnings: string[]
 }
 
 export type ValidationResult = {
