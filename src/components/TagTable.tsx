@@ -11,6 +11,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import TagRow from './TagRow'
 import ValueCell from './ValueCell'
 import type { DicomElement, DicomNode, TableDicomRow } from '../types/dicom'
+import { findTagOccurrences } from '../data/batchEdit'
 
 const SEARCH_DEBOUNCE_MS = 150
 const MAX_SEARCH_RESULTS = 200
@@ -24,18 +25,43 @@ type Props = {
   selectedPath?: string[]
   onChange: (path: string[], value: string) => void
   onSelect: (path: string[]) => void
+  onBatchEdit: (element: DicomElement) => void
 }
 
-export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onChange, onSelect }: Props) {
+export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onChange, onSelect, onBatchEdit }: Props) {
   const tableScrollRef = useRef<HTMLDivElement>(null)
   const [expanded, setExpanded] = useState<ExpandedState>({})
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [pendingScrollPath, setPendingScrollPath] = useState<string[]>()
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>({})
+  const [contextMenu, setContextMenu] = useState<{ element: DicomElement; x: number; y: number }>()
+  const contextMenuRef = useRef<HTMLDivElement>(null)
+  const selectedElement = useMemo(() => selectedPath
+    ? findTagOccurrences(nodes, selectedPath[selectedPath.length - 1]).find((match) => samePath(match.element.path, selectedPath))?.element
+    : undefined, [nodes, selectedPath])
   const rows = useMemo(() => toTableRows(nodes, fileMeta), [fileMeta, nodes])
   const searchResults = useMemo(() => searchRows(rows, debouncedQuery), [debouncedQuery, rows])
   const searching = query.trim() !== debouncedQuery.trim()
+
+  useEffect(() => {
+    if (!contextMenu) return
+    function dismiss(event: MouseEvent) {
+      if (!contextMenuRef.current?.contains(event.target as Node)) setContextMenu(undefined)
+    }
+    function escape(event: KeyboardEvent) {
+      if (event.key === 'Escape') setContextMenu(undefined)
+    }
+    const dismissOnScroll = () => setContextMenu(undefined)
+    window.addEventListener('mousedown', dismiss)
+    window.addEventListener('keydown', escape)
+    window.addEventListener('scroll', dismissOnScroll, true)
+    return () => {
+      window.removeEventListener('mousedown', dismiss)
+      window.removeEventListener('keydown', escape)
+      window.removeEventListener('scroll', dismissOnScroll, true)
+    }
+  }, [contextMenu])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -49,6 +75,7 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
     setQuery('')
     setDebouncedQuery('')
     setPendingScrollPath(undefined)
+    setContextMenu(undefined)
   }, [filePath])
 
   const columns = useMemo<ColumnDef<TableDicomRow>[]>(
@@ -207,6 +234,14 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
     <div className="flex h-full flex-col overflow-hidden rounded border border-slate-300 bg-white shadow-sm">
       <div className="border-b border-slate-200 bg-slate-50 p-3">
         <div className="flex items-center gap-2">
+          <button
+            className="shrink-0 rounded bg-blue-700 px-3 py-1.5 text-sm text-white hover:bg-blue-600 disabled:opacity-45"
+            disabled={!selectedElement?.editable}
+            title="Select an editable tag to change matching tags in one or more files."
+            onClick={() => { if (selectedElement?.editable) onBatchEdit(selectedElement) }}
+          >
+            Batch Edit
+          </button>
           <input
             className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
             value={query}
@@ -314,11 +349,17 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
                 row={row}
                 selected={samePath(row.original.path, selectedPath)}
                 onSelect={onSelect}
+                onBatchContextMenu={(element, x, y) => setContextMenu({ element, x, y })}
               />
             ))}
           </tbody>
         </table>
       </div>
+      {contextMenu ? (
+        <div ref={contextMenuRef} role="menu" className="fixed z-40 rounded border border-slate-200 bg-white p-1 shadow-lg" style={{ left: Math.max(8, Math.min(contextMenu.x, window.innerWidth - 220)), top: Math.max(8, Math.min(contextMenu.y, window.innerHeight - 60)) }}>
+          <button autoFocus role="menuitem" className="rounded px-4 py-2 text-sm hover:bg-blue-50" onClick={() => { onBatchEdit(contextMenu.element); setContextMenu(undefined) }}>Batch edit this tag…</button>
+        </div>
+      ) : null}
     </div>
   )
 }

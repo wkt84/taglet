@@ -12,6 +12,7 @@ CT、MR、RT Plan、RT Structure Set、RT Dose などの DICOM ファイルを�
 - Sequence / Item の展開・折りたたみ
 - タグ番号またはタグ名による検索
 - テキスト系 VR の編集
+- 同じタグ番号の一括変更（親 Sequence 配下・ファイル全体・複数ファイル）
 - multiple value の validation
 - Tag / Sequence の追加と削除
 - Save / Save As
@@ -82,6 +83,21 @@ xattr -cr /Applications/Taglet.app
 6. `Save` または `Save As` で保存します。
 
 複数ファイルを開いた場合は、画面上部のタブで切り替えできます。
+
+### タグの一括変更
+
+編集可能なタグ行を選択して `Batch Edit` を押すか、行を右クリックして `Batch edit this tag…` を選びます。
+
+- `Files`: 現在のファイル、または開いている複数ファイルから対象を選択します。
+- `Scope`: ファイル全体、または親 Sequence 配下の全 Item を指定します。入れ子の Sequence も対象です。
+- `New value`: 対象タグに設定する値を入力します。空欄にすると値を空にできます。
+- `Preview`: ファイル、Sequence / Item の位置、Beam 名・番号、現在値、新しい値を確認します。チェックを外すと個別に除外できます。
+
+例えば RTPlan の Beam 内のマシン ID を選び、Scope を Beam Sequence にすると、全 Beam の同じタグ番号をまとめて変更できます。複数ファイルでは Item 番号ではなく Sequence のタグ番号の階層で範囲を照合するため、Beam 数が異なるファイルも対象にできます。
+
+一致するタグがないファイルは一覧に表示され、タグは追加されません。編集不可のタグと、既に新しい値になっているタグは変更対象外です。適用前に各 VR の値検証を行い、検証に失敗した場合は一括変更全体を適用しません。
+
+適用後は未保存の状態です。変更した各ファイルを `Save` または `Save As` で保存してください。
 
 ## Viewer
 
@@ -175,10 +191,13 @@ npm run tauri:dev:wsl
 
 ```bash
 npm run build
+npm test
 cd src-tauri
 cargo check
 cargo test
 ```
+
+`npm test` は Node.js 24 で検証しています。
 
 ## ライセンス
 

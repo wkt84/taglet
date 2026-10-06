@@ -1,13 +1,14 @@
 import { flexRender, Row } from '@tanstack/react-table'
-import type { TableDicomRow } from '../types/dicom'
+import type { DicomElement, TableDicomRow } from '../types/dicom'
 
 type Props = {
   row: Row<TableDicomRow>
   selected: boolean
   onSelect: (path: string[]) => void
+  onBatchContextMenu: (element: DicomElement, x: number, y: number) => void
 }
 
-export default function TagRow({ row, selected, onSelect }: Props) {
+export default function TagRow({ row, selected, onSelect, onBatchContextMenu }: Props) {
   const isSequence = row.original.kind === 'Sequence'
   const isFileMeta = row.original.kind === 'FileMeta'
   const isItem = row.original.kind === 'Item'
@@ -33,6 +34,12 @@ export default function TagRow({ row, selected, onSelect }: Props) {
       onClick={() => {
         onSelect(row.original.path)
         if (canToggle) row.toggleExpanded()
+      }}
+      onContextMenu={(event) => {
+        if (row.original.kind !== 'Element' || !row.original.editable) return
+        event.preventDefault()
+        onSelect(row.original.path)
+        onBatchContextMenu(row.original, event.clientX, event.clientY)
       }}
       title={canToggle ? (row.getIsExpanded() ? 'Collapse' : 'Expand') : undefined}
     >

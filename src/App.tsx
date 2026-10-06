@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { getVersion } from '@tauri-apps/api/app'
 import AddTagDialog from './components/AddTagDialog'
+import BatchEditDialog from './components/BatchEditDialog'
 import AboutDialog from './components/AboutDialog'
 import BevViewer from './components/BevViewer'
 import ConfirmDeleteDialog from './components/ConfirmDeleteDialog'
@@ -14,7 +15,7 @@ import TagTable from './components/TagTable'
 import Toolbar from './components/Toolbar'
 import UpdateChecker from './components/UpdateChecker'
 import { useDicomFile } from './hooks/useDicomFile'
-import type { DicomNode } from './types/dicom'
+import type { DicomElement, DicomNode } from './types/dicom'
 
 function fileName(path?: string) {
   if (!path) return undefined
@@ -97,6 +98,7 @@ type PendingDelete = {
 export default function App() {
   const dicom = useDicomFile()
   const [addingTag, setAddingTag] = useState(false)
+  const [batchElement, setBatchElement] = useState<DicomElement>()
   const [showingImageViewer, setShowingImageViewer] = useState(false)
   const [showingBevViewer, setShowingBevViewer] = useState(false)
   const [showingRtStructViewer, setShowingRtStructViewer] = useState(false)
@@ -124,6 +126,10 @@ export default function App() {
     const name = fileName(dicom.filePath)
     return name ? `Taglet - ${name}` : 'Taglet'
   }, [dicom.filePath])
+
+  useEffect(() => {
+    setBatchElement(undefined)
+  }, [dicom.activeDocumentId])
 
   useEffect(() => {
     getVersion()
@@ -248,8 +254,19 @@ export default function App() {
           selectedPath={selectedPath}
           onChange={dicom.updateNodeValue}
           onSelect={dicom.setSelectedPath}
+          onBatchEdit={setBatchElement}
         />
       </section>
+      {batchElement && dicom.activeDocumentId ? (
+        <BatchEditDialog
+          element={batchElement}
+          documents={dicom.documents}
+          activeDocumentId={dicom.activeDocumentId}
+          error={dicom.error}
+          onApply={dicom.batchUpdateValues}
+          onClose={() => setBatchElement(undefined)}
+        />
+      ) : null}
       {addingTag ? (
         <AddTagDialog
           existingTags={existingTagsForTarget}

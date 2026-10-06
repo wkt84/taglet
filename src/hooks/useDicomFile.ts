@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { DicomElement, DicomFileContent, DicomNode } from '../types/dicom'
+import type { DicomElement, DicomFileContent, DicomNode, ValidationResult } from '../types/dicom'
+import { applyBatchValueChanges, validateBatchValueChanges, type BatchValueChange } from '../data/batchEdit'
 
 export type DicomDocument = {
   id: string
@@ -369,6 +370,30 @@ export function useDicomFile() {
     return true
   }, [activeDocument, updateDocument])
 
+  const batchUpdateValues = useCallback(async (changes: BatchValueChange[]) => {
+    setError(undefined)
+    if (changes.length === 0) return false
+    const snapshot = documentsRef.current
+    try {
+      await validateBatchValueChanges(snapshot, changes, (vr, value) => invoke<ValidationResult>('validate_value', { vr, value }))
+      if (documentsRef.current !== snapshot) {
+        throw new Error('The open files changed during validation. Review the preview and try again.')
+      }
+      const next = snapshot.map((document) => {
+        const edits = changes.filter((change) => change.documentId === document.id && change.value !== change.previousValue)
+        if (edits.length === 0) return document
+        const nodes = applyBatchValueChanges(document.nodes, edits)
+        return { ...document, nodes, fileMeta: syncFileMetaFromNodes(document.fileMeta, nodes), dirty: true }
+      })
+      documentsRef.current = next
+      setDocuments(next)
+      return true
+    } catch (error) {
+      setError(String(error))
+      return false
+    }
+  }, [])
+
   const deleteNodeByPath = useCallback((path: string[]) => {
     if (!activeDocumentId) return
     updateDocument(activeDocumentId, (document) => {
@@ -414,6 +439,7 @@ export function useDicomFile() {
       saveFile,
       saveFileAs,
       updateNodeValue,
+      batchUpdateValues,
       addTag,
       deleteNodeByPath,
       selectedPath: activeDocument?.selectedPath,
@@ -423,6 +449,7 @@ export function useDicomFile() {
       activeDocument,
       activeDocumentId,
       addTag,
+      batchUpdateValues,
       closeDocument,
       closeFile,
       deleteNodeByPath,
