@@ -199,6 +199,25 @@ cargo test
 
 `npm test` は Node.js 24 で検証しています。
 
+### 画面テスト（Playwright）
+
+初回はテスト用 Chromium をインストールします。
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
+
+Playwright が Vite を `http://127.0.0.1:5174` で起動し、Chromium で一括変更画面をテストします。Tauri API はテスト側からモックを注入し、2 Beam / 3 Beam の RTPlan 相当データを読み込みます。Sequence の範囲、複数ファイル、個別除外、検証エラー、空値への変更と、保存コマンドに渡される編集結果を確認します。実ファイルの読み書きと Rust 側の値検証は、この画面テストの対象外です。
+
+画面を表示して実行する場合:
+
+```bash
+npm run test:e2e -- --headed
+```
+
+失敗時のスクリーンショットと trace は `test-results/` に保存されます。
+
 ## ライセンス
 
 MIT
