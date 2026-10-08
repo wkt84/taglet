@@ -37,7 +37,8 @@ export default function ValueCell({ element, onCommit }: Props) {
     }
   }, [draft, editing, element.editable, element.vr])
 
-  if (preview.needsDialog || dialogOpen) {
+  const hasDisplayOptions = element.value.includes('\\') || element.value.trimStart().startsWith('<')
+  if (preview.needsDialog || dialogOpen || hasDisplayOptions) {
     return (
       <div className="flex min-w-0 items-center gap-2">
         <span className={`dicom-value-font min-w-0 flex-1 truncate ${element.editable ? '' : 'text-slate-500'}`}>

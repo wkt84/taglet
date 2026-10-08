@@ -9,6 +9,9 @@ test.describe.configure({ mode: 'default' })
 const LONG_TEXT = '(0008,4000)'
 const PRIVATE_TEXT = '(0019,1002)'
 const LONG_SH = '(0008,0050)'
+const MLC = '(300A,011C)'
+const XML = '(0019,1003)'
+const mixedXml = '<?xml version="1.0"?><Parameters><Machine id="A"><Energy>6</Energy><Mode>STATIC</Mode></Machine><Text>before <b>bold</b> after</Text><Keep xml:space="preserve">  <v>1</v>  </Keep></Parameters>'
 const text = 'Long report 😀 '.repeat(20) + '\r\nSecond line\twith trailing spaces  '
 const privateText = 'ASCII_PRIVATE_'.repeat(25) + '  '
 const longSh = 'VALUE\\'.repeat(25) + 'LAST'
@@ -36,6 +39,8 @@ test.beforeEach(async ({ page }) => {
     element(LONG_TEXT, text, 'LT'),
     { ...element(PRIVATE_TEXT, privateText, 'UN', false), inferred_vr: 'LT?' },
     element(LONG_SH, longSh, 'SH'),
+    element(MLC, '-10\\-20\\-30\\10\\20\\30', 'DS'),
+    element(XML, mixedXml, 'UN', false),
   )
   await openMockFiles(page, fixtureFiles)
 })
@@ -115,4 +120,58 @@ test('multiline drafts apply only explicitly and Escape discards changes', async
   await expect(dialog).not.toBeVisible()
   await expect(row(page, LONG_TEXT).getByRole('button', { name: 'View full value' })).toBeFocused()
   expect(valueAt(await savedNodes(page, FILE_A) as DicomNode[], LONG_TEXT)).toBe(newText)
+})
+
+test('table columns and transpose pair MLC banks without changing the saved value', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const dialog = await openValue(page, MLC)
+  await expect(dialog.locator('option', { hasText: 'XML format' })).toHaveCount(0)
+  await dialog.getByLabel('Display', { exact: true }).selectOption('table')
+  await dialog.getByLabel('Columns', { exact: true }).fill('3')
+  let rows = dialog.getByRole('table', { name: 'Value table' }).locator('tbody tr')
+  await expect(rows).toHaveCount(2)
+  expect(await rows.first().locator('td').allTextContents()).toEqual(['-10', '-20', '-30'])
+  await dialog.getByRole('button', { name: 'Transpose', exact: true }).click()
+  await expect(rows).toHaveCount(3)
+  expect(await rows.first().locator('td').allTextContents()).toEqual(['-10', '10'])
+  await expect(dialog.getByRole('button', { name: 'Apply', exact: true })).toHaveCount(0)
+  await page.evaluate(() => { Object.defineProperty(navigator.clipboard, 'writeText', { value: async () => { throw new Error('unavailable') } }) })
+  await dialog.getByRole('button', { name: 'Copy full value' }).click()
+  await expect(dialog.getByRole('status')).toHaveText('Copied')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('-10\\-20\\-30\\10\\20\\30')
+  await dialog.getByLabel('Display', { exact: true }).selectOption('raw')
+  await expect(dialog.getByRole('textbox', { name: 'Full value' })).toHaveValue('-10\\-20\\-30\\10\\20\\30')
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  expect(valueAt(await savedNodes(page, FILE_A) as DicomNode[], MLC)).toBe('-10\\-20\\-30\\10\\20\\30')
+})
+
+test('XML formatting is conditional, preserves mixed content and copies the original', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const dialog = await openValue(page, XML)
+  await dialog.getByLabel('Display', { exact: true }).selectOption('xml')
+  const formatted = dialog.getByLabel('Formatted XML', { exact: true })
+  await expect(formatted).toContainText('\n  <Machine id="A">\n    <Energy>6</Energy>')
+  await expect(formatted).toContainText('<Text>before <b>bold</b> after</Text>')
+  await expect(formatted).toContainText('<Keep xml:space="preserve">  <v>1</v>  </Keep>')
+  await expect(formatted).toContainText('<?xml version="1.0"?>')
+  await dialog.getByRole('button', { name: 'Copy full value' }).click()
+  await expect(dialog.getByRole('status')).toHaveText('Copied')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(mixedXml)
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  expect(valueAt(await savedNodes(page, FILE_A) as DicomNode[], XML)).toBe(mixedXml)
+})
+
+test('XML option follows valid drafts, rejecting malformed XML and allowing an element named parsererror', async ({ page }) => {
+  const dialog = await openValue(page, LONG_TEXT)
+  const raw = dialog.getByRole('textbox', { name: 'Full value' })
+  await raw.fill('<root><broken></root>')
+  await expect(dialog.locator('option', { hasText: 'XML format' })).toHaveCount(0)
+  await raw.fill('<parsererror><child>valid XML</child></parsererror>')
+  await expect(dialog.locator('option', { hasText: 'XML format' })).toHaveCount(1)
+  await dialog.getByLabel('Display', { exact: true }).selectOption('xml')
+  await expect(dialog.getByLabel('Formatted XML', { exact: true })).toContainText('valid XML')
+  await dialog.getByLabel('Display', { exact: true }).selectOption('raw')
+  await raw.fill('Plain text again')
+  await expect(dialog.locator('option', { hasText: 'XML format' })).toHaveCount(0)
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
 })

@@ -1,7 +1,8 @@
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomElement, ValidationResult } from '../types/dicom'
+import { formattedXml, valueMatrix } from '../data/valueFormats'
 
 type Props = {
   element: DicomElement
@@ -20,6 +21,15 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
   const [applying, setApplying] = useState(false)
   const [validation, setValidation] = useState<ValidationResult>({ valid: true })
   const [copyStatus, setCopyStatus] = useState('')
+  const [mode, setMode] = useState<'raw' | 'table' | 'xml'>('raw')
+  const [columns, setColumns] = useState('2')
+  const [transpose, setTranspose] = useState(false)
+  const xml = useMemo(() => formattedXml(draft), [draft])
+  const matrix = useMemo(() => mode === 'table' ? valueMatrix(draft, Number(columns), transpose) : [], [draft, columns, transpose, mode])
+
+  useEffect(() => {
+    if (mode === 'xml' && xml === null) setMode('raw')
+  }, [mode, xml])
 
   useEffect(() => {
     activeRef.current = true
@@ -62,9 +72,12 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
       // Some desktop WebViews do not expose the Clipboard API. Copy the actual
       // textarea contents without replacing line breaks or trimming whitespace.
       if (!activeRef.current) return
-      const text = textRef.current!
+      const text = document.createElement('textarea')
+      text.className = 'sr-only'
+      text.value = draft
+      text.readOnly = true
+      dialogRef.current!.appendChild(text)
       const previousFocus = document.activeElement as HTMLElement | null
-      const { selectionStart, selectionEnd, selectionDirection } = text
       const copyExactText = (event: ClipboardEvent) => {
         if (event.clipboardData) {
           event.clipboardData.setData('text/plain', draft)
@@ -81,7 +94,7 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
         copied = false
       } finally {
         document.removeEventListener('copy', copyExactText)
-        text.setSelectionRange(selectionStart, selectionEnd, selectionDirection)
+        text.remove()
         previousFocus?.focus()
       }
       setCopyStatus(copied ? 'Copied' : 'Copy failed. Select the text and copy it manually.')
@@ -108,14 +121,28 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
         <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
             <label className="flex items-center gap-2">
+              Display
+              <select aria-label="Display" disabled={applying} className="rounded border border-slate-300 bg-white px-2 py-1" value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
+                <option value="raw">Original</option>
+                <option value="table">Table</option>
+                {xml !== null ? <option value="xml">XML format</option> : null}
+              </select>
+            </label>
+            {mode === 'table' ? <>
+              <label className="flex items-center gap-2">Columns
+                <input aria-label="Columns" type="number" min="1" max="1024" className="w-20 rounded border border-slate-300 px-2 py-1" value={columns} onChange={(event) => setColumns(event.target.value)} onBlur={() => setColumns(String(Math.max(1, Math.min(1024, Math.trunc(Number(columns)) || 1))))} />
+              </label>
+              <button aria-pressed={transpose} className={`rounded border px-2 py-1 ${transpose ? 'border-blue-400 bg-blue-50 text-blue-800' : 'border-slate-300'}`} onClick={() => setTranspose((current) => !current)}>Transpose</button>
+            </> : <label className="flex items-center gap-2">
               <input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} />
               Wrap text
-            </label>
+            </label>}
             <span className="text-xs text-slate-500">
               {Array.from(draft).length.toLocaleString()} characters · DICOM Length: {element.length.toLocaleString()} bytes (loaded)
             </span>
           </div>
           <textarea
+            hidden={mode !== 'raw'}
             ref={textRef}
             aria-label="Full value"
             readOnly={!element.editable}
@@ -126,16 +153,29 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
             value={draft}
             onChange={(event) => { setDraft(event.target.value); setValidation({ valid: true }); setCopyStatus('') }}
           />
+          {mode === 'table' ? <div className="h-[min(50vh,28rem)] min-h-32 overflow-auto rounded border border-slate-300">
+            <table aria-label="Value table" className="w-full border-collapse text-sm">
+              <thead className="sticky top-0 bg-slate-100 text-slate-600"><tr>
+                <th scope="col" className="border-b border-slate-300 px-3 py-2 text-left font-normal">#</th>
+                {matrix[0]?.map((_, index) => <th key={index} scope="col" className="border-b border-slate-300 px-3 py-2 text-right font-normal">{index + 1}</th>)}
+              </tr></thead>
+              <tbody>{matrix.map((row, rowIndex) => <tr key={rowIndex}>
+                <th scope="row" className="border-b border-slate-200 bg-slate-50 px-3 py-2 text-left font-normal text-slate-500">{rowIndex + 1}</th>
+                {row.map((value, columnIndex) => <td key={columnIndex} className="dicom-value-font whitespace-pre border-b border-slate-200 px-3 py-2 text-right tabular-nums">{value === null ? <span className="text-slate-400">—</span> : value === '' ? <span className="text-slate-400">(empty)</span> : value}</td>)}
+              </tr>)}</tbody>
+            </table>
+          </div> : null}
+          {mode === 'xml' ? <pre aria-label="Formatted XML" className={`dicom-value-font m-0 h-[min(50vh,28rem)] min-h-32 overflow-auto rounded border border-slate-300 p-3 text-sm ${wrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'}`}>{xml}</pre> : null}
           {!validation.valid ? <p role="alert" className="text-sm text-red-700">{validation.message ?? 'Invalid value'}</p> : null}
           <p className="text-xs text-slate-500">
-            {element.editable ? 'Apply confirms this value. Save the file to write your changes.' : 'Read-only value. You can view and copy the text.'}
+            {mode !== 'raw' ? 'Display only. Copy uses the original text; select Original to edit.' : element.editable ? 'Apply confirms this value. Save the file to write your changes.' : 'Read-only value. You can view and copy the text.'}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 px-4 py-3">
           <button disabled={applying} className="rounded border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-50" onClick={() => void copy()}>Copy full value</button>
           <span role="status" className="flex-1 text-xs text-slate-600">{copyStatus}</span>
           <button className="rounded px-3 py-1.5 text-sm hover:bg-slate-100" onClick={onClose}>{element.editable ? 'Cancel' : 'Close'}</button>
-          {element.editable ? <button disabled={applying} className="rounded bg-blue-700 px-4 py-1.5 text-sm text-white hover:bg-blue-600 disabled:opacity-50" onClick={() => void apply()}>{applying ? 'Validating…' : 'Apply'}</button> : null}
+          {element.editable && mode === 'raw' ? <button disabled={applying} className="rounded bg-blue-700 px-4 py-1.5 text-sm text-white hover:bg-blue-600 disabled:opacity-50" onClick={() => void apply()}>{applying ? 'Validating…' : 'Apply'}</button> : null}
         </div>
       </div>
     </dialog>,
