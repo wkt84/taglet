@@ -52,12 +52,20 @@ function findDeviceDefinition(beam: RtPlanBeam, deviceType: string) {
     ?? beam.devices.find((device) => normalized.startsWith(device.device_type.toUpperCase()))
 }
 
-function apertureExtent(beam: RtPlanBeam, controlPoint: RtPlanControlPoint) {
-  const values = [
-    ...controlPoint.devices.flatMap((device) => device.positions),
-    ...beam.devices.flatMap((device) => device.leaf_position_boundaries),
-  ]
-  const maxAbs = Math.max(100, ...values.map((value) => Math.abs(value)))
+function apertureExtent(beam: RtPlanBeam) {
+  let maxAbs = 100
+  for (const controlPoint of beam.control_points) {
+    for (const device of controlPoint.devices) {
+      for (const position of device.positions) {
+        maxAbs = Math.max(maxAbs, Math.abs(position))
+      }
+    }
+  }
+  for (const device of beam.devices) {
+    for (const boundary of device.leaf_position_boundaries) {
+      maxAbs = Math.max(maxAbs, Math.abs(boundary))
+    }
+  }
   return Math.ceil(maxAbs / 50) * 50
 }
 
@@ -109,7 +117,7 @@ function BevCanvas({ beam, controlPoint }: { beam: RtPlanBeam; controlPoint: RtP
   const dragStartRef = useRef<{ x: number; y: number }>()
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
-  const extent = apertureExtent(beam, controlPoint)
+  const extent = useMemo(() => apertureExtent(beam), [beam])
   const xDevice = findDevice(controlPoint, ['ASYMX', 'X'])
   const yDevice = findDevice(controlPoint, ['ASYMY', 'Y'])
   const mlcDevices = controlPoint.devices.filter((device) => isMlcType(device.device_type))
@@ -345,7 +353,7 @@ export default function BevViewer({ onClose }: Props) {
             ) : error ? (
               <span className="max-w-md text-sm text-red-300">{error}</span>
             ) : info?.supported && selectedControlPoint ? (
-              <BevCanvas beam={selectedBeam} controlPoint={selectedControlPoint} />
+              <BevCanvas key={selectedBeam.beam_index} beam={selectedBeam} controlPoint={selectedControlPoint} />
             ) : (
               <div className="max-w-md text-center text-sm">
                 <div className="font-medium">BEV is not available.</div>
