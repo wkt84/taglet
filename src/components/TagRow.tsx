@@ -1,5 +1,6 @@
 import { flexRender, Row } from '@tanstack/react-table'
 import type { DicomElement, TableDicomRow } from '../types/dicom'
+import { canBatchEdit } from '../data/privateTags'
 
 type Props = {
   row: Row<TableDicomRow>
@@ -36,7 +37,7 @@ export default function TagRow({ row, selected, onSelect, onBatchContextMenu }: 
         if (canToggle) row.toggleExpanded()
       }}
       onContextMenu={(event) => {
-        if (row.original.kind !== 'Element' || !row.original.editable) return
+        if (row.original.kind !== 'Element' || !canBatchEdit(row.original)) return
         event.preventDefault()
         onSelect(row.original.path)
         onBatchContextMenu(row.original, event.clientX, event.clientY)

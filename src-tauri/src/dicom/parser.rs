@@ -24,6 +24,7 @@ use super::model::{
     RtPlanBevInfo, RtPlanControlPoint, RtStructBounds, RtStructContour, RtStructData, RtStructInfo,
     RtStructPoint, RtStructRoi, RtStructSlice, RtStructSliceContours,
 };
+use super::private::validate_private_nodes;
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 const DOSE_GRID_SCALING: Tag = Tag(0x3004, 0x000E);
@@ -538,6 +539,14 @@ pub fn apply_nodes_to_object(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
 ) -> Result<(), String> {
+    validate_private_nodes(obj, nodes)?;
+    apply_validated_nodes_to_object(obj, nodes)
+}
+
+fn apply_validated_nodes_to_object(
+    obj: &mut InMemDicomObject,
+    nodes: &[DicomNode],
+) -> Result<(), String> {
     let desired_tags = nodes
         .iter()
         .map(node_tag)
@@ -577,7 +586,7 @@ pub fn apply_nodes_to_object(
                 obj.update_value(tag, |value| {
                     if let Some(sequence_items) = value.items_mut() {
                         for (item, next_nodes) in sequence_items.iter_mut().zip(items.iter()) {
-                            let _ = apply_nodes_to_object(item, next_nodes);
+                            let _ = apply_validated_nodes_to_object(item, next_nodes);
                         }
                     }
                 });
@@ -961,7 +970,7 @@ fn private_un_text_value(value: &Value<InMemDicomObject>) -> Option<String> {
         return None;
     };
     let trimmed = trim_dicom_padding(bytes.as_slice());
-    if trimmed.is_empty() || trimmed.len() > 256 {
+    if trimmed.is_empty() || trimmed.len() > 10_240 {
         return None;
     }
     if !trimmed
@@ -1000,6 +1009,10 @@ fn infer_text_vr(value: &str) -> Option<&'static str> {
 
     if components.iter().all(|component| component.len() <= 64) {
         return Some("LO");
+    }
+
+    if value.len() <= 10_240 && !value.contains('\\') {
+        return Some("LT");
     }
 
     None
@@ -1056,7 +1069,7 @@ fn format_tag(tag: Tag) -> String {
     format!("({:04X},{:04X})", tag.group(), tag.element())
 }
 
-fn parse_tag(tag: &str) -> Result<Tag, String> {
+pub(super) fn parse_tag(tag: &str) -> Result<Tag, String> {
     let text = tag
         .strip_prefix('(')
         .and_then(|value| value.strip_suffix(')'))
@@ -1637,5 +1650,86 @@ mod tests {
         assert_eq!(infer_text_vr("HF1"), Some("CS"));
         assert_eq!(infer_text_vr("d10"), Some("SH"));
         assert_eq!(infer_text_vr("LongerThanSixteenChars"), Some("LO"));
+        assert_eq!(infer_text_vr(&"A".repeat(65)), Some("LT"));
+        assert_eq!(infer_text_vr(&"A".repeat(10_240)), Some("LT"));
+        assert_eq!(infer_text_vr(&"A".repeat(10_241)), None);
+        assert_eq!(infer_text_vr(&format!("{}\\B", "A".repeat(65))), None);
+    }
+
+    #[test]
+    fn private_un_ascii_display_accepts_up_to_10240_bytes() {
+        for length in [66, 256, 257, 10_240] {
+            let text = "a".repeat(length);
+            let value = Value::Primitive(PrimitiveValue::U8(text.clone().into_bytes().into()));
+            let (display, inferred) = display_element_value(Tag(0x0019, 0x1001), VR::UN, &value);
+            assert_eq!(display, text);
+            assert_eq!(inferred.as_deref(), Some("LT?"));
+        }
+        let oversized = Value::Primitive(PrimitiveValue::U8(vec![b'A'; 10_241].into()));
+        assert!(private_un_text_value(&oversized).is_none());
+    }
+
+    #[test]
+    fn private_un_ascii_display_rejects_structure_and_non_printable_bytes() {
+        for bytes in [
+            vec![0xFE, 0xFF, 0x00, 0xE0],
+            b"A\nB".to_vec(),
+            b"A\tB".to_vec(),
+            b"A\0B".to_vec(),
+            vec![0xC3, 0xA9],
+            vec![],
+            vec![b' ', 0],
+        ] {
+            let value = Value::Primitive(PrimitiveValue::U8(bytes.into()));
+            assert!(private_un_text_value(&value).is_none());
+        }
+        let value = Value::Primitive(PrimitiveValue::U8(b"Readable text \0".to_vec().into()));
+        assert_eq!(
+            private_un_text_value(&value).as_deref(),
+            Some("Readable text")
+        );
+    }
+
+    #[test]
+    fn inferred_private_un_text_remains_read_only_and_preserves_bytes_on_save() {
+        let tag = Tag(0x0019, 0x1001);
+        let bytes = [vec![b'A'; 10240], vec![b' ', 0]].concat();
+        let mut obj = InMemDicomObject::new_empty();
+        obj.put_str(Tag(0x0019, 0x0010), VR::LO, "VENDOR");
+        obj.put(dicom_core::DataElement::new(
+            tag,
+            VR::UN,
+            PrimitiveValue::U8(bytes.clone().into()),
+        ));
+        let nodes = object_to_nodes(&obj, vec![]);
+        let node = nodes
+            .iter()
+            .find(|node| matches!(node, DicomNode::Element { tag, .. } if tag == "(0019,1001)"))
+            .unwrap();
+        assert!(
+            matches!(node, DicomNode::Element { vr, inferred_vr: Some(inferred), editable: false, .. } if vr == "UN" && inferred == "LT?")
+        );
+        let syntaxes = [
+            uids::IMPLICIT_VR_LITTLE_ENDIAN,
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+        ];
+        let before = syntaxes.map(|uid| {
+            let mut encoded = Vec::new();
+            obj.write_dataset_with_ts(&mut encoded, TransferSyntaxRegistry.get(uid).unwrap())
+                .unwrap();
+            encoded
+        });
+        apply_nodes_to_object(&mut obj, &nodes).unwrap();
+        assert_eq!(obj.get(tag).unwrap().vr(), VR::UN);
+        assert_eq!(
+            obj.get(tag).unwrap().value().to_bytes().unwrap().as_ref(),
+            bytes.as_slice()
+        );
+        for (uid, expected) in syntaxes.into_iter().zip(before) {
+            let mut encoded = Vec::new();
+            obj.write_dataset_with_ts(&mut encoded, TransferSyntaxRegistry.get(uid).unwrap())
+                .unwrap();
+            assert_eq!(encoded, expected);
+        }
     }
 }

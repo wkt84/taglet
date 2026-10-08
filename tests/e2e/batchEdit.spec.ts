@@ -26,6 +26,19 @@ test.beforeEach(async ({ page }) => {
   await openMockFiles(page)
 })
 
+test('private values and creators allow single edits but cannot open batch editing', async ({ page }) => {
+  for (const tag of ['(0019,0010)', '(0019,1001)']) {
+    const privateRow = row(page, [tag]);
+    await privateRow.getByText('[Private]', { exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Batch Edit', exact: true })).toBeDisabled();
+    await privateRow.click({ button: 'right' });
+    await expect(page.getByRole('menuitem', { name: 'Batch edit this tag…' })).toHaveCount(0);
+  }
+  await row(page, ['(0019,1001)']).getByRole('button', { name: 'PRIVATE_VALUE', exact: true }).click();
+  await expect(row(page, ['(0019,1001)']).getByRole('textbox')).toHaveValue('PRIVATE_VALUE');
+  await row(page, ['(0019,1001)']).getByRole('textbox').press('Escape');
+})
+
 test('parent Sequence scope changes all Beams while individual exclusions preserve other values', async ({ page }) => {
   const dialog = await openBatch(page)
   await expect(dialog.getByLabel('Scope')).toHaveValue(JSON.stringify([BEAMS]))

@@ -1,4 +1,5 @@
 import type { DicomElement, DicomNode, ValidationResult } from '../types/dicom'
+import { canBatchEdit } from './privateTags.ts'
 
 export type BatchValueChange = {
   documentId: string
@@ -77,7 +78,10 @@ export async function validateBatchValueChanges(
   const valuesByVr = new Map<string, Set<string>>()
   for (const change of changes) {
     const element = elements.get(occurrenceKey(change.documentId, change.path))
-    if (!element?.editable || element.value !== change.previousValue) {
+    if (element && !canBatchEdit(element) && element.editable) {
+      throw new Error('Private tags do not support batch editing.')
+    }
+    if (!element || !canBatchEdit(element) || element.value !== change.previousValue) {
       throw new Error('A target has changed or is no longer editable. Review the preview and try again.')
     }
     const values = valuesByVr.get(element.vr) ?? new Set<string>()
@@ -98,7 +102,7 @@ export function applyBatchValueChanges(nodes: DicomNode[], changes: BatchValueCh
     return current.map((node) => {
       if (node.kind === 'Sequence') return { ...node, items: node.items.map(visit) }
       const change = byPath.get(JSON.stringify(node.path))
-      return change && node.editable && node.value === change.previousValue
+      return change && canBatchEdit(node) && node.value === change.previousValue
         ? { ...node, value: change.value }
         : node
     })

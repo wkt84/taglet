@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { DICOM_TAG_OPTIONS, DicomTagOption } from '../data/dicomTags'
 import type { DicomElement } from '../types/dicom'
+import { isPrivateTag } from '../data/privateTags'
 
 type Props = {
   existingTags: string[]
@@ -34,11 +35,6 @@ function normalizeTag(input: string) {
   const compact = input.trim().replace(/[()]/g, '').replace(/\s/g, '').toUpperCase()
   const match = compact.match(/^([0-9A-F]{4}),?([0-9A-F]{4})$/)
   return match ? `(${match[1]},${match[2]})` : undefined
-}
-
-function isPrivateTag(tag: string) {
-  const group = Number.parseInt(tag.slice(1, 5), 16)
-  return Number.isFinite(group) && group % 2 === 1
 }
 
 export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose }: Props) {

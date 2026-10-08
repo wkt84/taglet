@@ -13,6 +13,8 @@ function element(tag: string, value: string, path: string[], description: string
 
 function plan(beamCount: number): DicomFileContent {
   const nodes: DicomNode[] = [
+    element('(0019,0010)', 'VENDOR', ['(0019,0010)'], '[Private]', 'LO'),
+    element('(0019,1001)', 'PRIVATE_VALUE', ['(0019,1001)'], '[Private]', 'LO'),
     element(MACHINE, 'ROOT_MACHINE', [MACHINE], 'Treatment Machine Name'),
     {
       kind: 'Sequence', tag: BEAMS, description: 'Beam Sequence', length: 0, path: [BEAMS],

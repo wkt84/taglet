@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ancestorScopes, findTagOccurrences, applyBatchValueChanges, validateBatchValueChanges, occurrenceKey } from '../src/data/batchEdit.ts'
+import { canBatchEdit, isPrivateTag } from '../src/data/privateTags.ts'
 
 const BEAMS = '(300A,00B0)'
 const NESTED = '(300A,0111)'
@@ -8,6 +9,20 @@ const OTHER = '(300A,0070)'
 const MACHINE = '(300A,00B2)'
 const element = (tag, value, path, editable = true) => ({ kind: 'Element', tag, vr: 'SH', description: 'Test tag', value, path, editable, length: value.length })
 const sequence = (tag, path, items) => ({ kind: 'Sequence', tag, description: tag === BEAMS ? 'Beam Sequence' : 'Other Sequence', length: 0, path, items })
+
+test('private values and creators are excluded from batch editing at every entry point', async () => {
+  for (const tag of ['(0019,0010)', '(0019,1001)', '(0021,1001)']) {
+    const node = element(tag, 'OLD', [tag]);
+    const changes = [{ documentId: 'a', path: [tag], previousValue: 'OLD', value: 'NEW' }];
+    assert.equal(isPrivateTag(tag), true);
+    assert.equal(canBatchEdit(node), false);
+    assert.deepEqual(applyBatchValueChanges([node], changes), [node]);
+    await assert.rejects(validateBatchValueChanges([{ id: 'a', nodes: [node] }], changes,
+      async () => { throw new Error('VR validation should not run'); }), /Private tags/);
+  }
+  assert.equal(canBatchEdit(element(MACHINE, 'OLD', [MACHINE])), true);
+  assert.equal(isPrivateTag('invalid'), false);
+})
 
 function plan(beamCount = 2) {
   const beams = sequence(BEAMS, [BEAMS], Array.from({ length: beamCount }, (_, index) => {

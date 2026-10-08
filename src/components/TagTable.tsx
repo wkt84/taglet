@@ -12,6 +12,7 @@ import TagRow from './TagRow'
 import ValueCell from './ValueCell'
 import type { DicomElement, DicomNode, TableDicomRow } from '../types/dicom'
 import { findTagOccurrences } from '../data/batchEdit'
+import { canBatchEdit } from '../data/privateTags'
 
 const SEARCH_DEBOUNCE_MS = 150
 const MAX_SEARCH_RESULTS = 200
@@ -236,9 +237,9 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
         <div className="flex items-center gap-2">
           <button
             className="shrink-0 rounded bg-blue-700 px-3 py-1.5 text-sm text-white hover:bg-blue-600 disabled:opacity-45"
-            disabled={!selectedElement?.editable}
-            title="Select an editable tag to change matching tags in one or more files."
-            onClick={() => { if (selectedElement?.editable) onBatchEdit(selectedElement) }}
+            disabled={!selectedElement || !canBatchEdit(selectedElement)}
+            title="Select an editable standard tag. Private tags do not support batch editing."
+            onClick={() => { if (selectedElement && canBatchEdit(selectedElement)) onBatchEdit(selectedElement) }}
           >
             Batch Edit
           </button>

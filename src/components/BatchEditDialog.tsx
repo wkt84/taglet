@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { DicomDocument } from '../hooks/useDicomFile'
 import type { DicomElement } from '../types/dicom'
 import { ancestorScopes, findTagOccurrences, occurrenceKey, type BatchValueChange } from '../data/batchEdit'
+import { canBatchEdit } from '../data/privateTags'
 
 type Props = {
   element: DicomElement
@@ -30,7 +31,7 @@ export default function BatchEditDialog({ element, documents, activeDocumentId, 
     matches: findTagOccurrences(document.nodes, element.tag, JSON.parse(scopeKey) as string[]),
   }))
   const changes = preview.flatMap(({ document, matches }) => matches
-    .filter(({ element: match }) => match.editable && match.value !== value && !excluded.has(occurrenceKey(document.id, match.path)))
+    .filter(({ element: match }) => canBatchEdit(match) && match.value !== value && !excluded.has(occurrenceKey(document.id, match.path)))
     .map(({ element: match }): BatchValueChange => ({ documentId: document.id, path: match.path, previousValue: match.value, value })))
   const fileCount = new Set(changes.map((change) => change.documentId)).size
 
