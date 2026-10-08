@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomFramePixels, DicomImageInfo } from '../types/dicom'
+import { autoWindow, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
 
 type Props = {
   onClose: () => void
@@ -10,13 +11,6 @@ function valueText(value: unknown) {
   if (value === undefined || value === null || value === '') return '-'
   if (Array.isArray(value)) return value.length === 0 ? '-' : value.join(', ')
   return String(value)
-}
-
-function formatWindowNumber(value: number) {
-  if (!Number.isFinite(value)) return '0'
-  if (Math.abs(value) >= 1000) return value.toFixed(0)
-  if (Math.abs(value) >= 10) return value.toFixed(2)
-  return value.toPrecision(4).replace(/\.?0+$/, '')
 }
 
 function base64ToBytes(value: string) {
@@ -101,15 +95,14 @@ export default function ImageViewer({ onClose }: Props) {
   const histogramTrackRef = useRef<HTMLDivElement>(null)
   const rgbaBufferRef = useRef<Uint8ClampedArray<ArrayBuffer>>()
   const dragRef = useRef<{ x: number; y: number; panX: number; panY: number }>()
-  const histogramDragRef = useRef<'low' | 'high' | 'window'>()
+  const histogramDragRef = useRef<WindowDrag>()
   const pendingWindowBoundsRef = useRef<{ low: number; high: number }>()
   const windowUpdateFrameRef = useRef<number>()
   const [imageInfo, setImageInfo] = useState<DicomImageInfo>()
   const [framePixels, setFramePixels] = useState<DicomFramePixels>()
   const [frameIndex, setFrameIndex] = useState(0)
-  const [windowCenter, setWindowCenter] = useState<number>()
-  const [windowWidth, setWindowWidth] = useState<number>()
-  const [useAutoWindow, setUseAutoWindow] = useState(false)
+  const [imageWindow, setImageWindow] = useState<ImageWindow>({ center: 0, width: 1, auto: true })
+  const useAutoWindow = imageWindow.auto
   const [zoom, setZoom] = useState(1)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [error, setError] = useState<string>()
@@ -124,14 +117,10 @@ export default function ImageViewer({ onClose }: Props) {
   const histogramMin = framePixels?.min_value ?? 0
   const histogramMax = framePixels?.max_value ?? 1
   const histogramRange = Math.max(0, histogramMax - histogramMin)
-  const minWindowWidth = Math.max(histogramRange / 4096, 1e-6)
-  const windowStep = Math.max(histogramRange / 2048, 1e-6)
-  const effectiveWindowCenter = useAutoWindow && framePixels
-    ? (framePixels.min_value + framePixels.max_value) / 2
-    : (windowCenter ?? 0)
-  const effectiveWindowWidth = useAutoWindow && framePixels
-    ? Math.max(minWindowWidth, framePixels.max_value - framePixels.min_value)
-    : Math.max(minWindowWidth, windowWidth ?? minWindowWidth)
+  const { minWidth: minWindowWidth, step: windowStep } = windowLimits(histogramMin, histogramMax)
+  const effectiveWindow = useAutoWindow ? autoWindow(histogramMin, histogramMax) : imageWindow
+  const effectiveWindowCenter = effectiveWindow.center
+  const effectiveWindowWidth = effectiveWindow.width
   const windowLow = effectiveWindowCenter - effectiveWindowWidth / 2
   const windowHigh = effectiveWindowCenter + effectiveWindowWidth / 2
   const histogram = useMemo(
@@ -149,10 +138,9 @@ export default function ImageViewer({ onClose }: Props) {
         if (!canceled) {
           setImageInfo(info)
           if (info.window_center[0] !== undefined && info.window_width[0] !== undefined) {
-            setWindowCenter(info.window_center[0])
-            setWindowWidth(info.window_width[0])
+            setImageWindow({ center: info.window_center[0], width: Math.max(Number.EPSILON, info.window_width[0]), auto: false })
           } else {
-            setUseAutoWindow(true)
+            setImageWindow((current) => ({ ...current, auto: true }))
           }
         }
       })
@@ -171,6 +159,8 @@ export default function ImageViewer({ onClose }: Props) {
   useEffect(() => {
     if (!imageInfo?.supported) return
 
+    cancelWindowUpdate()
+    cancelHistogramDrag()
     let canceled = false
     setFrameLoading(true)
     setError(undefined)
@@ -181,12 +171,6 @@ export default function ImageViewer({ onClose }: Props) {
       .then((frame) => {
         if (!canceled) {
           setFramePixels(frame)
-          if (useAutoWindow) {
-            const frameRange = Math.max(0, frame.max_value - frame.min_value)
-            const frameMinWindowWidth = Math.max(frameRange / 4096, 1e-6)
-            setWindowCenter((frame.min_value + frame.max_value) / 2)
-            setWindowWidth(Math.max(frameMinWindowWidth, frameRange))
-          }
         }
       })
       .catch((error) => {
@@ -213,8 +197,8 @@ export default function ImageViewer({ onClose }: Props) {
     if (!framePixels || !decodedValues || !canvasRef.current) return
 
     const canvas = canvasRef.current
-    canvas.width = framePixels.width
-    canvas.height = framePixels.height
+    if (canvas.width !== framePixels.width) canvas.width = framePixels.width
+    if (canvas.height !== framePixels.height) canvas.height = framePixels.height
     const context = canvas.getContext('2d')
     if (!context) return
 
@@ -262,32 +246,44 @@ export default function ImageViewer({ onClose }: Props) {
     setPan({ x: 0, y: 0 })
   }
 
+  function cancelWindowUpdate() {
+    if (windowUpdateFrameRef.current !== undefined) {
+      window.cancelAnimationFrame(windowUpdateFrameRef.current)
+      windowUpdateFrameRef.current = undefined
+    }
+    pendingWindowBoundsRef.current = undefined
+  }
+
+  function cancelHistogramDrag() {
+    const drag = histogramDragRef.current
+    histogramDragRef.current = undefined
+    if (drag && histogramTrackRef.current?.hasPointerCapture(drag.pointerId)) {
+      histogramTrackRef.current.releasePointerCapture(drag.pointerId)
+    }
+  }
+
+  function updateWindow(center: number, width: number, auto = false, fromDrag = false) {
+    if (!Number.isFinite(center) || !Number.isFinite(width)) return
+    cancelWindowUpdate()
+    if (!fromDrag) cancelHistogramDrag()
+    setImageWindow({ center, width: Math.max(minWindowWidth, width), auto })
+  }
+
   function resetWindow() {
     if (imageInfo?.window_center[0] !== undefined && imageInfo.window_width[0] !== undefined) {
-      setWindowCenter(imageInfo.window_center[0])
-      setWindowWidth(imageInfo.window_width[0])
-      setUseAutoWindow(false)
+      updateWindow(imageInfo.window_center[0], imageInfo.window_width[0])
     } else {
       setAutoWindow(true)
     }
   }
 
   function setAutoWindow(enabled: boolean) {
-    setUseAutoWindow(enabled)
-    if (enabled && framePixels) {
-      const frameRange = Math.max(0, framePixels.max_value - framePixels.min_value)
-      const frameMinWindowWidth = Math.max(frameRange / 4096, 1e-6)
-      setWindowCenter((framePixels.min_value + framePixels.max_value) / 2)
-      setWindowWidth(Math.max(frameMinWindowWidth, frameRange))
-    }
+    // Freeze the currently displayed window when leaving Auto, including after frame changes.
+    updateWindow(effectiveWindowCenter, effectiveWindowWidth, enabled)
   }
 
-  function setWindowBounds(low: number, high: number) {
-    const nextLow = Math.min(low, high - minWindowWidth)
-    const nextHigh = Math.max(high, nextLow + minWindowWidth)
-    setWindowCenter((nextLow + nextHigh) / 2)
-    setWindowWidth(nextHigh - nextLow)
-    setUseAutoWindow(false)
+  function setWindowBounds(low: number, high: number, fromDrag = false) {
+    updateWindow(low + (high - low) / 2, high - low, false, fromDrag)
   }
 
   function scheduleWindowBounds(low: number, high: number) {
@@ -298,7 +294,7 @@ export default function ImageViewer({ onClose }: Props) {
       windowUpdateFrameRef.current = undefined
       const bounds = pendingWindowBoundsRef.current
       pendingWindowBoundsRef.current = undefined
-      if (bounds) setWindowBounds(bounds.low, bounds.high)
+      if (bounds) setWindowBounds(bounds.low, bounds.high, true)
     })
   }
 
@@ -308,27 +304,38 @@ export default function ImageViewer({ onClose }: Props) {
     return Math.min(100, Math.max(0, 100 - normalized * 100))
   }
 
-  function histogramEventValue(event: MouseEvent<HTMLElement>) {
-    const rect = histogramTrackRef.current?.getBoundingClientRect()
-    if (!rect) return histogramMin
-    const normalized = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height))
-    return histogramMax - normalized * (histogramMax - histogramMin)
+  function startHistogramDrag(event: PointerEvent<HTMLElement>, kind: WindowDrag['kind']) {
+    if (!framePixels || frameLoading || event.button !== 0 || histogramDragRef.current) return
+    const track = histogramTrackRef.current
+    const rect = track?.getBoundingClientRect()
+    if (!track || !rect || rect.height <= 0 || histogramRange <= 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    cancelWindowUpdate()
+    histogramDragRef.current = {
+      kind, pointerId: event.pointerId, startY: event.clientY,
+      unitsPerPixel: histogramRange / rect.height, minWidth: minWindowWidth,
+      low: windowLow, high: windowHigh,
+    }
+    track.setPointerCapture(event.pointerId)
   }
 
-  function updateHistogramWindow(event: MouseEvent<HTMLElement>) {
-    if (!histogramDragRef.current || !framePixels) return
-    const value = histogramEventValue(event)
-    const clamped = Math.min(histogramMax, Math.max(histogramMin, value))
+  function updateHistogramWindow(event: PointerEvent<HTMLElement>) {
+    const drag = histogramDragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const bounds = dragWindowBounds(drag, event.clientY)
+    scheduleWindowBounds(bounds.low, bounds.high)
+  }
 
-    if (histogramDragRef.current === 'low') {
-      scheduleWindowBounds(clamped, Math.max(clamped + minWindowWidth, windowHigh))
-    } else if (histogramDragRef.current === 'high') {
-      scheduleWindowBounds(Math.min(windowLow, clamped - minWindowWidth), clamped)
-    } else {
-      const width = Math.max(minWindowWidth, windowHigh - windowLow)
-      const low = Math.min(histogramMax - width, Math.max(histogramMin, clamped - width / 2))
-      scheduleWindowBounds(low, low + width)
-    }
+  function finishHistogramDrag(event: PointerEvent<HTMLElement>, commit: boolean) {
+    const drag = histogramDragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    histogramDragRef.current = undefined
+    const bounds = commit ? dragWindowBounds(drag, event.clientY) : pendingWindowBoundsRef.current
+    if (bounds) setWindowBounds(bounds.low, bounds.high)
+    else cancelWindowUpdate()
+    const track = histogramTrackRef.current
+    if (track?.hasPointerCapture(event.pointerId)) track.releasePointerCapture(event.pointerId)
   }
 
   return (
@@ -400,18 +407,12 @@ export default function ImageViewer({ onClose }: Props) {
                     <div className="font-mono">{formatWindowNumber(histogramMax)}</div>
                     <div
                       ref={histogramTrackRef}
-                      className="relative min-h-0 w-14 flex-1 cursor-ns-resize rounded border border-slate-600 bg-slate-900"
-                      onMouseDown={(event) => {
-                        histogramDragRef.current = 'window'
-                        updateHistogramWindow(event)
-                      }}
-                      onMouseMove={updateHistogramWindow}
-                      onMouseUp={() => {
-                        histogramDragRef.current = undefined
-                      }}
-                      onMouseLeave={() => {
-                        histogramDragRef.current = undefined
-                      }}
+                      className="relative min-h-0 w-14 flex-1 touch-none select-none cursor-ns-resize rounded border border-slate-600 bg-slate-900"
+                      onPointerDown={(event) => startHistogramDrag(event, 'window')}
+                      onPointerMove={updateHistogramWindow}
+                      onPointerUp={(event) => finishHistogramDrag(event, true)}
+                      onPointerCancel={(event) => finishHistogramDrag(event, false)}
+                      onLostPointerCapture={(event) => finishHistogramDrag(event, false)}
                     >
                       {histogram.map((count, index) => (
                         <div
@@ -435,21 +436,13 @@ export default function ImageViewer({ onClose }: Props) {
                         className="absolute left-1/2 h-3 w-16 -translate-x-1/2 -translate-y-1/2 rounded border border-amber-100 bg-amber-300 shadow"
                         style={{ top: `${valueToHistogramPercent(windowHigh)}%` }}
                         title="Window upper bound"
-                        onMouseDown={(event) => {
-                          event.stopPropagation()
-                          histogramDragRef.current = 'high'
-                          updateHistogramWindow(event)
-                        }}
+                        onPointerDown={(event) => startHistogramDrag(event, 'high')}
                       />
                       <button
                         className="absolute left-1/2 h-3 w-16 -translate-x-1/2 -translate-y-1/2 rounded border border-amber-100 bg-amber-300 shadow"
                         style={{ top: `${valueToHistogramPercent(windowLow)}%` }}
                         title="Window lower bound"
-                        onMouseDown={(event) => {
-                          event.stopPropagation()
-                          histogramDragRef.current = 'low'
-                          updateHistogramWindow(event)
-                        }}
+                        onPointerDown={(event) => startHistogramDrag(event, 'low')}
                       />
                     </div>
                     <div className="font-mono">{formatWindowNumber(histogramMin)}</div>
@@ -505,7 +498,7 @@ export default function ImageViewer({ onClose }: Props) {
                         step={windowStep}
                         disabled={useAutoWindow}
                         value={Number.isFinite(windowLow) ? formatWindowNumber(windowLow) : '0'}
-                        onChange={(event) => setWindowBounds(Number(event.target.value), windowHigh)}
+                        onChange={(event) => setWindowBounds(Math.min(Number(event.target.value), windowHigh - minWindowWidth), windowHigh)}
                       />
                     </label>
                     <label className="block text-xs text-slate-600">
@@ -516,7 +509,7 @@ export default function ImageViewer({ onClose }: Props) {
                         step={windowStep}
                         disabled={useAutoWindow}
                         value={Number.isFinite(windowHigh) ? formatWindowNumber(windowHigh) : '1'}
-                        onChange={(event) => setWindowBounds(windowLow, Number(event.target.value))}
+                        onChange={(event) => setWindowBounds(windowLow, Math.max(windowLow + minWindowWidth, Number(event.target.value)))}
                       />
                     </label>
                     <label className="block text-xs text-slate-600">
@@ -526,8 +519,8 @@ export default function ImageViewer({ onClose }: Props) {
                         type="number"
                         step={windowStep}
                         disabled={useAutoWindow}
-                        value={windowCenter === undefined ? '0' : formatWindowNumber(windowCenter)}
-                        onChange={(event) => setWindowCenter(Number(event.target.value))}
+                        value={formatWindowNumber(effectiveWindowCenter)}
+                        onChange={(event) => updateWindow(Number(event.target.value), effectiveWindowWidth)}
                       />
                     </label>
                     <label className="block text-xs text-slate-600">
@@ -538,8 +531,8 @@ export default function ImageViewer({ onClose }: Props) {
                         min={minWindowWidth}
                         step={windowStep}
                         disabled={useAutoWindow}
-                        value={windowWidth === undefined ? formatWindowNumber(minWindowWidth) : formatWindowNumber(windowWidth)}
-                        onChange={(event) => setWindowWidth(Math.max(minWindowWidth, Number(event.target.value)))}
+                        value={formatWindowNumber(effectiveWindowWidth)}
+                        onChange={(event) => updateWindow(effectiveWindowCenter, Number(event.target.value))}
                       />
                     </label>
                   </div>
