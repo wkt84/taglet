@@ -2,7 +2,7 @@ import { expect, type Page } from '@playwright/test'
 import { files, FILE_A, FILE_B, FILE_C } from './fixtures'
 import type { DicomFileContent } from '../../src/types/dicom'
 
-export async function openMockFiles(page: Page, fixtureFiles: Record<string, DicomFileContent> = files) {
+export async function openMockFiles(page: Page, fixtureFiles: Record<string, DicomFileContent> = files, viewerResponses: Record<string, unknown> = {}) {
   // Inject the official Tauri mocks before React mounts; production code is untouched.
   await page.route('**/src/main.tsx', async (route) => {
     const response = await route.fetch()
@@ -10,9 +10,14 @@ export async function openMockFiles(page: Page, fixtureFiles: Record<string, Dic
       import { mockIPC, mockWindows } from '/node_modules/@tauri-apps/api/mocks.js';
       mockWindows('main');
       const fixtureFiles = ${JSON.stringify(fixtureFiles)};
+      const viewerResponses = ${JSON.stringify(viewerResponses)};
       window.__testIpcCalls = [];
       mockIPC((command, args) => {
         window.__testIpcCalls.push({ command, args });
+        if (command in viewerResponses) {
+          const response = viewerResponses[command];
+          return structuredClone(command === 'get_dicom_frame_pixels' ? response[args.frameIndex] : response);
+        }
         switch (command) {
           case 'plugin:app|version': return '0.1.13';
           case 'take_launch_file_paths': return [];
