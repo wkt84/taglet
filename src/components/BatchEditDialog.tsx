@@ -3,6 +3,7 @@ import type { DicomDocument } from '../hooks/useDicomFile'
 import type { DicomElement } from '../types/dicom'
 import { ancestorScopes, findTagOccurrences, occurrenceKey, type BatchValueChange } from '../data/batchEdit'
 import { canBatchEdit } from '../data/privateTags'
+import ValueCell from './ValueCell'
 
 type Props = {
   element: DicomElement
@@ -143,8 +144,8 @@ export default function BatchEditDialog({ element, documents, activeDocumentId, 
                           </td>
                           <td className="max-w-sm break-words p-2"><div title={document.filePath} className="font-medium">{document.filePath.split(/[\\/]/).pop()}</div><div className="mt-1 text-xs">{location}</div></td>
                           <td className="p-2 align-top font-mono text-xs">{match.vr}</td>
-                          <td className="dicom-value-font max-w-xs whitespace-pre-wrap break-all p-2 align-top">{match.value || '(empty)'}</td>
-                          <td className="dicom-value-font max-w-xs whitespace-pre-wrap break-all p-2 align-top">{!match.editable ? 'Read-only · skipped' : unchanged ? 'Unchanged' : value || '(empty)'}</td>
+                          <td className="max-w-xs p-2 align-top"><ValueCell element={{ ...match, editable: false }} onCommit={() => {}} /></td>
+                          <td className="max-w-xs p-2 align-top">{!match.editable ? 'Read-only · skipped' : unchanged ? 'Unchanged' : <ValueCell element={{ ...match, value, editable: false }} onCommit={() => {}} />}</td>
                         </tr>
                       )
                     }))}

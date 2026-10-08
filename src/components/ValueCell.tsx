@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomElement, ValidationResult } from '../types/dicom'
+import { valuePreview } from '../data/valuePreview'
+import ValueDialog from './ValueDialog'
 
 type Props = {
   element: DicomElement
@@ -9,6 +11,8 @@ type Props = {
 
 export default function ValueCell({ element, onCommit }: Props) {
   const [editing, setEditing] = useState(false)
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const preview = useMemo(() => valuePreview(element.value), [element.value])
   const [draft, setDraft] = useState(element.value)
   const [validation, setValidation] = useState<ValidationResult>({ valid: true })
 
@@ -32,6 +36,23 @@ export default function ValueCell({ element, onCommit }: Props) {
       canceled = true
     }
   }, [draft, editing, element.editable, element.vr])
+
+  if (preview.needsDialog || dialogOpen) {
+    return (
+      <div className="flex min-w-0 items-center gap-2">
+        <span className={`dicom-value-font min-w-0 flex-1 truncate ${element.editable ? '' : 'text-slate-500'}`}>
+          {preview.text || '(empty)'}
+        </span>
+        <button
+          className="shrink-0 rounded border border-slate-300 px-2 py-0.5 text-xs text-blue-700 hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-300"
+          onClick={() => setDialogOpen(true)}
+        >
+          View full value
+        </button>
+        {dialogOpen ? <ValueDialog element={element} onCommit={onCommit} onClose={() => setDialogOpen(false)} /> : null}
+      </div>
+    )
+  }
 
   if (!element.editable) {
     return (

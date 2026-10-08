@@ -1,14 +1,15 @@
 import { expect, type Page } from '@playwright/test'
 import { files, FILE_A, FILE_B, FILE_C } from './fixtures'
+import type { DicomFileContent } from '../../src/types/dicom'
 
-export async function openMockFiles(page: Page) {
+export async function openMockFiles(page: Page, fixtureFiles: Record<string, DicomFileContent> = files) {
   // Inject the official Tauri mocks before React mounts; production code is untouched.
   await page.route('**/src/main.tsx', async (route) => {
     const response = await route.fetch()
     const setup = `
       import { mockIPC, mockWindows } from '/node_modules/@tauri-apps/api/mocks.js';
       mockWindows('main');
-      const fixtureFiles = ${JSON.stringify(files)};
+      const fixtureFiles = ${JSON.stringify(fixtureFiles)};
       window.__testIpcCalls = [];
       mockIPC((command, args) => {
         window.__testIpcCalls.push({ command, args });

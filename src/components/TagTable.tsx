@@ -13,6 +13,7 @@ import ValueCell from './ValueCell'
 import type { DicomElement, DicomNode, TableDicomRow } from '../types/dicom'
 import { findTagOccurrences } from '../data/batchEdit'
 import { canBatchEdit } from '../data/privateTags'
+import { valuePreview } from '../data/valuePreview'
 
 const SEARCH_DEBOUNCE_MS = 150
 const MAX_SEARCH_RESULTS = 200
@@ -400,7 +401,7 @@ function tagIndent(depth: number) {
 }
 
 function rowValue(row: TableDicomRow) {
-  if (row.kind === 'Element') return row.value || '-'
+  if (row.kind === 'Element') return valuePreview(row.value).text || '-'
   if (row.kind === 'Sequence') return `${row.items.length} item${row.items.length === 1 ? '' : 's'}`
   if (row.kind === 'FileMeta') return `${row.subRows.length} element${row.subRows.length === 1 ? '' : 's'}`
   return `${row.childCount} tag${row.childCount === 1 ? '' : 's'}`
