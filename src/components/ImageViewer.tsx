@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomFramePixels, DicomImageInfo } from '../types/dicom'
-import { autoWindow, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
+import { autoWindow, clampWindowToRange, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
 
 type Props = {
   onClose: () => void
@@ -315,7 +315,8 @@ export default function ImageViewer({ onClose }: Props) {
     histogramDragRef.current = {
       kind, pointerId: event.pointerId, startY: event.clientY,
       unitsPerPixel: histogramRange / rect.height, minWidth: minWindowWidth,
-      low: windowLow, high: windowHigh,
+      // A DICOM window may extend beyond the frame's pixel range (common for RTIMAGE); start from the drawn handles.
+      ...clampWindowToRange({ low: windowLow, high: windowHigh }, histogramMin, histogramMax, minWindowWidth),
     }
     track.setPointerCapture(event.pointerId)
   }
@@ -323,6 +324,8 @@ export default function ImageViewer({ onClose }: Props) {
   function updateHistogramWindow(event: PointerEvent<HTMLElement>) {
     const drag = histogramDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
+    if (event.clientY === drag.startY && !drag.moved) return
+    drag.moved = true
     const bounds = dragWindowBounds(drag, event.clientY)
     scheduleWindowBounds(bounds.low, bounds.high)
   }
@@ -331,7 +334,9 @@ export default function ImageViewer({ onClose }: Props) {
     const drag = histogramDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
     histogramDragRef.current = undefined
-    const bounds = commit ? dragWindowBounds(drag, event.clientY) : pendingWindowBoundsRef.current
+    // A click without movement must not replace an out-of-range window with its clamped start.
+    const moved = drag.moved || event.clientY !== drag.startY
+    const bounds = !moved ? undefined : commit ? dragWindowBounds(drag, event.clientY) : pendingWindowBoundsRef.current
     if (bounds) setWindowBounds(bounds.low, bounds.high)
     else cancelWindowUpdate()
     const track = histogramTrackRef.current

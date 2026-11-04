@@ -6,6 +6,7 @@ export type WindowDrag = WindowBounds & {
   startY: number
   unitsPerPixel: number
   minWidth: number
+  moved?: boolean
 }
 
 export function windowLimits(min: number, max: number) {
@@ -35,4 +36,12 @@ export function dragWindowBounds(drag: WindowDrag, clientY: number): WindowBound
     return { low: drag.low, high: Math.max(drag.high + delta, drag.low + drag.minWidth) }
   }
   return { low: drag.low + delta, high: drag.high + delta }
+}
+
+// Clamp a window into the slider range so a drag starts from where the handles are drawn.
+export function clampWindowToRange(bounds: WindowBounds, min: number, max: number, minWidth: number): WindowBounds {
+  if (!(max - min >= minWidth)) return bounds
+  const low = Math.min(Math.max(bounds.low, min), max - minWidth)
+  const high = Math.max(Math.min(bounds.high, max), low + minWidth)
+  return { low, high }
 }

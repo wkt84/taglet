@@ -83,6 +83,35 @@ test('RTDOSE: Auto follows frame changes and disabling it freezes the displayed 
   await expect.poll(() => grays(page)).toEqual([0, 128, 255])
 })
 
+test('RTIMAGE: DICOM window beyond the pixel range drags from the drawn handle without a dead zone', async ({ page }) => {
+  // Fractional rescale: stored integers map to non-integer values (-3.5 .. 21.18).
+  const pixels = frame([0, 10000, 20000], 16, false, 0.001234, -3.5)
+  const range = pixels.max_value - pixels.min_value
+  await openViewer(page, 'RTIMAGE', [pixels], [50, 200])
+  const handle = page.getByTitle('Window upper bound')
+  const track = (await handle.locator('..').boundingBox())!
+  const box = (await handle.boundingBox())!
+  expect(Math.abs(box.y + box.height / 2 - track.y)).toBeLessThan(2)
+  const x = box.x + box.width / 2, y = box.y + box.height / 2
+
+  // A click without movement keeps the DICOM window.
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.up()
+  await expect(page.getByLabel('WL', { exact: true })).toHaveValue('50')
+  await expect(page.getByLabel('WW', { exact: true })).toHaveValue('200')
+
+  // Dragging a quarter of the track moves High by a quarter of the range from the visible top edge.
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.move(x, y + track.height / 4, { steps: 5 })
+  await expect.poll(async () => (await handle.boundingBox())!.y + box.height / 2).toBeCloseTo(y + track.height / 4, -1)
+  await page.mouse.up()
+  await expect.poll(async () => Number(await page.getByLabel('High', { exact: true }).inputValue())).toBeCloseTo(pixels.max_value - range / 4, 4)
+  expect(Number(await page.getByLabel('Low', { exact: true }).inputValue())).toBeCloseTo(pixels.min_value, 6)
+  await expect.poll(() => grays(page)).toEqual([0, 170, 255])
+})
+
 test('crossing bounds and reversing preserves the opposite bound', async ({ page }) => {
   await openViewer(page, 'RTIMAGE', [frame([0, 128, 256], 16, false, 1)], [128, 128])
   const handle = page.getByTitle('Window upper bound')
