@@ -112,6 +112,14 @@ test('RTIMAGE: DICOM window beyond the pixel range drags from the drawn handle w
   await expect.poll(() => grays(page)).toEqual([0, 170, 255])
 })
 
+test('RTIMAGE: bits above Bits Stored are ignored when rendering', async ({ page }) => {
+  // 12-bit samples in 16-bit words with garbage (e.g. overlay bits) in the upper nibble.
+  const pixels = { ...frame([0xF000, 0xF800, 0xFFFF], 16, false, 1), bits_stored: 12, high_bit: 11, min_value: 0, max_value: 4095 }
+  await openViewer(page, 'RTIMAGE', [pixels])
+  await expect.poll(() => grays(page)).toEqual([0, 128, 255])
+  await expect(page.getByLabel('WW', { exact: true })).toHaveValue('4095')
+})
+
 test('crossing bounds and reversing preserves the opposite bound', async ({ page }) => {
   await openViewer(page, 'RTIMAGE', [frame([0, 128, 256], 16, false, 1)], [128, 128])
   const handle = page.getByTitle('Window upper bound')

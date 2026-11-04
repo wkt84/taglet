@@ -67,6 +67,8 @@ export type DicomFramePixels = {
   height: number
   frame_index: number
   bits_allocated: number
+  bits_stored?: number
+  high_bit?: number
   pixel_representation: number
   photometric_interpretation?: string | null
   rescale_intercept: number

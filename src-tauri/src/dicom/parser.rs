@@ -231,12 +231,12 @@ pub fn frame_image(
     }
 
     let frame = &pixel_bytes[frame_offset..frame_offset + frame_byte_len];
-    let signed = info.pixel_representation.unwrap_or(0) == 1;
+    let layout = PixelLayout::from_info(&info, bits_allocated);
     let (slope, intercept) = pixel_value_transform(&info);
     let mut values = Vec::with_capacity(width as usize * height as usize);
 
     for index in 0..frame_sample_count {
-        let stored = stored_pixel_value(frame, index, bits_allocated, signed);
+        let stored = stored_pixel_value(frame, index, layout);
         values.push(stored * slope + intercept);
     }
 
@@ -311,22 +311,17 @@ pub fn frame_pixels(
     }
 
     let frame = &pixel_bytes[frame_offset..frame_offset + frame_byte_len];
-    let signed = info.pixel_representation.unwrap_or(0) == 1;
+    let layout = PixelLayout::from_info(&info, bits_allocated);
     let (slope, intercept) = pixel_value_transform(&info);
-    let (min_value, max_value) = frame_min_max(
-        frame,
-        bits_allocated,
-        signed,
-        slope,
-        intercept,
-        frame_sample_count,
-    );
+    let (min_value, max_value) = frame_min_max(frame, layout, slope, intercept, frame_sample_count);
 
     Ok(DicomFramePixels {
         width,
         height,
         frame_index,
         bits_allocated,
+        bits_stored: layout.bits_stored,
+        high_bit: layout.high_bit,
         pixel_representation: info.pixel_representation.unwrap_or(0),
         photometric_interpretation: info.photometric_interpretation,
         rescale_intercept: intercept,
@@ -1554,47 +1549,79 @@ fn pixel_value_transform(info: &DicomImageInfo) -> (f64, f64) {
     )
 }
 
-fn stored_pixel_value(frame: &[u8], index: usize, bits_allocated: u32, signed: bool) -> f64 {
-    match bits_allocated {
-        8 => {
-            let value = frame[index];
-            if signed {
-                i8::from_le_bytes([value]) as f64
-            } else {
-                value as f64
-            }
+/// How stored pixel values are packed into each allocated sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PixelLayout {
+    bits_allocated: u32,
+    bits_stored: u32,
+    high_bit: u32,
+    signed: bool,
+}
+
+impl PixelLayout {
+    /// Falls back to the full sample when Bits Stored / High Bit are missing or inconsistent.
+    fn new(
+        bits_allocated: u32,
+        bits_stored: Option<u32>,
+        high_bit: Option<u32>,
+        signed: bool,
+    ) -> Self {
+        let bits_stored = bits_stored
+            .filter(|bits| (1..=bits_allocated).contains(bits))
+            .unwrap_or(bits_allocated);
+        let high_bit = high_bit
+            .filter(|bit| (bits_stored - 1..bits_allocated).contains(bit))
+            .unwrap_or(bits_stored - 1);
+        Self {
+            bits_allocated,
+            bits_stored,
+            high_bit,
+            signed,
         }
+    }
+
+    fn from_info(info: &DicomImageInfo, bits_allocated: u32) -> Self {
+        Self::new(
+            bits_allocated,
+            info.bits_stored,
+            info.high_bit,
+            info.pixel_representation.unwrap_or(0) == 1,
+        )
+    }
+}
+
+fn stored_pixel_value(frame: &[u8], index: usize, layout: PixelLayout) -> f64 {
+    let raw: u64 = match layout.bits_allocated {
+        8 => frame[index] as u64,
         16 => {
             let offset = index * 2;
-            let bytes = [frame[offset], frame[offset + 1]];
-            if signed {
-                i16::from_le_bytes(bytes) as f64
-            } else {
-                u16::from_le_bytes(bytes) as f64
-            }
+            u16::from_le_bytes([frame[offset], frame[offset + 1]]) as u64
         }
         32 => {
             let offset = index * 4;
-            let bytes = [
+            u32::from_le_bytes([
                 frame[offset],
                 frame[offset + 1],
                 frame[offset + 2],
                 frame[offset + 3],
-            ];
-            if signed {
-                i32::from_le_bytes(bytes) as f64
-            } else {
-                u32::from_le_bytes(bytes) as f64
-            }
+            ]) as u64
         }
-        _ => 0.0,
+        _ => return 0.0,
+    };
+
+    // Keep only bits (high_bit - bits_stored + 1)..=high_bit; the rest may hold overlays or garbage.
+    let shift = layout.high_bit + 1 - layout.bits_stored;
+    let value = (raw >> shift) & ((1u64 << layout.bits_stored) - 1);
+    if layout.signed && value & (1u64 << (layout.bits_stored - 1)) != 0 {
+        value as f64 - (1u64 << layout.bits_stored) as f64
+    } else {
+        value as f64
     }
 }
 
 fn frame_min_max(
     frame: &[u8],
-    bits_allocated: u32,
-    signed: bool,
+    layout: PixelLayout,
     slope: f64,
     intercept: f64,
     sample_count: usize,
@@ -1603,7 +1630,7 @@ fn frame_min_max(
     let mut max_value = f64::NEG_INFINITY;
 
     for index in 0..sample_count {
-        let stored = stored_pixel_value(frame, index, bits_allocated, signed) * slope + intercept;
+        let stored = stored_pixel_value(frame, index, layout) * slope + intercept;
         min_value = min_value.min(stored);
         max_value = max_value.max(stored);
     }
@@ -1623,23 +1650,72 @@ mod tests {
     fn decodes_unsigned_32_bit_pixels() {
         let frame = [0x78, 0x56, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF];
 
-        assert_eq!(stored_pixel_value(&frame, 0, 32, false), 0x1234_5678 as f64);
-        assert_eq!(stored_pixel_value(&frame, 1, 32, false), u32::MAX as f64);
+        let layout = PixelLayout::new(32, None, None, false);
+        assert_eq!(stored_pixel_value(&frame, 0, layout), 0x1234_5678 as f64);
+        assert_eq!(stored_pixel_value(&frame, 1, layout), u32::MAX as f64);
     }
 
     #[test]
     fn decodes_signed_32_bit_pixels() {
         let frame = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x80];
 
-        assert_eq!(stored_pixel_value(&frame, 0, 32, true), -1.0);
-        assert_eq!(stored_pixel_value(&frame, 1, 32, true), i32::MIN as f64);
+        let layout = PixelLayout::new(32, Some(32), Some(31), true);
+        assert_eq!(stored_pixel_value(&frame, 0, layout), -1.0);
+        assert_eq!(stored_pixel_value(&frame, 1, layout), i32::MIN as f64);
+    }
+
+    #[test]
+    fn masks_bits_above_bits_stored() {
+        // 12-bit unsigned in 16-bit samples with garbage (e.g. overlay) in the upper nibble.
+        let frame = [0xFF, 0xFF, 0x34, 0xA2];
+        let layout = PixelLayout::new(16, Some(12), Some(11), false);
+        assert_eq!(stored_pixel_value(&frame, 0, layout), 0x0FFF as f64);
+        assert_eq!(stored_pixel_value(&frame, 1, layout), 0x0234 as f64);
+        assert_eq!(
+            frame_min_max(&frame, layout, 1.0, 0.0, 2),
+            (0x234 as f64, 0xFFF as f64)
+        );
+    }
+
+    #[test]
+    fn sign_extends_from_bits_stored() {
+        // 12-bit signed: 0x0FFF is -1 and 0x0800 is -2048 regardless of the upper nibble.
+        let frame = [0xFF, 0xFF, 0x00, 0x58, 0xFF, 0x07];
+        let layout = PixelLayout::new(16, Some(12), Some(11), true);
+        assert_eq!(stored_pixel_value(&frame, 0, layout), -1.0);
+        assert_eq!(stored_pixel_value(&frame, 1, layout), -2048.0);
+        assert_eq!(stored_pixel_value(&frame, 2, layout), 2047.0);
+    }
+
+    #[test]
+    fn honors_high_bit_offset() {
+        // 12 bits stored at bits 15..=4 (High Bit 15).
+        let frame = 0xABC0u16.to_le_bytes();
+        let layout = PixelLayout::new(16, Some(12), Some(15), false);
+        assert_eq!(stored_pixel_value(&frame, 0, layout), 0xABC as f64);
+    }
+
+    #[test]
+    fn invalid_bits_stored_or_high_bit_fall_back_to_full_sample() {
+        assert_eq!(PixelLayout::new(16, Some(0), None, false).bits_stored, 16);
+        assert_eq!(PixelLayout::new(16, Some(20), None, false).bits_stored, 16);
+        let layout = PixelLayout::new(16, Some(12), Some(16), false);
+        assert_eq!((layout.bits_stored, layout.high_bit), (12, 11));
+        let layout = PixelLayout::new(16, Some(12), Some(5), false);
+        assert_eq!((layout.bits_stored, layout.high_bit), (12, 11));
     }
 
     #[test]
     fn applies_dose_grid_scaling_to_min_max() {
         let frame = [0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00];
 
-        let (min, max) = frame_min_max(&frame, 32, false, 0.001, 0.0, 2);
+        let (min, max) = frame_min_max(
+            &frame,
+            PixelLayout::new(32, None, None, false),
+            0.001,
+            0.0,
+            2,
+        );
 
         assert_eq!(min, 0.0);
         assert_eq!(max, 10.0);
