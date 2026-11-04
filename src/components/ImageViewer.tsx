@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomFramePixels, DicomImageInfo } from '../types/dicom'
-import { autoWindow, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
+import { extractStoredValue, pixelLayout } from '../data/pixelLayout'
+import { autoWindow, dragStartBounds, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
 
 type Props = {
   onClose: () => void
@@ -26,24 +27,16 @@ function decodeFrameValues(frame: DicomFramePixels) {
   const pixelBytes = base64ToBytes(frame.pixel_base64)
   const sampleCount = frame.width * frame.height
   const values = new Float64Array(sampleCount)
-  const signed = frame.pixel_representation === 1
+  const layout = pixelLayout(frame.bits_allocated, frame.bits_stored, frame.high_bit, frame.pixel_representation === 1)
   const view = new DataView(pixelBytes.buffer, pixelBytes.byteOffset, pixelBytes.byteLength)
 
   for (let index = 0; index < sampleCount; index += 1) {
-    let stored = 0
-    if (frame.bits_allocated === 8) {
-      stored = signed ? view.getInt8(index) : view.getUint8(index)
-    } else {
-      const bytesPerSample = frame.bits_allocated / 8
-      const offset = index * bytesPerSample
-      if (frame.bits_allocated === 16) {
-        stored = signed ? view.getInt16(offset, true) : view.getUint16(offset, true)
-      } else {
-        stored = signed ? view.getInt32(offset, true) : view.getUint32(offset, true)
-      }
-    }
-
-    values[index] = stored * frame.rescale_slope + frame.rescale_intercept
+    const raw = frame.bits_allocated === 8
+      ? view.getUint8(index)
+      : frame.bits_allocated === 16
+        ? view.getUint16(index * 2, true)
+        : view.getUint32(index * 4, true)
+    values[index] = extractStoredValue(raw, layout) * frame.rescale_slope + frame.rescale_intercept
   }
 
   return values
@@ -315,7 +308,7 @@ export default function ImageViewer({ onClose }: Props) {
     histogramDragRef.current = {
       kind, pointerId: event.pointerId, startY: event.clientY,
       unitsPerPixel: histogramRange / rect.height, minWidth: minWindowWidth,
-      low: windowLow, high: windowHigh,
+      ...dragStartBounds(kind, { low: windowLow, high: windowHigh }, histogramMin, histogramMax, minWindowWidth),
     }
     track.setPointerCapture(event.pointerId)
   }
@@ -323,6 +316,8 @@ export default function ImageViewer({ onClose }: Props) {
   function updateHistogramWindow(event: PointerEvent<HTMLElement>) {
     const drag = histogramDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
+    if (event.clientY === drag.startY && !drag.moved) return
+    drag.moved = true
     const bounds = dragWindowBounds(drag, event.clientY)
     scheduleWindowBounds(bounds.low, bounds.high)
   }
@@ -331,7 +326,9 @@ export default function ImageViewer({ onClose }: Props) {
     const drag = histogramDragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
     histogramDragRef.current = undefined
-    const bounds = commit ? dragWindowBounds(drag, event.clientY) : pendingWindowBoundsRef.current
+    // A click without movement must not replace an out-of-range window with its clamped start.
+    const moved = drag.moved || event.clientY !== drag.startY
+    const bounds = !moved ? undefined : commit ? dragWindowBounds(drag, event.clientY) : pendingWindowBoundsRef.current
     if (bounds) setWindowBounds(bounds.low, bounds.high)
     else cancelWindowUpdate()
     const track = histogramTrackRef.current

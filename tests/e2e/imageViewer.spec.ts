@@ -83,6 +83,67 @@ test('RTDOSE: Auto follows frame changes and disabling it freezes the displayed 
   await expect.poll(() => grays(page)).toEqual([0, 128, 255])
 })
 
+test('RTIMAGE: DICOM window beyond the pixel range drags from the drawn handle without a dead zone', async ({ page }) => {
+  // Fractional rescale: stored integers map to non-integer values (-3.5 .. 21.18).
+  const pixels = frame([0, 10000, 20000], 16, false, 0.001234, -3.5)
+  const range = pixels.max_value - pixels.min_value
+  await openViewer(page, 'RTIMAGE', [pixels], [50, 200])
+  const handle = page.getByTitle('Window upper bound')
+  const track = (await handle.locator('..').boundingBox())!
+  const box = (await handle.boundingBox())!
+  expect(Math.abs(box.y + box.height / 2 - track.y)).toBeLessThan(2)
+  const x = box.x + box.width / 2, y = box.y + box.height / 2
+
+  // A click without movement keeps the DICOM window.
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.up()
+  await expect(page.getByLabel('WL', { exact: true })).toHaveValue('50')
+  await expect(page.getByLabel('WW', { exact: true })).toHaveValue('200')
+
+  // Dragging a quarter of the track moves High by a quarter of the range from the visible top edge.
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.move(x, y + track.height / 4, { steps: 5 })
+  await expect.poll(async () => (await handle.boundingBox())!.y + box.height / 2).toBeCloseTo(y + track.height / 4, -1)
+  await page.mouse.up()
+  const high = pixels.max_value - range / 4
+  await expect.poll(async () => Number(await page.getByLabel('High', { exact: true }).inputValue())).toBeCloseTo(high, 4)
+  // The untouched lower bound keeps the DICOM value.
+  await expect(page.getByLabel('Low', { exact: true })).toHaveValue('-50')
+  const values = [0, 10000, 20000].map((stored) => stored * 0.001234 - 3.5)
+  await expect.poll(() => grays(page)).toEqual(values.map((value) => Math.round(Math.min(1, Math.max(0, (value + 50) / (high + 50))) * 255)))
+})
+
+test('moving the whole window keeps WW across separate drags beyond the pixel range', async ({ page }) => {
+  await openViewer(page, 'RTIMAGE', [frame([0, 128, 256], 16, false, 1)], [128, 128])
+  const track = (await page.getByTitle('Window upper bound').locator('..').boundingBox())!
+  const x = track.x + track.width / 2
+  // Background between the handles (Low=64 at 75%, High=192 at 25%): move up by half the track.
+  await page.mouse.move(x, track.y + track.height * 0.5)
+  await page.mouse.down()
+  await page.mouse.move(x, track.y, { steps: 5 })
+  await page.mouse.up()
+  await expect(page.getByLabel('Low', { exact: true })).toHaveValue('192')
+  await expect(page.getByLabel('High', { exact: true })).toHaveValue('320')
+  // Then down by a quarter, starting below the Low handle (now at 25%).
+  await page.mouse.move(x, track.y + track.height * 0.6)
+  await page.mouse.down()
+  await page.mouse.move(x, track.y + track.height * 0.85, { steps: 5 })
+  await page.mouse.up()
+  await expect(page.getByLabel('Low', { exact: true })).toHaveValue('128')
+  await expect(page.getByLabel('High', { exact: true })).toHaveValue('256')
+  await expect(page.getByLabel('WW', { exact: true })).toHaveValue('128')
+})
+
+test('RTIMAGE: bits above Bits Stored are ignored when rendering', async ({ page }) => {
+  // 12-bit samples in 16-bit words with garbage (e.g. overlay bits) in the upper nibble.
+  const pixels = { ...frame([0xF000, 0xF800, 0xFFFF], 16, false, 1), bits_stored: 12, high_bit: 11, min_value: 0, max_value: 4095 }
+  await openViewer(page, 'RTIMAGE', [pixels])
+  await expect.poll(() => grays(page)).toEqual([0, 128, 255])
+  await expect(page.getByLabel('WW', { exact: true })).toHaveValue('4095')
+})
+
 test('crossing bounds and reversing preserves the opposite bound', async ({ page }) => {
   await openViewer(page, 'RTIMAGE', [frame([0, 128, 256], 16, false, 1)], [128, 128])
   const handle = page.getByTitle('Window upper bound')

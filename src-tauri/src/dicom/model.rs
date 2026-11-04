@@ -83,6 +83,8 @@ pub struct DicomFramePixels {
     pub height: u32,
     pub frame_index: u32,
     pub bits_allocated: u32,
+    pub bits_stored: u32,
+    pub high_bit: u32,
     pub pixel_representation: u32,
     pub photometric_interpretation: Option<String>,
     pub rescale_intercept: f64,
