@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomFramePixels, DicomImageInfo } from '../types/dicom'
 import { extractStoredValue, pixelLayout } from '../data/pixelLayout'
-import { autoWindow, clampWindowToRange, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
+import { autoWindow, dragStartBounds, dragWindowBounds, formatWindowNumber, windowLimits, type ImageWindow, type WindowDrag } from '../data/imageWindow'
 
 type Props = {
   onClose: () => void
@@ -308,8 +308,7 @@ export default function ImageViewer({ onClose }: Props) {
     histogramDragRef.current = {
       kind, pointerId: event.pointerId, startY: event.clientY,
       unitsPerPixel: histogramRange / rect.height, minWidth: minWindowWidth,
-      // A DICOM window may extend beyond the frame's pixel range (common for RTIMAGE); start from the drawn handles.
-      ...clampWindowToRange({ low: windowLow, high: windowHigh }, histogramMin, histogramMax, minWindowWidth),
+      ...dragStartBounds(kind, { low: windowLow, high: windowHigh }, histogramMin, histogramMax, minWindowWidth),
     }
     track.setPointerCapture(event.pointerId)
   }
