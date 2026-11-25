@@ -161,6 +161,12 @@ pub struct Iso2022Charset {
     /// such as "ISO_IR 13" (PS3.3 C.12.1.1.2); a lone "ISO 2022 IR 87", seen in the
     /// field, still uses them as there is no other way to write kanji.
     code_extensions: bool,
+    /// Whether JIS X 0201 (ISO 2022 IR 13), JIS X 0212 (ISO 2022 IR 159) and ISO 8859-1
+    /// (ISO 2022 IR 100) are declared, so that strict decoding can reject values that
+    /// switch to character sets the declaration does not include.
+    has_jis0201: bool,
+    has_jis0212: bool,
+    has_latin1: bool,
 }
 
 impl Iso2022Charset {
@@ -173,11 +179,19 @@ impl Iso2022Charset {
         let has_jis0208 = terms
             .iter()
             .any(|term| normalize_term(term) == "ISO 2022 IR 87");
+        let declares = |wanted: &[&str]| {
+            terms
+                .iter()
+                .any(|term| wanted.contains(&normalize_term(term).as_str()))
+        };
         Self {
             initial_g0,
             initial_g1,
             has_jis0208,
             code_extensions: terms.len() > 1 || has_jis0208,
+            has_jis0201: declares(&["ISO_IR 13", "ISO 2022 IR 13"]),
+            has_jis0212: declares(&["ISO 2022 IR 159"]),
+            has_latin1: declares(&["ISO_IR 100", "ISO 2022 IR 100"]),
         }
     }
 
@@ -272,6 +286,18 @@ impl Iso2022Charset {
     }
 
     /// Returns `None` for escape sequences this decoder does not know.
+    /// Whether the declaration includes the character set an escape sequence designates.
+    fn declares(&self, designation: Designation) -> bool {
+        match designation {
+            Designation::G0(G0::Ascii) => true,
+            Designation::G0(G0::JisRoman) | Designation::G1(G1::Katakana) => self.has_jis0201,
+            Designation::G0(G0::Jis0208) => self.has_jis0208,
+            Designation::G0(G0::Jis0212) => self.has_jis0212,
+            Designation::G1(G1::Latin1) => self.has_latin1,
+            Designation::G1(G1::None) => false,
+        }
+    }
+
     /// Decode one value. Bytes the declared character sets do not cover decode as
     /// U+FFFD, or, for high bytes with no G1 set designated, as ISO 8859-1, unless
     /// `strict`, which fails on those.
@@ -288,6 +314,9 @@ impl Iso2022Charset {
 
             if byte == ESC {
                 let (consumed, designation) = parse_escape(&bytes[index + 1..])?;
+                if strict && !self.declares(designation) {
+                    return None;
+                }
                 match designation {
                     Designation::G0(set) => g0 = set,
                     Designation::G1(set) => g1 = set,
@@ -358,6 +387,7 @@ impl Iso2022Charset {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Designation {
     G0(G0),
     G1(G1),
@@ -560,6 +590,9 @@ mod tests {
         );
         // Half-width katakana bytes without ISO 2022 IR 13 declared, or designated.
         assert!(jis.decode_strict(VR::LO, b"\xca\xdd").is_none());
+        // Designating a character set the declaration does not include.
+        assert!(jis.decode_strict(VR::LO, b"\x1b)I\xca\xdd").is_none());
+        assert_eq!(jis.decode(VR::LO, b"\x1b)I\xca\xdd"), "ﾊﾝ");
         assert_eq!(
             charset("\\ISO 2022 IR 13")
                 .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
