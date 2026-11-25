@@ -13,8 +13,16 @@ on:
 permissions:
   contents: read
 
+# A newer build for the same pull request or branch replaces a running one. Events
+# that do not build (e.g. another label added) get a group of their own, so that
+# they never cancel a running build.
 concurrency:
-  group: test-build-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    test-build-${{ github.event.pull_request.number || github.ref }}-${{
+    (github.event_name == 'workflow_dispatch' ||
+    (github.event.action == 'labeled' && github.event.label.name == 'build:windows') ||
+    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:windows')))
+    && 'build' || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -25,7 +33,11 @@ jobs:
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:windows'))
     runs-on: windows-latest
     steps:
+      # The pull request's own head commit, not the merge with the base branch, so
+      # that the build matches the commit it is named after.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,7 +58,11 @@ jobs:
       (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:windows'))
     runs-on: windows-latest
     steps:
+      # The pull request's own head commit, not the merge with the base branch, so
+      # that the build matches the commit it is named after.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
