@@ -30,6 +30,8 @@ const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 
 #[derive(Debug, Clone)]
 pub struct TextValue {
+    /// The character set in effect for the value's dataset or item.
+    pub charset: TextCharset,
     pub vr: VR,
     /// The original bytes of the value.
     pub bytes: Vec<u8>,
@@ -204,6 +206,7 @@ where
                     values.insert(
                         element_path,
                         TextValue {
+                            charset: charset.clone(),
                             vr,
                             decoded: charset.decode(vr, &bytes),
                             round_trips: dicom_rs_round_trips(&dicom_rs_codec, vr, &bytes),
