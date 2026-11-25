@@ -828,12 +828,14 @@ fn ensure_vrs_match_dictionary_in(
                         *signed_pixel_data = Some(first != 0);
                     }
                 }
-                if unchanged_vr {
-                    continue;
-                }
                 let Some(entry) = StandardDataDictionary.by_tag(parsed) else {
                     continue;
                 };
+                // US or SS elements are checked even when unchanged: a changed Pixel
+                // Representation changes how they read back.
+                if unchanged_vr && !matches!(entry.vr(), VirtualVr::Xs) {
+                    continue;
+                }
                 let signed = [VR::SS];
                 let unsigned = [VR::US];
                 let (allowed, reason): (&[VR], &str) = match entry.vr() {
@@ -858,7 +860,22 @@ fn ensure_vrs_match_dictionary_in(
                     ));
                 }
             }
-            DicomNode::Sequence { items, .. } => {
+            DicomNode::Sequence { items, path, .. } => {
+                let existing = obj
+                    .get(parsed)
+                    .is_some_and(|element| matches!(element.value(), Value::Sequence(_)));
+                let dictionary_vr = StandardDataDictionary
+                    .by_tag(parsed)
+                    .map(|entry| entry.vr());
+                if let Some(dictionary_vr) =
+                    dictionary_vr.filter(|vr| !existing && *vr != VirtualVr::Exact(VR::SQ))
+                {
+                    return Err(format!(
+                        "Cannot save: {} is a sequence, but Implicit VR files do not store VRs and readers take it as {}.",
+                        path.join(" / "),
+                        dictionary_vr.relaxed()
+                    ));
+                }
                 let empty = InMemDicomObject::new_empty();
                 let obj_items = sequence_items(obj, parsed).unwrap_or_default();
                 for (index, item_nodes) in items.iter().enumerate() {
@@ -4636,6 +4653,58 @@ mod tests {
         assert!(check(Some("0"), "US").is_ok());
         assert!(check(Some("1"), "SS").is_ok());
         assert!(signed_after_item.is_ok());
+    }
+
+    /// An unchanged US or SS element no longer matches after Pixel Representation
+    /// changes, and a sequence at a tag the dictionary does not define as SQ would be
+    /// read as another VR.
+    #[test]
+    fn implicit_vr_check_covers_unchanged_us_or_ss_elements_and_sequences() {
+        let mut obj = InMemDicomObject::new_empty();
+        obj.put(DataElement::new(
+            tags::PIXEL_REPRESENTATION,
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+        obj.put(DataElement::new(
+            Tag(0x0028, 0x0106),
+            VR::SS,
+            PrimitiveValue::from(-1_i16),
+        ));
+        obj.put(DataElement::new(
+            Tag(0x0008, 0x1030),
+            VR::SQ,
+            Value::from(dicom_core::value::DataSetSequence::from(Vec::<
+                InMemDicomObject,
+            >::new(
+            ))),
+        ));
+        let nodes_with = |representation: &str, sequence_tag: &str| {
+            vec![
+                element_node("(0028,0103)", "US", representation, &[]),
+                element_node("(0028,0106)", "SS", "-1", &[]),
+                DicomNode::Sequence {
+                    tag: sequence_tag.to_string(),
+                    description: String::new(),
+                    length: 0,
+                    items: vec![vec![]],
+                    path: vec![sequence_tag.to_string()],
+                },
+            ]
+        };
+
+        // As read: the sequence already in the file is left alone.
+        assert!(ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0008,1030)")).is_ok());
+        let changed = ensure_vrs_match_dictionary(&obj, &nodes_with("0", "(0008,1030)"));
+        assert!(changed.unwrap_err().contains("(0028,0106) has VR SS"));
+        let added = ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0008,103E)")).unwrap_err();
+        assert!(
+            added.contains("(0008,103E) is a sequence") && added.contains("as LO"),
+            "{added}"
+        );
+        // Sequences at SQ tags and private tags can be added.
+        assert!(ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0008,1115)")).is_ok());
+        assert!(ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0009,1001)")).is_ok());
     }
 
     /// Files that dicom-rs writes as Implicit VR, with private elements and nested
