@@ -67,6 +67,25 @@ impl TextCharset {
         Ok(encoded.join(&b'\\'))
     }
 
+    /// Decode a value's bytes, without trailing padding, or `None` when they are not
+    /// valid in this character set: where `decode` falls back to ISO 8859-1, or dicom-rs
+    /// writes invalid bytes as octal escapes such as "\\377".
+    pub fn decode_strict(&self, vr: VR, bytes: &[u8]) -> Option<String> {
+        let decoded = match self {
+            // Bytes the declared character sets do not cover decode as U+FFFD, or (high
+            // bytes without a G1 set) as ISO 8859-1.
+            TextCharset::Iso2022(charset) => charset.decode(vr, bytes).filter(|decoded| {
+                !decoded.contains(char::REPLACEMENT_CHARACTER)
+                    && (charset.initial_g1 != G1::None || bytes.is_ascii())
+            }),
+            TextCharset::Codec(codec) => codec
+                .decode(bytes)
+                .ok()
+                .filter(|decoded| codec.encode(decoded).is_ok_and(|encoded| encoded == bytes)),
+        }?;
+        Some(trim_padding(&decoded).to_string())
+    }
+
     /// Decode a value's bytes, without trailing padding.
     pub fn decode(&self, vr: VR, bytes: &[u8]) -> String {
         let decoded = match self {
@@ -368,6 +387,38 @@ fn is_jis0208_row(row: u8) -> bool {
     (0x21..=0x28).contains(&row) || (0x30..=0x74).contains(&row)
 }
 
+/// The terms of a Specific Character Set value in a form that compares equal for the
+/// same declaration, e.g. "ISO_IR 192" and "ISO_IR 192 ".
+pub fn declaration_terms(value: &str) -> Vec<String> {
+    let terms = value
+        .split('\\')
+        .map(|term| normalize_term(term.trim_matches(|c: char| c == ' ' || c == '\0')))
+        .collect::<Vec<_>>();
+    if terms.iter().all(String::is_empty) {
+        Vec::new()
+    } else {
+        terms
+    }
+}
+
+/// Whether Taglet can write text under this Specific Character Set value: the default
+/// repertoire, one single-byte or Unicode character set that dicom-rs encodes, or the
+/// Japanese character sets (with ISO 2022 code extensions).
+pub fn is_writable_declaration(value: &str) -> bool {
+    let terms = declaration_terms(value);
+    if terms.is_empty() {
+        return true;
+    }
+    if terms.iter().any(|term| is_japanese_term(term)) {
+        return terms.iter().all(|term| {
+            term.is_empty()
+                || is_japanese_term(term)
+                || matches!(term.as_str(), "ISO_IR 6" | "ISO 2022 IR 6")
+        });
+    }
+    terms.len() == 1 && SpecificCharacterSet::from_code(&terms[0]).is_some()
+}
+
 fn normalize_term(term: &str) -> String {
     term.replace('_', " ")
         .replace("ISO IR", "ISO_IR")
@@ -486,6 +537,58 @@ mod tests {
         for value in ["", "ISO_IR 100", "ISO_IR 192", "ISO 2022 IR 6", "GB18030"] {
             assert!(matches!(charset(value), TextCharset::Codec(_)), "{value:?}");
         }
+    }
+
+    #[test]
+    fn strict_decoding_rejects_invalid_bytes() {
+        let utf8 = charset("ISO_IR 192");
+        assert_eq!(
+            utf8.decode_strict(VR::LO, "山田 ".as_bytes()).unwrap(),
+            "山田"
+        );
+        assert!(utf8.decode_strict(VR::LO, b"ID\xff\xfe").is_none());
+        let jis = charset("\\ISO 2022 IR 87");
+        assert_eq!(
+            jis.decode_strict(VR::LO, b"\x1b$BA0N)A#\x1b(B").unwrap(),
+            "前立腺"
+        );
+        // Half-width katakana bytes without ISO 2022 IR 13 declared.
+        assert!(jis.decode_strict(VR::LO, b"\xca\xdd").is_none());
+        assert_eq!(
+            charset("ISO_IR 13")
+                .decode_strict(VR::LO, b"\xca\xdd")
+                .unwrap(),
+            "ﾊﾝ"
+        );
+    }
+
+    #[test]
+    fn writable_declarations() {
+        for value in [
+            "",
+            "ISO_IR 192",
+            "ISO_IR 100 ",
+            "GB18030",
+            "\\ISO 2022 IR 87",
+            "ISO 2022 IR 13\\ISO 2022 IR 87",
+            "ISO_IR 13",
+            "ISO 2022 IR 6\\ISO 2022 IR 87\\ISO 2022 IR 159",
+        ] {
+            assert!(is_writable_declaration(value), "{value}");
+        }
+        for value in [
+            "\\ISO 2022 IR 149",
+            "ISO_IR 100\\ISO 2022 IR 87",
+            "ISO_IR 192\\ISO_IR 100",
+            "UTF-8",
+        ] {
+            assert!(!is_writable_declaration(value), "{value}");
+        }
+        assert_eq!(
+            declaration_terms("ISO_IR 192 "),
+            declaration_terms("ISO_IR 192")
+        );
+        assert!(declaration_terms(" ").is_empty());
     }
 
     #[test]
