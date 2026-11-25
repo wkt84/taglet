@@ -789,7 +789,9 @@ fn plan_splice(
     if collect_edited_paths(object, nodes, text, &mut edited).is_err() {
         return Ok(None);
     }
-    if (!edited.is_empty() || !diff.removed.is_empty()) && has_group_length(index.nodes()) {
+    // Group lengths would have to be recomputed for any change.
+    let changes_anything = !edited.is_empty() || !diff.added.is_empty() || !diff.removed.is_empty();
+    if changes_anything && has_group_length(index.nodes()) {
         return Ok(None);
     }
     // Changing or removing a declaration changes how other text reads; changing the SOP
@@ -4858,5 +4860,25 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(index.unwrap_err().contains("out of order or repeated"));
+    }
+
+    /// Review on #12: adding an element to a file with group lengths goes through the
+    /// full writer, so the group lengths are not left stale.
+    #[test]
+    fn adding_elements_to_files_with_group_lengths_is_not_spliced() {
+        let path = temp_path("group-length-add.dcm");
+        let dataset = [
+            explicit_element(0x0008, 0x0000, b"UL", &[0, 0, 0, 0]),
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes.push(element_node("(0008,1030)", "LO", "HEAD", &[]));
+        let planned = plan_for(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!planned);
     }
 }
