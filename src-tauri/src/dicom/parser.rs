@@ -69,6 +69,8 @@ const TEXT_READ_ONLY_WARNING: &str =
     "Some text is in a character set that cannot be written back in its place (e.g. set only inside a sequence item). It is shown read-only.";
 const TEXT_SAVE_BLOCKED_WARNING: &str =
     "Some text in this file cannot be written back without changing its bytes, so saving is disabled for this file.";
+const TEXT_ADD_BLOCKED_WARNING: &str =
+    "Some text in this file cannot be written back by the full writer, and the file's tags are not in order, so saving fails if elements are added. Values can still be edited and elements removed.";
 const RAW_DATASET_START_GROUPS: &[u16] = &[
     0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x3006, 0x300A, 0x300C,
 ];
@@ -78,7 +80,8 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
     let text = TextValues::read(path);
     // Files that can be saved by splicing can have any decoded value edited, since
     // splicing writes the encoded bytes itself (#8).
-    let spliceable = can_splice(path, &content);
+    let splice_index = can_splice(path, &content);
+    let spliceable = splice_index.is_some();
     let mut read_only = false;
     for nodes in [&mut content.file_meta, &mut content.nodes] {
         read_only |= apply_text_values(nodes, &text, spliceable);
@@ -86,8 +89,14 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
     if read_only {
         content.warnings.push(TEXT_READ_ONLY_WARNING.to_string());
     }
-    if !spliceable && !text.paths_not_round_tripping().is_empty() {
+    let blocked = !text.paths_not_round_tripping().is_empty();
+    if blocked && !spliceable {
         content.warnings.push(TEXT_SAVE_BLOCKED_WARNING.to_string());
+    }
+    // Elements are only inserted by splicing into files with tags in order; adding
+    // one to this file goes through the full writer, which cannot write this text.
+    if blocked && splice_index.is_some_and(|ordered| !ordered) {
+        content.warnings.push(TEXT_ADD_BLOCKED_WARNING.to_string());
     }
     Ok(content)
 }
@@ -95,7 +104,8 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
 /// Whether value edits to this file can be saved by splicing: a Part 10 file whose
 /// data set is Explicit VR Little Endian, that can be indexed, has no group length
 /// elements, and whose file meta SOP UIDs match the data set's (see `plan_splice`).
-fn can_splice(path: &str, content: &DicomFileContent) -> bool {
+/// `Some` with whether its tags are in order (needed to add elements), or `None`.
+fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
     let value_of = |nodes: &[DicomNode], wanted: &str| {
         nodes.iter().find_map(|node| match node {
             DicomNode::Element { tag, value, .. } if tag == wanted => {
@@ -108,11 +118,17 @@ fn can_splice(path: &str, content: &DicomFileContent) -> bool {
         let dataset = value_of(&content.nodes, dataset_tag);
         dataset.is_none() || dataset == value_of(&content.file_meta, meta_tag)
     };
-    value_of(&content.file_meta, "(0002,0010)")
+    let supported = value_of(&content.file_meta, "(0002,0010)")
         .is_some_and(|uid| splice::supports_transfer_syntax(&uid))
         && meta_matches("(0002,0002)", "(0008,0016)")
-        && meta_matches("(0002,0003)", "(0008,0018)")
-        && splice::FileIndex::read(path).is_ok_and(|index| !has_group_length(index.nodes()))
+        && meta_matches("(0002,0003)", "(0008,0018)");
+    if !supported {
+        return None;
+    }
+    splice::FileIndex::read(path)
+        .ok()
+        .filter(|index| !has_group_length(index.nodes()))
+        .map(|index| index.is_ordered())
 }
 
 fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
@@ -900,14 +916,24 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
     struct Shape {
         elements: HashSet<Vec<String>>,
         sequences: HashMap<Vec<String>, usize>,
+        /// Set when a node's path does not match where it is, e.g. an item moved to
+        /// another position. Paths address the file's elements, so splicing could
+        /// then copy values from the wrong item.
+        inconsistent: bool,
     }
 
-    fn node_shape(nodes: &[DicomNode], root: bool, shape: &mut Shape) {
+    fn node_shape(nodes: &[DicomNode], parent: &[String], shape: &mut Shape) {
         for node in nodes {
             let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
                 node;
-            if root && parse_tag(tag).is_ok_and(|tag| tag == PIXEL_DATA) {
+            if parent.is_empty() && parse_tag(tag).is_ok_and(|tag| tag == PIXEL_DATA) {
                 continue;
+            }
+            if path.len() != parent.len() + 1
+                || path[..parent.len()] != *parent
+                || path[parent.len()] != *tag
+            {
+                shape.inconsistent = true;
             }
             match node {
                 DicomNode::Element { .. } => {
@@ -915,8 +941,10 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
                 }
                 DicomNode::Sequence { items, .. } => {
                     shape.sequences.insert(path.clone(), items.len());
-                    for item in items {
-                        node_shape(item, false, shape);
+                    for (index, item) in items.iter().enumerate() {
+                        let mut item_path = path.clone();
+                        item_path.push(format!("Item#{index}"));
+                        node_shape(item, &item_path, shape);
                     }
                 }
             }
@@ -953,7 +981,10 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
     }
 
     let mut from_nodes = Shape::default();
-    node_shape(nodes, true, &mut from_nodes);
+    node_shape(nodes, &[], &mut from_nodes);
+    if from_nodes.inconsistent {
+        return None;
+    }
     let mut from_index = Shape::default();
     index_shape(index, &[], &mut from_index);
     // Opaque values show up as plain element nodes.
@@ -4920,5 +4951,70 @@ mod tests {
         assert!(contains(&saved, b"ID002"));
         assert!(contains(&saved, HAN_IR13));
         assert!(!added_planned);
+    }
+
+    /// Review on #12: nodes whose paths do not match their positions (e.g. an item
+    /// moved) are not spliced, since paths address the file's elements.
+    #[test]
+    fn moved_items_are_not_spliced() {
+        let path = temp_path("moved-items.dcm");
+        let first = [
+            explicit_element(0x3006, 0x0022, b"IS", b"1"),
+            explicit_element(0x3006, 0x0026, b"LO", b"PTV"),
+        ]
+        .concat();
+        let second = [
+            explicit_element(0x3006, 0x0022, b"IS", b"2"),
+            explicit_element(0x3006, 0x0026, b"LO", b"CTV"),
+        ]
+        .concat();
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            defined_sequence(0x3006, 0x0020, &[first, second]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let unchanged = plan_for(&path, &nodes);
+        if let Some(DicomNode::Sequence { items, .. }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0020)"))
+        {
+            items.swap(0, 1);
+        }
+        let swapped = plan_for(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(unchanged);
+        assert!(!swapped);
+    }
+
+    /// Review on #12: a file with tags out of order and text the full writer cannot
+    /// write warns that adding elements fails.
+    #[test]
+    fn unordered_files_with_unwritable_text_warn_about_adding() {
+        let path = temp_path("unordered-warning.dcm");
+        let item = [
+            explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+            explicit_element(0x3006, 0x0026, b"LO", HAN_IR13),
+        ]
+        .concat();
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            explicit_element(0x0010, 0x0010, b"PN", b"Yamada^Taro"),
+            defined_sequence(0x3006, 0x0020, &[item]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(has_warning(&content, TEXT_ADD_BLOCKED_WARNING));
+        assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), true)
+        );
     }
 }
