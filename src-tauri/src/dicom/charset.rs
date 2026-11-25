@@ -402,17 +402,27 @@ pub fn is_writable_declaration(value: &str) -> bool {
         .split('\\')
         .map(|term| term.trim_matches(|c: char| c == ' ' || c == '\0'))
         .collect::<Vec<_>>();
-    if terms.iter().all(|term| term.is_empty()) {
-        return true;
+    match terms.as_slice() {
+        [""] => true,
+        // Single-valued: no code extensions (PS3.3 C.12.1.1.2).
+        ["ISO_IR 13"] => true,
+        [term] => !is_japanese_term(term) && SpecificCharacterSet::from_code(term).is_some(),
+        // Multi-valued: ISO 2022 terms only, the first one (or an empty first value)
+        // being the initial character set, and at least one Japanese multi-byte set.
+        [first, rest @ ..] => {
+            matches!(*first, "" | "ISO 2022 IR 6" | "ISO 2022 IR 13")
+                && rest.iter().all(|term| {
+                    matches!(
+                        *term,
+                        "ISO 2022 IR 13" | "ISO 2022 IR 87" | "ISO 2022 IR 159"
+                    )
+                })
+                && rest
+                    .iter()
+                    .any(|term| matches!(*term, "ISO 2022 IR 87" | "ISO 2022 IR 159"))
+        }
+        [] => true,
     }
-    if terms.iter().any(|term| is_japanese_term(term)) {
-        return terms.iter().all(|term| {
-            term.is_empty()
-                || is_japanese_term(term)
-                || matches!(normalize_term(term).as_str(), "ISO_IR 6" | "ISO 2022 IR 6")
-        });
-    }
-    terms.len() == 1 && SpecificCharacterSet::from_code(terms[0]).is_some()
 }
 
 fn normalize_term(term: &str) -> String {
@@ -581,6 +591,11 @@ mod tests {
         for value in [
             "\\ISO 2022 IR 149",
             "ISO_IR 100\\ISO 2022 IR 87",
+            // Single-valued terms in a multi-valued declaration, and the other way round.
+            "ISO_IR 13\\ISO 2022 IR 87",
+            "ISO_IR 6\\ISO 2022 IR 87",
+            "ISO 2022 IR 87",
+            "ISO 2022 IR 6\\ISO 2022 IR 13",
             "ISO_IR 192\\ISO_IR 100",
             "UTF-8",
         ] {
