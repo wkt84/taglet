@@ -3987,13 +3987,10 @@ mod tests {
     fn mismatched_file_meta_is_not_spliced() {
         let path = temp_path("splice-meta.dcm");
         let dataset = [
-            base_elements(b"ISO_IR 192").into_iter().collect::<Vec<_>>(),
+            base_elements(b"ISO_IR 192"),
             explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
         ]
-        .concat()
-        .windows(1)
-        .map(|byte| byte[0])
-        .collect::<Vec<_>>();
+        .concat();
         // The data set says 1.2.3.4; make the meta say something else.
         let meta = FileMetaTableBuilder::new()
             .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
