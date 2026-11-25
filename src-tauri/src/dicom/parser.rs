@@ -76,17 +76,29 @@ const RAW_DATASET_START_GROUPS: &[u16] = &[
 pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
     let mut content = open_nodes_without_text_values(path)?;
     let text = TextValues::read(path);
+    // Files that can be saved by splicing can have any decoded value edited, since
+    // splicing writes the encoded bytes itself (#8).
+    let spliceable = can_splice(&content.file_meta);
     let mut read_only = false;
     for nodes in [&mut content.file_meta, &mut content.nodes] {
-        read_only |= apply_text_values(nodes, &text);
+        read_only |= apply_text_values(nodes, &text, spliceable);
     }
     if read_only {
         content.warnings.push(TEXT_READ_ONLY_WARNING.to_string());
     }
-    if !text.paths_not_round_tripping().is_empty() {
+    if !spliceable && !text.paths_not_round_tripping().is_empty() {
         content.warnings.push(TEXT_SAVE_BLOCKED_WARNING.to_string());
     }
     Ok(content)
+}
+
+/// Whether a file with this file meta information can be saved by splicing: a Part 10
+/// file whose data set is Explicit VR Little Endian.
+fn can_splice(file_meta: &[DicomNode]) -> bool {
+    file_meta.iter().any(|node| {
+        matches!(node, DicomNode::Element { tag, value, .. }
+            if tag == "(0002,0010)" && splice::supports_transfer_syntax(value))
+    })
 }
 
 fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
@@ -1604,7 +1616,7 @@ fn display_value(value: &Value<InMemDicomObject>) -> String {
 /// Replace text values that dicom-rs decoded differently from the character set in
 /// effect for their dataset or item. Values that dicom-rs cannot write byte for byte
 /// become read-only. Returns whether any value became read-only.
-pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues) -> bool {
+pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues, spliceable: bool) -> bool {
     let mut replaced = false;
     for node in nodes {
         match node {
@@ -1618,14 +1630,15 @@ pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues) -> bool {
                     continue;
                 };
                 if trim_padding(value) != text_value.decoded {
+                    let writable = text_value.editable || spliceable;
                     *value = text_value.decoded.clone();
-                    *editable &= text_value.editable;
-                    replaced |= !text_value.editable;
+                    *editable &= writable;
+                    replaced |= !writable;
                 }
             }
             DicomNode::Sequence { items, .. } => {
                 for item in items {
-                    replaced |= apply_text_values(item, text);
+                    replaced |= apply_text_values(item, text, spliceable);
                 }
             }
         }
@@ -1930,7 +1943,7 @@ fn encode_edited_text(
         match dicom_rs_write(codec, stored) {
             Some(written) if charset.decode(vr, &written) == entered => Ok(None),
             _ => Err(
-                "it cannot be written in this file's character set at this position".to_string(),
+                "it can only be saved when the other changes in this save are value edits; save other changes (such as added or removed elements) separately".to_string(),
             ),
         }
     }
@@ -3101,16 +3114,17 @@ mod tests {
         let saved = save_unchanged(&path);
         std::fs::remove_file(&path).ok();
 
+        // Editable, as splicing can write it (#8); the full writer still refuses.
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0026)"),
-            ("ﾊﾝ".to_string(), false)
+            ("ﾊﾝ".to_string(), true)
         );
         assert_eq!(
             value_and_editable(&content.nodes, "(0010,0010)"),
             ("山田^太郎".to_string(), true)
         );
-        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
-        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+        assert!(!has_warning(&content, TEXT_READ_ONLY_WARNING));
+        assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
         let error = saved.unwrap_err();
         assert!(
             error.contains("(3006,0020) / Item#0 / (3006,0026)"),
@@ -3605,10 +3619,10 @@ mod tests {
         }
     }
 
-    /// Phase 2: text where dicom-rs does not write byte for byte stays read-only and
-    /// cannot be saved in a Japanese character set.
+    /// Text where dicom-rs does not write byte for byte cannot be saved by the full
+    /// writer in a Japanese character set; splicing saves it (#8).
     #[test]
-    fn japanese_edits_under_a_utf8_codec_block_saving() {
+    fn japanese_edits_under_a_utf8_codec_need_splicing() {
         let path = temp_path("phase2-utf8-parent.dcm");
         let rest = roi_sequence(Some(b"\\ISO 2022 IR 87"), PROSTATE_IR87);
         write_part10(&path, Some(b"ISO_IR 192"), &rest);
@@ -3627,13 +3641,15 @@ mod tests {
             *editable = true;
             *value = "膀胱".to_string();
         }
-        let saved = save_and_reopen(&path, &nodes);
+        let full = save_and_reopen(&path, &nodes);
+        let spliced = save_file(&path, &nodes);
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(shown, ("前立腺".to_string(), false));
-        assert!(saved
+        assert_eq!(shown, ("前立腺".to_string(), true));
+        assert!(full
             .unwrap_err()
             .contains("(3006,0020) / Item#0 / (3006,0026)"));
+        assert!(contains(&spliced.unwrap(), b"\x1b$Bg/fy\x1b(B"));
     }
 
     /// Review on #9: saving again right after a save works, also with kanji whose JIS
@@ -3946,7 +3962,7 @@ mod tests {
         );
         assert_eq!(
             value_and_editable(&reopened, "(3006,0026)"),
-            ("ﾊﾝ".to_string(), false)
+            ("ﾊﾝ".to_string(), true)
         );
     }
 
@@ -4513,5 +4529,60 @@ mod tests {
         second.unwrap();
         assert!(contains(&saved, b"VENDOR"));
         assert!(contains(&saved, &[0xFC, 0xFF, 0xFC, 0xFF]));
+    }
+
+    /// #8: values dicom-rs cannot write back are editable and saved by splicing, here
+    /// half-width katakana in an ISO_IR 13 item under a UTF-8 data set.
+    #[test]
+    fn splice_saves_edits_to_values_dicom_rs_cannot_write() {
+        let path = temp_path("splice-edit-read-only.dcm");
+        write_mixed_charset_file(&path);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"]).unwrap() =
+            "ｶﾝｿﾞｳ".to_string();
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        // JIS X 0201 katakana bytes, written as they are.
+        assert!(contains(&saved, b"\xb6\xdd\xbf\xde\xb3 "));
+        let reopened_path = temp_path("splice-edit-read-only-reopened.dcm");
+        std::fs::write(&reopened_path, &saved).unwrap();
+        let reopened = open_nodes(reopened_path.to_str().unwrap()).unwrap().nodes;
+        std::fs::remove_file(&reopened_path).ok();
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0026)"),
+            ("ｶﾝｿﾞｳ".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&reopened, "(0010,0010)"),
+            ("山田^太郎".to_string(), true)
+        );
+    }
+
+    /// Raw data sets without file meta information cannot be spliced, so values dicom-rs
+    /// cannot write back stay read-only there.
+    #[test]
+    fn values_dicom_rs_cannot_write_stay_read_only_without_splicing() {
+        let path = temp_path("raw-read-only.dcm");
+        let mut item = implicit_element(0x0008, 0x0005, b"ISO_IR 13");
+        item.extend(implicit_element(0x3006, 0x0026, HAN_IR13));
+        let dataset = [
+            implicit_element(0x0008, 0x0005, b"ISO_IR 192"),
+            implicit_element(0x0008, 0x0060, b"RTSTRUCT"),
+            sequence(0x3006, 0x0020, &[item], false),
+        ]
+        .concat();
+        std::fs::write(&path, dataset).unwrap();
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
     }
 }
