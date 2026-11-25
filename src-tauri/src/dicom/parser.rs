@@ -668,10 +668,6 @@ fn create_temporary_save_file(destination: &str) -> Result<(std::path::PathBuf, 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let destination = std::path::Path::new(destination);
-    let file_name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -685,7 +681,9 @@ fn create_temporary_save_file(destination: &str) -> Result<(std::path::PathBuf, 
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
-        let temporary = destination.with_file_name(format!(".{file_name}.{unique}.taglet-saving"));
+        // A short name independent of the destination's, so that long file names
+        // still fit the file system's limit.
+        let temporary = destination.with_file_name(format!(".taglet-{unique}.tmp"));
         match options.open(&temporary) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2681,7 +2679,8 @@ mod tests {
     /// Review P1 (4th round): saving over a file never leaves it truncated.
     #[test]
     fn failed_save_keeps_the_existing_destination_file() {
-        let path = temp_path("ir13-overwrite.dcm");
+        let dir = temp_test_dir("overwrite");
+        let path = dir.join("ir13-overwrite.dcm");
         let rest = explicit_element(0x0010, 0x0020, b"LO", b"ID001");
         write_part10(&path, Some(b"ISO_IR 13"), &rest);
         let path_text = path.to_str().unwrap();
@@ -2696,17 +2695,20 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         std::fs::remove_file(&path).ok();
-        assert!(no_temporary_files_left(&path));
+        assert!(dir_is_empty(&dir));
+        std::fs::remove_dir(&dir).ok();
     }
 
-    fn no_temporary_files_left(path: &std::path::Path) -> bool {
-        let prefix = format!(".{}.", path.file_name().unwrap().to_string_lossy());
-        std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .all(|entry| {
-                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-                !(name.starts_with(&prefix) && name.ends_with(".taglet-saving"))
-            })
+    /// A directory used by one test only, so that it can be checked for leftovers.
+    fn temp_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Whether `dir` is empty, i.e. no temporary file was left behind.
+    fn dir_is_empty(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir).unwrap().next().is_none()
     }
 
     /// Review P1 (5th round): errors from the final buffered write are not lost.
@@ -2738,7 +2740,8 @@ mod tests {
     #[test]
     fn saving_keeps_the_permissions_of_the_replaced_file() {
         use std::os::unix::fs::PermissionsExt;
-        let path = temp_path("permissions.dcm");
+        let dir = temp_test_dir("permissions");
+        let path = dir.join("permissions.dcm");
         write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let path_text = path.to_str().unwrap();
@@ -2750,7 +2753,28 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(mode, 0o600);
-        assert!(no_temporary_files_left(&path));
+        assert!(dir_is_empty(&dir));
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// Review P2 (6th round): files with names close to the 255-byte limit can be saved.
+    #[test]
+    fn saving_over_a_file_with_a_long_name() {
+        let dir = temp_test_dir("long-name");
+        let path = dir.join(format!("{}.dcm", "a".repeat(246)));
+        write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
+        let path_text = path.to_str().unwrap();
+        let nodes = open_nodes(path_text).unwrap().nodes;
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let saved = save_object_with_nodes(&mut obj, &nodes, &text, path_text);
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        saved.unwrap();
+        assert!(contains(&written, b"PTV"));
+        assert!(dir_is_empty(&dir));
+        std::fs::remove_dir(&dir).ok();
     }
 
     /// Review P2 (5th round): an unrelated file with a temporary-looking name is kept.
