@@ -102,7 +102,7 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
 }
 
 /// Whether value edits to this file can be saved by splicing: a Part 10 file whose
-/// data set is Explicit VR Little Endian, that can be indexed, has no group length
+/// data set is Explicit or Implicit VR Little Endian, that can be indexed, has no group length
 /// elements, and whose file meta SOP UIDs match the data set's (see `plan_splice`).
 /// `Some` with whether its tags are in order (needed to add elements), or `None`.
 fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
@@ -716,8 +716,8 @@ fn apply_validated_nodes_to_object(
 
 /// Save `nodes` from the file at `source` to `destination`.
 ///
-/// When the edits only replace values of existing elements in an Explicit VR Little
-/// Endian file, the original file is copied and only the edited values (and the lengths
+/// When the edits only replace values of existing elements in an Explicit or Implicit
+/// VR Little Endian file, the original file is copied and only the edited values (and the lengths
 /// that change with them) are rewritten, so every other byte is kept (#8). Otherwise
 /// the object is written through dicom-rs by `save_object_with_nodes`.
 ///
@@ -860,14 +860,16 @@ fn plan_splice(
                 return Ok(None);
             };
             match encode_spliced_value(vr, value, Some(&charset)) {
-                Ok(Some(bytes)) => match splice::encode_element(tag, vr, &bytes) {
-                    Ok(element) => edits
-                        .insertions
-                        .entry(parent.to_vec())
-                        .or_default()
-                        .push((tag, element)),
-                    Err(error) => failures.push(format!("{} ({error})", path.join(" / "))),
-                },
+                Ok(Some(bytes)) => {
+                    match splice::encode_element(tag, vr, &bytes, index.is_explicit()) {
+                        Ok(element) => edits
+                            .insertions
+                            .entry(parent.to_vec())
+                            .or_default()
+                            .push((tag, element)),
+                        Err(error) => failures.push(format!("{} ({error})", path.join(" / "))),
+                    }
+                }
                 Ok(None) => return Ok(None),
                 Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
             }
@@ -2086,7 +2088,7 @@ fn encode_edited_text(
         match dicom_rs_write(codec, stored) {
             Some(written) if charset.decode(vr, &written) == entered => Ok(None),
             _ => Err(
-                "it can only be written by editing the file in place, which needs an Explicit VR Little Endian file and a save that does not add or remove sequences or items or change the Specific Character Set or SOP UIDs".to_string(),
+                "it can only be written by editing the file in place, which needs an Explicit or Implicit VR Little Endian file and a save that does not add or remove sequences or items or change the Specific Character Set or SOP UIDs".to_string(),
             ),
         }
     }
@@ -4255,9 +4257,263 @@ mod tests {
         assert_eq!(after, original);
     }
 
+    // ---- Implicit VR Little Endian ----
+
+    fn implicit_defined_sequence(group: u16, element: u16, items: &[Vec<u8>]) -> Vec<u8> {
+        let mut content = Vec::new();
+        for item in items {
+            content.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            content.extend_from_slice(&(item.len() as u32).to_le_bytes());
+            content.extend_from_slice(item);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        out.extend(content);
+        out
+    }
+
+    fn implicit_uid(group: u16, element: u16, uid: &str) -> Vec<u8> {
+        let mut value = uid.as_bytes().to_vec();
+        if value.len() % 2 == 1 {
+            value.push(0);
+        }
+        implicit_element(group, element, &value)
+    }
+
+    /// The Implicit VR counterpart of `write_mixed_charset_file`: UTF-8 overall, with an
+    /// ISO_IR 13 item in a defined-length sequence, an undefined-length sequence and
+    /// native pixel data.
+    fn write_implicit_mixed_charset_file(path: &std::path::Path) -> Vec<u8> {
+        let item = [
+            implicit_element(0x0008, 0x0005, b"ISO_IR 13"),
+            implicit_element(0x3006, 0x0022, b"1"),
+            implicit_element(0x3006, 0x0026, HAN_IR13),
+        ]
+        .concat();
+        let dataset = [
+            implicit_element(0x0008, 0x0005, b"ISO_IR 192"),
+            implicit_uid(0x0008, 0x0016, RTSTRUCT_SOP_CLASS),
+            implicit_uid(0x0008, 0x0018, "1.2.3.4"),
+            implicit_element(0x0008, 0x0060, b"RTSTRUCT"),
+            implicit_element(0x0010, 0x0010, "山田^太郎".as_bytes()),
+            implicit_element(0x0010, 0x0020, b"ID001"),
+            implicit_defined_sequence(0x3006, 0x0020, &[item]),
+            sequence(
+                0x3006,
+                0x0039,
+                &[implicit_element(0x3006, 0x0084, b"1")],
+                false,
+            ),
+            implicit_element(0x7FE0, 0x0010, &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ]
+        .concat();
+        write_part10_with(path, uids::IMPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        std::fs::read(path).unwrap()
+    }
+
+    fn plans_splice(path: &std::path::Path, nodes: &[DicomNode]) -> bool {
+        let path_text = path.to_str().unwrap();
+        plan_splice(
+            path_text,
+            &open_full_object(path_text).unwrap(),
+            nodes,
+            &TextValues::try_read(path_text).unwrap(),
+            splice::file_stamp(path_text).unwrap(),
+        )
+        .unwrap()
+        .is_some()
+    }
+
+    fn reopen(name: &str, bytes: &[u8]) -> Vec<DicomNode> {
+        let path = temp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+        let nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        std::fs::remove_file(&path).ok();
+        nodes
+    }
+
+    #[test]
+    fn implicit_vr_splice_without_edits_keeps_the_file_byte_for_byte() {
+        let path = temp_path("implicit-identity.dcm");
+        let original = write_implicit_mixed_charset_file(&path);
+        let nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(saved.unwrap(), original);
+    }
+
+    #[test]
+    fn implicit_vr_edits_are_spliced() {
+        let path = temp_path("implicit-edit.dcm");
+        let original = write_implicit_mixed_charset_file(&path);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0010)"]).unwrap() = "鈴木^花子".to_string();
+
+        // The full writer refuses this file.
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let destination = temp_path("implicit-edit-full.dcm");
+        assert!(
+            save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap()).is_err()
+        );
+        assert!(plans_splice(&path, &nodes));
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let reopened = reopen("implicit-edit-reopened.dcm", &saved);
+        // Only the name and its 32-bit length field differ (both names are 13 bytes,
+        // padded to 14).
+        let name = "山田^太郎".as_bytes();
+        let name_start = original
+            .windows(name.len())
+            .position(|window| window == name)
+            .unwrap();
+        assert_eq!(&saved[..name_start], &original[..name_start]);
+        assert_eq!(&saved[name_start..name_start + 14], "鈴木^花子 ".as_bytes());
+        assert_eq!(&saved[name_start + 14..], &original[name_start + 14..]);
+        assert_eq!(
+            value_and_editable(&reopened, "(0010,0010)"),
+            ("鈴木^花子".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn implicit_vr_splice_updates_lengths_of_defined_length_items() {
+        let path = temp_path("implicit-defined.dcm");
+        write_implicit_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"]).unwrap() =
+            "ﾊﾝﾀﾞ PTV".to_string();
+        assert!(plans_splice(&path, &nodes));
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let reopened = reopen("implicit-defined-reopened.dcm", &saved.unwrap());
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0026)"),
+            ("ﾊﾝﾀﾞ PTV".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0084)"),
+            ("1".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn implicit_vr_elements_are_added_and_removed_by_splicing() {
+        let path = temp_path("implicit-add-remove.dcm");
+        write_implicit_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes
+            .retain(|node| !matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0020)"));
+        let position = nodes
+            .iter()
+            .position(|node| matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0010)"))
+            .unwrap();
+        nodes.insert(position, element_node("(0008,1030)", "LO", "頭部", &[]));
+        // Implicit VR has 32-bit lengths, so long values fit.
+        let long_name = "山".repeat(30_000);
+        *find_element_mut(&mut nodes, &["(0010,0010)"]).unwrap() = long_name.clone();
+        assert!(plans_splice(&path, &nodes));
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let mut added = vec![0x08, 0x00, 0x30, 0x10];
+        added.extend_from_slice(&6_u32.to_le_bytes());
+        added.extend_from_slice("頭部".as_bytes());
+        assert!(contains(&saved, &added));
+        assert!(!contains(&saved, b"ID001"));
+        let reopened = reopen("implicit-add-remove-reopened.dcm", &saved);
+        assert_eq!(
+            value_and_editable(&reopened, "(0008,1030)"),
+            ("頭部".to_string(), true)
+        );
+        assert_eq!(value_and_editable(&reopened, "(0010,0010)").0, long_name);
+        assert!(find_element(&reopened, "(0010,0020)").is_none());
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), true)
+        );
+    }
+
+    /// Files that dicom-rs writes as Implicit VR, with private elements and nested
+    /// sequences, are indexed the way dicom-rs reads them.
+    #[test]
+    fn implicit_vr_files_written_by_dicom_rs_are_spliced() {
+        let mut inner = InMemDicomObject::new_empty();
+        inner.put_str(Tag(0x3006, 0x0084), VR::IS, "1");
+        let mut item = InMemDicomObject::new_empty();
+        item.put_str(Tag(0x3006, 0x0022), VR::IS, "1");
+        item.put_str(Tag(0x3006, 0x0026), VR::LO, "PTV");
+        item.put(DataElement::new(
+            Tag(0x3006, 0x0039),
+            VR::SQ,
+            Value::from(dicom_core::value::DataSetSequence::from(vec![inner])),
+        ));
+        let mut obj = InMemDicomObject::new_empty();
+        obj.put_str(Tag(0x0008, 0x0005), VR::CS, "ISO_IR 192");
+        obj.put_str(Tag(0x0008, 0x0016), VR::UI, RTSTRUCT_SOP_CLASS);
+        obj.put_str(Tag(0x0008, 0x0018), VR::UI, "1.2.3.4");
+        obj.put_str(Tag(0x0009, 0x0010), VR::LO, "VENDOR");
+        obj.put_str(Tag(0x0009, 0x1001), VR::LO, "private");
+        obj.put_str(Tag(0x0010, 0x0010), VR::PN, "Yamada^Tarou");
+        obj.put(DataElement::new(
+            Tag(0x3006, 0x0020),
+            VR::SQ,
+            Value::from(dicom_core::value::DataSetSequence::from(vec![item])),
+        ));
+        let mut dataset = Vec::new();
+        obj.write_dataset_with_ts(
+            &mut dataset,
+            TransferSyntaxRegistry
+                .get(uids::IMPLICIT_VR_LITTLE_ENDIAN)
+                .unwrap(),
+        )
+        .unwrap();
+        let path = temp_path("implicit-dicom-rs.dcm");
+        write_part10_with(&path, uids::IMPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let original = std::fs::read(&path).unwrap();
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let unchanged = save_file(&path, &opened);
+        let mut edited = opened.clone();
+        *find_element_mut(
+            &mut edited,
+            &[
+                "(3006,0020)",
+                "Item#0",
+                "(3006,0039)",
+                "Item#0",
+                "(3006,0084)",
+            ],
+        )
+        .unwrap() = "2".to_string();
+        *find_element_mut(&mut edited, &["(0010,0010)"]).unwrap() = "山田^太郎".to_string();
+        let edited_plans_splice = plans_splice(&path, &edited);
+        let saved = save_file(&path, &edited);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(unchanged.unwrap(), original);
+        assert!(edited_plans_splice);
+        let reopened = reopen("implicit-dicom-rs-reopened.dcm", &saved.unwrap());
+        assert_eq!(value_and_editable(&reopened, "(3006,0084)").0, "2");
+        assert_eq!(value_and_editable(&reopened, "(0010,0010)").0, "山田^太郎");
+        assert_eq!(value_and_editable(&reopened, "(0009,1001)").0, "private");
+    }
+
     #[test]
     fn splice_transfer_syntaxes() {
         for uid in [
+            uids::IMPLICIT_VR_LITTLE_ENDIAN,
             uids::EXPLICIT_VR_LITTLE_ENDIAN,
             "1.2.840.10008.1.2.4.50",
             "1.2.840.10008.1.2.4.90",
@@ -4266,7 +4522,6 @@ mod tests {
             assert!(splice::supports_transfer_syntax(uid), "{uid}");
         }
         for uid in [
-            uids::IMPLICIT_VR_LITTLE_ENDIAN,
             "1.2.840.10008.1.2.2",
             uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
             "1.2.840.10008.1.20",
