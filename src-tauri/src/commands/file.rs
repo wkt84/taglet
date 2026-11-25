@@ -6,10 +6,8 @@ use dicom_object::DefaultDicomObject;
 use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
-use crate::dicom::parser::{
-    apply_nodes_to_object, open_full_object, open_nodes, rt_struct_data,
-    sync_file_meta_from_dataset,
-};
+use crate::dicom::parser::{open_full_object, open_nodes, rt_struct_data, save_object_with_nodes};
+use crate::dicom::text_values::TextValues;
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
@@ -65,16 +63,28 @@ impl LaunchFileStore {
 }
 
 impl DicomStore {
+    pub fn current_path(&self) -> Result<String, String> {
+        self.current_path
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "No DICOM file is currently open".to_string())
+    }
+
     pub fn with_current_full_object<R>(
         &self,
         f: impl FnOnce(&DefaultDicomObject) -> Result<R, String>,
     ) -> Result<R, String> {
-        let current_path = self
-            .current_path
-            .lock()
-            .map_err(|_| "DICOM store lock poisoned".to_string())?
-            .clone()
-            .ok_or_else(|| "No DICOM file is currently open".to_string())?;
+        self.with_full_object(&self.current_path()?, f)
+    }
+
+    /// Run `f` with the full object of the file at `current_path`.
+    pub fn with_full_object<R>(
+        &self,
+        current_path: &str,
+        f: impl FnOnce(&DefaultDicomObject) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let current_path = current_path.to_string();
         let mut objects = self
             .objects
             .lock()
@@ -140,7 +150,7 @@ impl DicomStore {
                 .full
                 .as_ref()
                 .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
-            stored.rt_struct = Some(rt_struct_data(object)?);
+            stored.rt_struct = Some(rt_struct_data(object, &TextValues::read(&current_path))?);
         }
 
         let data = stored
@@ -234,6 +244,11 @@ fn save_to_path(
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
 ) -> Result<(), String> {
+    // Text is written through dicom-rs, which cannot write every value back with its
+    // original bytes (e.g. text in a character set set only inside a sequence item).
+    let text = TextValues::try_read(&source_path)
+        .map_err(|error| format!("Could not check text values before saving: {error}"))?;
+
     let mut objects = store
         .objects
         .lock()
@@ -250,12 +265,8 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    apply_nodes_to_object(object, &nodes)?;
-    sync_file_meta_from_dataset(object);
+    save_object_with_nodes(object, &nodes, &text, &destination_path)?;
     stored.rt_struct = None;
-    object
-        .write_to_file(&destination_path)
-        .map_err(|error| error.to_string())?;
 
     if source_path != destination_path {
         objects.insert(

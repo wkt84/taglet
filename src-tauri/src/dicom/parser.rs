@@ -2,7 +2,7 @@ use base64::Engine;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
 use dicom_core::header::{HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
-use dicom_core::{Tag, VR};
+use dicom_core::{DataElement, Tag, VR};
 use dicom_dictionary_std::{tags, uids, StandardDataDictionary};
 use dicom_encoding::text::SpecificCharacterSet;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
@@ -13,11 +13,16 @@ use dicom_parser::dataset::lazy_read::LazyDataSetReader;
 use dicom_parser::dataset::{DataToken, LazyDataToken};
 use dicom_parser::stateful::decode::StatefulDecode;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::str::FromStr;
 
+use super::charset::{
+    dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, is_charset_sensitive, trim_padding,
+    TextCharset,
+};
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
     RtPlanBeam, RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition,
@@ -25,6 +30,7 @@ use super::model::{
     RtStructPoint, RtStructRoi, RtStructSlice, RtStructSliceContours,
 };
 use super::private::validate_private_nodes;
+use super::text_values::TextValues;
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 const DOSE_GRID_SCALING: Tag = Tag(0x3004, 0x000E);
@@ -57,11 +63,31 @@ const MISSING_FILE_META_WARNING: &str =
     "File meta information header is missing. The dataset was read as Implicit VR Little Endian.";
 const MAX_RAW_DISPLAY_VALUE_LENGTH: u32 = 1_048_576;
 const MAX_RAW_DISPLAY_ELEMENTS: usize = 20_000;
+const TEXT_READ_ONLY_WARNING: &str =
+    "Some text uses a character set Taglet cannot edit yet (such as Japanese ISO 2022). It is shown read-only.";
+const TEXT_SAVE_BLOCKED_WARNING: &str =
+    "Some text in this file cannot be written back without changing its bytes, so saving is disabled for this file.";
 const RAW_DATASET_START_GROUPS: &[u16] = &[
     0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x3006, 0x300A, 0x300C,
 ];
 
 pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
+    let mut content = open_nodes_without_text_values(path)?;
+    let text = TextValues::read(path);
+    let mut read_only = false;
+    for nodes in [&mut content.file_meta, &mut content.nodes] {
+        read_only |= apply_text_values(nodes, &text);
+    }
+    if read_only {
+        content.warnings.push(TEXT_READ_ONLY_WARNING.to_string());
+    }
+    if !text.paths_not_round_tripping().is_empty() {
+        content.warnings.push(TEXT_SAVE_BLOCKED_WARNING.to_string());
+    }
+    Ok(content)
+}
+
+fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
     match OpenFileOptions::new()
         .read_until(tags::PIXEL_DATA)
         .open_file(path)
@@ -333,7 +359,10 @@ pub fn frame_pixels(
     })
 }
 
-pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, String> {
+pub fn rt_plan_bev_info(
+    obj: &DefaultDicomObject,
+    text: &TextValues,
+) -> Result<RtPlanBevInfo, String> {
     let modality = get_string(obj, tags::MODALITY);
     if modality.as_deref() != Some("RTPLAN") {
         return Ok(RtPlanBevInfo {
@@ -364,7 +393,12 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
             RtPlanBeam {
                 beam_index,
                 beam_number: get_i32(beam, BEAM_NUMBER),
-                beam_name: get_string(beam, BEAM_NAME),
+                beam_name: get_text(
+                    beam,
+                    BEAM_NAME,
+                    text,
+                    &[format_tag(BEAM_SEQUENCE), format!("Item#{beam_index}")],
+                ),
                 devices: beam_limiting_device_definitions(beam),
                 control_points,
             }
@@ -383,7 +417,7 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
     })
 }
 
-pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> {
+pub fn rt_struct_data(obj: &DefaultDicomObject, text: &TextValues) -> Result<RtStructData, String> {
     let modality = get_string(obj, tags::MODALITY);
     if modality.as_deref() != Some("RTSTRUCT") {
         return Ok(RtStructData {
@@ -393,7 +427,7 @@ pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> 
                     "RT Structure Set viewer is available for RTSTRUCT objects only".to_string(),
                 ),
                 modality,
-                structure_set_label: get_string(obj, STRUCTURE_SET_LABEL),
+                structure_set_label: get_text(obj, STRUCTURE_SET_LABEL, text, &[]),
                 rois: Vec::new(),
                 slices: Vec::new(),
                 bounds: None,
@@ -402,7 +436,7 @@ pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> 
         });
     }
 
-    let roi_names = structure_set_roi_names(obj);
+    let roi_names = structure_set_roi_names(obj, text);
     let roi_contours = rt_struct_contours(obj, &roi_names);
     let rois = rt_struct_rois(obj, &roi_names, &roi_contours);
     let slices = rt_struct_slices(&roi_contours);
@@ -418,7 +452,7 @@ pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> 
                 Some("ROI Contour Sequence is missing or contains no contour data".to_string())
             },
             modality,
-            structure_set_label: get_string(obj, STRUCTURE_SET_LABEL),
+            structure_set_label: get_text(obj, STRUCTURE_SET_LABEL, text, &[]),
             rois,
             slices,
             bounds,
@@ -572,8 +606,14 @@ fn apply_validated_nodes_to_object(
                     continue;
                 }
                 let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
-                if is_text_editable(vr) {
-                    obj.put_str(tag, vr, value);
+                if is_text_editable(vr) && !element_has_value(obj, tag, vr, value) {
+                    if tag == tags::SPECIFIC_CHARACTER_SET {
+                        // Keep multiple values, which dicom-rs needs to switch character sets.
+                        let values = value.split('\\').map(str::to_string).collect();
+                        obj.put(DataElement::new(tag, vr, PrimitiveValue::Strs(values)));
+                    } else {
+                        obj.put_str(tag, vr, value);
+                    }
                 }
             }
             DicomNode::Sequence { tag, items, .. } => {
@@ -590,6 +630,113 @@ fn apply_validated_nodes_to_object(
         }
     }
     Ok(())
+}
+
+/// Apply nodes to a copy of `object`, check the text values and write the copy to
+/// `destination`. `object` is updated only when the file was written.
+pub fn save_object_with_nodes(
+    object: &mut DefaultDicomObject,
+    nodes: &[DicomNode],
+    text: &TextValues,
+    destination: &str,
+) -> Result<(), String> {
+    let mut candidate = object.clone();
+    apply_nodes_to_object(&mut candidate, nodes)?;
+    ensure_text_round_trips(&candidate, text)?;
+    sync_file_meta_from_dataset(&mut candidate);
+    write_file_atomically(&candidate, destination)?;
+    *object = candidate;
+    Ok(())
+}
+
+/// Write to a new temporary file next to `destination` and move it into place, so that
+/// a failed write never leaves `destination` truncated or replaced by a partial file.
+fn write_file_atomically(object: &DefaultDicomObject, destination: &str) -> Result<(), String> {
+    let (temporary, file) = create_temporary_save_file(destination)?;
+    let result = write_object_to(object, file)
+        .and_then(|()| copy_existing_permissions(destination, &temporary))
+        .and_then(|()| std::fs::rename(&temporary, destination).map_err(|error| error.to_string()));
+    if result.is_err() {
+        std::fs::remove_file(&temporary).ok();
+    }
+    result
+}
+
+/// Create a temporary file that only this save uses, readable by the owner only.
+fn create_temporary_save_file(destination: &str) -> Result<(std::path::PathBuf, File), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let destination = std::path::Path::new(destination);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    loop {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        // A short name independent of the destination's, so that long file names
+        // still fit the file system's limit.
+        let temporary = destination.with_file_name(format!(".taglet-{unique}.tmp"));
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+/// Write a Part 10 file and make sure every byte reached the disk. dicom-rs drops its
+/// internal buffer without flushing it explicitly, so errors from the final write are
+/// caught by `ErrorRecordingWriter` instead.
+fn write_object_to(object: &DefaultDicomObject, file: File) -> Result<(), String> {
+    let mut writer = ErrorRecordingWriter {
+        inner: file,
+        error: None,
+    };
+    let result = object
+        .write_all(&mut writer)
+        .map_err(|error| error.to_string());
+    if let Some(error) = writer.error.take() {
+        return Err(error);
+    }
+    result?;
+    writer.inner.sync_all().map_err(|error| error.to_string())
+}
+
+struct ErrorRecordingWriter<W> {
+    inner: W,
+    error: Option<String>,
+}
+
+impl<W: std::io::Write> std::io::Write for ErrorRecordingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf).inspect_err(|error| {
+            self.error.get_or_insert_with(|| error.to_string());
+        })
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush().inspect_err(|error| {
+            self.error.get_or_insert_with(|| error.to_string());
+        })
+    }
+}
+
+/// Keep the access permissions of a file that is being replaced.
+fn copy_existing_permissions(destination: &str, temporary: &std::path::Path) -> Result<(), String> {
+    match std::fs::metadata(destination) {
+        Ok(metadata) => std::fs::set_permissions(temporary, metadata.permissions())
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub fn sync_file_meta_from_dataset(obj: &mut DefaultDicomObject) {
@@ -945,6 +1092,166 @@ fn display_value(value: &Value<InMemDicomObject>) -> String {
     }
 }
 
+/// Replace text values that dicom-rs decoded differently from the character set in
+/// effect for their dataset or item. Replaced values are read-only, because saving
+/// writes text through dicom-rs. Returns whether any value was replaced.
+pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues) -> bool {
+    let mut replaced = false;
+    for node in nodes {
+        match node {
+            DicomNode::Element {
+                path,
+                value,
+                editable,
+                ..
+            } => {
+                let Some(text_value) = text.get(path) else {
+                    continue;
+                };
+                if trim_padding(value) != text_value.decoded {
+                    *value = text_value.decoded.clone();
+                    *editable = false;
+                    replaced = true;
+                }
+            }
+            DicomNode::Sequence { items, .. } => {
+                for item in items {
+                    replaced |= apply_text_values(item, text);
+                }
+            }
+        }
+    }
+    replaced
+}
+
+/// Whether an element already holds the displayed value, so that saving can keep the
+/// element as read (including its multiple values) instead of rewriting it.
+fn element_has_value(obj: &InMemDicomObject, tag: Tag, vr: VR, value: &str) -> bool {
+    obj.get(tag).is_some_and(|element| {
+        element.vr() == vr
+            && element
+                .to_str()
+                .is_ok_and(|current| trim_padding(&current) == trim_padding(value))
+    })
+}
+
+/// Fail when saving `obj` through dicom-rs would change the bytes of a text value that
+/// was not edited. The check follows the character set declarations that will actually
+/// be written, the way dicom-rs's writer switches codecs.
+pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut codec = SpecificCharacterSet::default();
+    collect_text_write_failures(
+        obj,
+        &[],
+        &TextCharset::default(),
+        text,
+        &mut codec,
+        &mut failures,
+    );
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let shown = failures
+        .iter()
+        .take(5)
+        .map(|path| path.join(" / "))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Cannot save: these text values would not be saved as shown (their characters or bytes would change): {shown}{}",
+        if failures.len() > 5 { ", ..." } else { "" }
+    ))
+}
+
+fn collect_text_write_failures(
+    obj: &InMemDicomObject,
+    parent_path: &[String],
+    inherited_charset: &TextCharset,
+    text: &TextValues,
+    codec: &mut SpecificCharacterSet,
+    failures: &mut Vec<Vec<String>>,
+) {
+    // The character set that the saved file declares for this dataset or item.
+    let charset = match obj.get(tags::SPECIFIC_CHARACTER_SET) {
+        Some(element) => element
+            .to_str()
+            .map(|value| TextCharset::from_specific_character_set(&value))
+            .unwrap_or_default(),
+        None => inherited_charset.clone(),
+    };
+    for element in obj.iter() {
+        let tag = element.tag();
+        let mut path = parent_path.to_vec();
+        path.push(format_tag(tag));
+        match element.value() {
+            Value::Sequence(sequence) => {
+                for (index, item) in sequence.items().iter().enumerate() {
+                    let mut item_path = path.clone();
+                    item_path.push(format!("Item#{index}"));
+                    collect_text_write_failures(item, &item_path, &charset, text, codec, failures);
+                }
+            }
+            Value::Primitive(value) if tag == tags::SPECIFIC_CHARACTER_SET => {
+                let name = match value {
+                    PrimitiveValue::Str(name) => Some(name.as_str()),
+                    PrimitiveValue::Strs(names) => names.first().map(String::as_str),
+                    _ => None,
+                };
+                *codec = dicom_rs_codec_after(codec.clone(), name);
+            }
+            Value::Primitive(value) => {
+                let vr = element.vr();
+                if !is_charset_sensitive(vr) {
+                    continue;
+                }
+                let stored = match value {
+                    PrimitiveValue::Str(text) => vec![text.to_string()],
+                    PrimitiveValue::Strs(texts) => texts.to_vec(),
+                    _ => continue,
+                };
+                let written = dicom_rs_write(codec, &stored);
+                let original = text.get(&path).filter(|original| {
+                    dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
+                        .is_some_and(|read| read == stored)
+                });
+                let keeps_value = match (original, written) {
+                    // Unedited text must keep its bytes and, under the character sets the
+                    // saved file declares, its meaning.
+                    (Some(original), Some(written)) => {
+                        written == original.bytes
+                            && charset.decode(original.vr, &original.bytes) == original.decoded
+                    }
+                    // Edited or added text must read back as entered.
+                    (None, Some(written)) => {
+                        charset.decode(vr, &written) == trim_padding(&stored.join("\\"))
+                    }
+                    (_, None) => false,
+                };
+                if !keeps_value {
+                    failures.push(path);
+                }
+            }
+            Value::PixelSequence(_) => {}
+        }
+    }
+}
+
+/// Text decoded with the character set in effect for its dataset or item, when known.
+fn get_text(
+    obj: &InMemDicomObject,
+    tag: Tag,
+    text: &TextValues,
+    path: &[String],
+) -> Option<String> {
+    let mut element_path = path.to_vec();
+    element_path.push(format_tag(tag));
+    match text.get(&element_path) {
+        Some(value) if obj.get(tag).is_some() => Some(value.decoded.clone()),
+        _ => get_string(obj, tag),
+    }
+}
+
 fn display_element_value(
     tag: Tag,
     vr: VR,
@@ -1149,14 +1456,19 @@ fn sequence_items(obj: &InMemDicomObject, tag: Tag) -> Option<&[InMemDicomObject
     })
 }
 
-fn structure_set_roi_names(obj: &InMemDicomObject) -> HashMap<i32, String> {
+fn structure_set_roi_names(obj: &InMemDicomObject, text: &TextValues) -> HashMap<i32, String> {
     sequence_items(obj, STRUCTURE_SET_ROI_SEQUENCE)
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| {
+                .enumerate()
+                .filter_map(|(index, item)| {
                     let roi_number = get_i32(item, ROI_NUMBER)?;
-                    let name = get_string(item, ROI_NAME)?;
+                    let item_path = [
+                        format_tag(STRUCTURE_SET_ROI_SEQUENCE),
+                        format!("Item#{index}"),
+                    ];
+                    let name = get_text(item, ROI_NAME, text, &item_path)?;
                     Some((roi_number, name))
                 })
                 .collect()
@@ -1193,7 +1505,7 @@ fn rt_struct_rois(
                     let roi_number = get_i32(item, ROI_NUMBER)?;
                     Some(RtStructRoi {
                         roi_number,
-                        name: get_string(item, ROI_NAME),
+                        name: roi_names.get(&roi_number).cloned(),
                         color: colors.get(&roi_number).copied(),
                         contour_count: *contour_counts.get(&roi_number).unwrap_or(&0),
                     })
@@ -1807,5 +2119,680 @@ mod tests {
                 .unwrap();
             assert_eq!(encoded, expected);
         }
+    }
+
+    /// PS3.5 Annex H.3.1, JIS X 0208 with ASCII.
+    const YAMADA_IR87: &[u8] =
+        b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B=\x1b$B$d$^$@\x1b(B^\x1b$B$?$m$&\x1b(B";
+    /// "前立腺" (prostate) in JIS X 0208.
+    const PROSTATE_IR87: &[u8] = b"\x1b$BA0N)A#\x1b(B";
+    /// "ﾊﾝ" in JIS X 0201 Katakana (ISO_IR 13). Not valid UTF-8.
+    const HAN_IR13: &[u8] = b"\xca\xdd";
+    const RTSTRUCT_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.481.3";
+
+    fn explicit_element(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(if vr == b"UI" { 0 } else { b' ' });
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(vr);
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn implicit_element(group: u16, element: u16, value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(b' ');
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn sequence(group: u16, element: u16, items: &[Vec<u8>], explicit: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        if explicit {
+            out.extend_from_slice(b"SQ\0\0");
+        }
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        for item in items {
+            out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            out.extend_from_slice(&u32::MAX.to_le_bytes());
+            out.extend_from_slice(item);
+            out.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0, 0, 0, 0, 0]);
+        }
+        out.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0]);
+        out
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("taglet-{}-{name}", std::process::id()))
+    }
+
+    /// Write an Explicit VR Little Endian Part 10 file whose dataset starts with
+    /// Specific Character Set (when given), SOP Class/Instance UID and Modality.
+    fn write_part10(path: &std::path::Path, charset: Option<&[u8]>, rest: &[u8]) {
+        let mut dataset = Vec::new();
+        if let Some(charset) = charset {
+            dataset.extend(explicit_element(0x0008, 0x0005, b"CS", charset));
+        }
+        dataset.extend(explicit_element(
+            0x0008,
+            0x0016,
+            b"UI",
+            RTSTRUCT_SOP_CLASS.as_bytes(),
+        ));
+        dataset.extend(explicit_element(0x0008, 0x0018, b"UI", b"1.2.3.4"));
+        dataset.extend(explicit_element(0x0008, 0x0060, b"CS", b"RTSTRUCT"));
+        dataset.extend_from_slice(rest);
+
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(RTSTRUCT_SOP_CLASS)
+            .media_storage_sop_instance_uid("1.2.3.4")
+            .build()
+            .unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(&[0; 128]);
+        file.extend_from_slice(b"DICM");
+        meta.write(&mut file).unwrap();
+        file.extend(dataset);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn roi_sequence(item_charset: Option<&[u8]>, roi_name: &[u8]) -> Vec<u8> {
+        let mut item = Vec::new();
+        if let Some(charset) = item_charset {
+            item.extend(explicit_element(0x0008, 0x0005, b"CS", charset));
+        }
+        item.extend(explicit_element(0x3006, 0x0022, b"IS", b"1"));
+        item.extend(explicit_element(0x3006, 0x0026, b"LO", roi_name));
+        sequence(0x3006, 0x0020, &[item], true)
+    }
+
+    /// An RT Structure Set with Japanese text in the dataset and in a sequence item.
+    fn write_iso2022_rtstruct(path: &std::path::Path, charset: &str) {
+        let rest = [
+            explicit_element(0x0010, 0x0010, b"PN", YAMADA_IR87),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            roi_sequence(None, PROSTATE_IR87),
+        ]
+        .concat();
+        write_part10(path, Some(charset.as_bytes()), &rest);
+    }
+
+    fn find_element<'a>(nodes: &'a [DicomNode], wanted: &str) -> Option<&'a DicomNode> {
+        nodes.iter().find_map(|node| match node {
+            DicomNode::Element { tag, .. } if tag == wanted => Some(node),
+            DicomNode::Sequence { items, .. } => {
+                items.iter().find_map(|item| find_element(item, wanted))
+            }
+            _ => None,
+        })
+    }
+
+    fn value_and_editable(nodes: &[DicomNode], wanted: &str) -> (String, bool) {
+        match find_element(nodes, wanted) {
+            Some(DicomNode::Element {
+                value, editable, ..
+            }) => (value.clone(), *editable),
+            _ => panic!("{wanted} not found"),
+        }
+    }
+
+    fn has_warning(content: &DicomFileContent, warning: &str) -> bool {
+        content
+            .warnings
+            .iter()
+            .any(|candidate| candidate == warning)
+    }
+
+    /// Open, apply the displayed nodes unchanged and save like `save_to_path` does.
+    fn save_unchanged(source: &std::path::Path) -> Result<Vec<u8>, String> {
+        let source_text = source.to_str().unwrap();
+        let nodes = open_nodes(source_text)?.nodes;
+        save_nodes(source, &nodes)
+    }
+
+    /// Apply nodes and save like `save_to_path` does.
+    fn save_nodes(source: &std::path::Path, nodes: &[DicomNode]) -> Result<Vec<u8>, String> {
+        let source_text = source.to_str().unwrap();
+        let text = TextValues::try_read(source_text)?;
+        let mut obj = open_full_object(source_text)?;
+        let destination = source.with_extension("saved.dcm");
+        let saved = save_object_with_nodes(&mut obj, nodes, &text, destination.to_str().unwrap());
+        if saved.is_err() {
+            std::fs::remove_file(&destination).ok();
+        }
+        saved?;
+        let written = std::fs::read(&destination).map_err(|error| error.to_string())?;
+        std::fs::remove_file(&destination).ok();
+        Ok(written)
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn displays_iso2022_japanese_text_read_only() {
+        for charset in [
+            "\\ISO 2022 IR 87",
+            "ISO 2022 IR 87",
+            "ISO 2022 IR 6\\ISO 2022 IR 87",
+        ] {
+            let path = temp_path("iso2022-display.dcm");
+            write_iso2022_rtstruct(&path, charset);
+            let content = open_nodes(path.to_str().unwrap()).unwrap();
+            std::fs::remove_file(&path).ok();
+
+            assert_eq!(
+                value_and_editable(&content.nodes, "(0010,0010)"),
+                ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), false),
+                "{charset:?}"
+            );
+            assert_eq!(
+                value_and_editable(&content.nodes, "(3006,0026)"),
+                ("前立腺".to_string(), false),
+                "{charset:?}"
+            );
+            // ASCII-only text stays editable.
+            assert_eq!(
+                value_and_editable(&content.nodes, "(0010,0020)"),
+                ("ID001".to_string(), true)
+            );
+            assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+            assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+        }
+    }
+
+    #[test]
+    fn rt_struct_roi_names_use_text_values() {
+        let path = temp_path("iso2022-roi.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let path_text = path.to_str().unwrap();
+        let obj = open_full_object(path_text).unwrap();
+        let data = rt_struct_data(&obj, &TextValues::read(path_text)).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let names = data
+            .info
+            .rois
+            .iter()
+            .map(|roi| roi.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![Some("前立腺".to_string())]);
+    }
+
+    #[test]
+    fn saving_iso2022_file_preserves_original_bytes() {
+        let path = temp_path("iso2022-save.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let written = save_unchanged(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(contains(&written, YAMADA_IR87));
+        assert!(contains(&written, PROSTATE_IR87));
+        assert!(contains(&written, b"\\ISO 2022 IR 87"));
+    }
+
+    #[test]
+    fn raw_dataset_fallback_decodes_iso2022_text() {
+        let path = temp_path("iso2022-raw.dcm");
+        let dataset = [
+            implicit_element(0x0008, 0x0005, b"\\ISO 2022 IR 87"),
+            implicit_element(0x0008, 0x0060, b"RTSTRUCT"),
+            implicit_element(0x0010, 0x0010, YAMADA_IR87),
+        ]
+        .concat();
+        std::fs::write(&path, dataset).unwrap();
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(0010,0010)"),
+            ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+    }
+
+    #[test]
+    fn files_without_japanese_charset_are_unchanged() {
+        let path = temp_path("latin1.dcm");
+        let rest = [
+            explicit_element(0x0010, 0x0010, b"PN", b"Caf\xe9^Ren\xe9"),
+            roi_sequence(None, b"PTV"),
+        ]
+        .concat();
+        write_part10(&path, Some(b"ISO_IR 100"), &rest);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(0010,0010)"),
+            ("Café^René".to_string(), true)
+        );
+        assert!(content.warnings.is_empty(), "{:?}", content.warnings);
+    }
+
+    /// Review P1: an item character set that dicom-rs does not know, under a parent
+    /// character set whose codec cannot carry the item's bytes.
+    #[test]
+    fn item_charset_under_utf8_parent_is_shown_and_blocks_saving() {
+        let path = temp_path("item-ir13-under-utf8.dcm");
+        let rest = [
+            explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+            roi_sequence(Some(b"ISO_IR 13"), HAN_IR13),
+        ]
+        .concat();
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        let saved = save_unchanged(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert_eq!(
+            value_and_editable(&content.nodes, "(0010,0010)"),
+            ("山田^太郎".to_string(), true)
+        );
+        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
+        );
+    }
+
+    /// dicom-rs keeps an item's character set for the rest of the stream. Text after the
+    /// sequence is shown with the parent's character set and still saved byte for byte.
+    #[test]
+    fn item_charset_does_not_leak_into_following_parent_elements() {
+        let path = temp_path("item-latin1-under-utf8.dcm");
+        let reviewer = "鈴木^花子".as_bytes();
+        let rest = [
+            roi_sequence(Some(b"ISO_IR 100"), b"Caf\xe9"),
+            explicit_element(0x300E, 0x0008, b"PN", reviewer),
+        ]
+        .concat();
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        let written = save_unchanged(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("Café".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&content.nodes, "(300E,0008)"),
+            ("鈴木^花子".to_string(), false)
+        );
+        assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+        assert!(contains(&written, reviewer));
+        assert!(contains(&written, b"Caf\xe9"));
+    }
+
+    /// Review P3: a character set given only inside a sequence item still warns.
+    #[test]
+    fn warns_when_only_an_item_declares_a_japanese_charset() {
+        let path = temp_path("item-only-charset.dcm");
+        write_part10(&path, None, &roi_sequence(Some(b"ISO_IR 13"), HAN_IR13));
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+
+        let raw_path = temp_path("item-only-charset-raw.dcm");
+        let mut item = implicit_element(0x0008, 0x0005, b"ISO_IR 13");
+        item.extend(implicit_element(0x3006, 0x0026, HAN_IR13));
+        let dataset = [
+            implicit_element(0x0008, 0x0060, b"RTSTRUCT"),
+            sequence(0x3006, 0x0020, &[item], false),
+        ]
+        .concat();
+        std::fs::write(&raw_path, dataset).unwrap();
+        let content = open_nodes(raw_path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&raw_path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+    }
+
+    /// Review P2: JIS X 0201 Romaji yen sign and overline without escape sequences.
+    #[test]
+    fn displays_jis_roman_yen_sign_and_overline() {
+        let path = temp_path("ir13-st.dcm");
+        let rest = explicit_element(0x3006, 0x0006, b"ST", b"100\\~");
+        write_part10(&path, Some(b"ISO_IR 13"), &rest);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        let written = save_unchanged(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0006)"),
+            ("100¥‾".to_string(), false)
+        );
+        assert!(contains(&written, b"100\\~"));
+    }
+
+    fn explicit_long_element(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(b' ');
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(vr);
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn find_element_mut<'a>(
+        nodes: &'a mut [DicomNode],
+        wanted_path: &[&str],
+    ) -> Option<&'a mut String> {
+        nodes.iter_mut().find_map(|node| match node {
+            DicomNode::Element { path, value, .. } if path == wanted_path => Some(value),
+            DicomNode::Sequence { items, .. } => items
+                .iter_mut()
+                .find_map(|item| find_element_mut(item, wanted_path)),
+            _ => None,
+        })
+    }
+
+    /// Review P1 (2nd round): an unedited multi-valued Specific Character Set in an item
+    /// must be saved as read, so that dicom-rs switches codecs the same way on writing.
+    #[test]
+    fn unedited_multi_valued_item_charset_is_saved_as_read() {
+        let path = temp_path("item-ir100-ir87-under-utf8.dcm");
+        let roi_name = b"Caf\xe9 \x1b$B;3ED\x1b(B";
+        let rest = roi_sequence(Some(b"ISO 2022 IR 100\\ISO 2022 IR 87"), roi_name);
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        let written = save_unchanged(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("Café 山田".to_string(), false)
+        );
+        let written = written.unwrap();
+        assert!(contains(&written, roi_name));
+        assert!(contains(&written, b"ISO 2022 IR 100\\ISO 2022 IR 87"));
+    }
+
+    /// Saving is checked against the declarations that will be written.
+    #[test]
+    fn editing_an_item_charset_blocks_saving_read_only_text() {
+        let path = temp_path("item-charset-edited.dcm");
+        let rest = roi_sequence(Some(b"ISO 2022 IR 100\\ISO 2022 IR 87"), b"Caf\xe9");
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(0008,0005)"]).unwrap() =
+            "ISO_IR 192".to_string();
+        let saved = save_nodes(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
+        );
+    }
+
+    /// Review P2 (2nd round): values larger than 16 MiB are checked too.
+    #[test]
+    fn large_text_values_are_checked_before_saving() {
+        let path = temp_path("item-large-ut.dcm");
+        let mut value = vec![b'A'; 16 * 1024 * 1024 + 2];
+        value.extend_from_slice(HAN_IR13);
+        let mut item = explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13");
+        item.extend(explicit_long_element(0x0040, 0xA160, b"UT", &value));
+        let rest = sequence(0x0040, 0xA730, &[item], true);
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let saved = save_unchanged(&path);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(0040,A730) / Item#0 / (0040,A160)"),
+            "{error}"
+        );
+    }
+
+    fn remove_element(nodes: &mut Vec<DicomNode>, tag_to_remove: &str) {
+        nodes
+            .retain(|node| !matches!(node, DicomNode::Element { tag, .. } if tag == tag_to_remove));
+    }
+
+    /// Review P1 (3rd round): changing or removing a declaration so that unedited
+    /// read-only text would mean something else blocks saving, including in items that
+    /// inherit the declaration.
+    #[test]
+    fn changing_the_declaration_of_read_only_text_blocks_saving() {
+        let path = temp_path("ir13-declaration-edited.dcm");
+        write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, HAN_IR13));
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        assert_eq!(
+            value_and_editable(&opened, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+
+        let mut changed = opened.clone();
+        *find_element_mut(&mut changed, &["(0008,0005)"]).unwrap() = "ISO_IR 100".to_string();
+        let changed_result = save_nodes(&path, &changed);
+
+        let mut removed = opened.clone();
+        remove_element(&mut removed, "(0008,0005)");
+        let removed_result = save_nodes(&path, &removed);
+
+        let unchanged_result = save_nodes(&path, &opened);
+        std::fs::remove_file(&path).ok();
+
+        for result in [changed_result, removed_result] {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+                "{error}"
+            );
+        }
+        assert!(contains(&unchanged_result.unwrap(), HAN_IR13));
+    }
+
+    /// Review P2 (3rd round): a rejected save leaves the cached object untouched.
+    #[test]
+    fn rejected_save_does_not_change_the_object() {
+        let path = temp_path("rejected-save.dcm");
+        let rest = roi_sequence(Some(b"ISO 2022 IR 100\\ISO 2022 IR 87"), b"Caf\xe9");
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(0008,0005)"]).unwrap() =
+            "ISO_IR 192".to_string();
+        *find_element_mut(&mut nodes, &["(0008,0060)"]).unwrap() = "CT".to_string();
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let destination = temp_path("rejected-save-destination.dcm");
+        let result = save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert_eq!(
+            get_string(&obj, tags::MODALITY).as_deref(),
+            Some("RTSTRUCT")
+        );
+    }
+
+    /// Review P2 (4th round): edited text must read back as entered under the declared
+    /// character set.
+    #[test]
+    fn edited_text_that_would_read_back_differently_blocks_saving() {
+        let path = temp_path("ir13-edited-text.dcm");
+        write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, b"PTV"));
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let roi_name = ["(3006,0020)", "Item#0", "(3006,0026)"];
+
+        let mut pound = opened.clone();
+        *find_element_mut(&mut pound, &roi_name).unwrap() = "£".to_string();
+        let pound_result = save_nodes(&path, &pound);
+
+        let mut ascii = opened.clone();
+        *find_element_mut(&mut ascii, &roi_name).unwrap() = "PTV2".to_string();
+        let ascii_result = save_nodes(&path, &ascii);
+        std::fs::remove_file(&path).ok();
+
+        let error = pound_result.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
+        );
+        assert!(contains(&ascii_result.unwrap(), b"PTV2"));
+    }
+
+    /// Review P1 (4th round): saving over a file never leaves it truncated.
+    #[test]
+    fn failed_save_keeps_the_existing_destination_file() {
+        let dir = temp_test_dir("overwrite");
+        let path = dir.join("ir13-overwrite.dcm");
+        let rest = explicit_element(0x0010, 0x0020, b"LO", b"ID001");
+        write_part10(&path, Some(b"ISO_IR 13"), &rest);
+        let path_text = path.to_str().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Text the declared character set cannot hold is rejected before writing.
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "患者".to_string();
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        assert!(save_object_with_nodes(&mut obj, &nodes, &text, path_text).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        std::fs::remove_file(&path).ok();
+        assert!(dir_is_empty(&dir));
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// A directory used by one test only, so that it can be checked for leftovers.
+    fn temp_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Whether `dir` is empty, i.e. no temporary file was left behind.
+    fn dir_is_empty(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir).unwrap().next().is_none()
+    }
+
+    /// Review P1 (5th round): errors from the final buffered write are not lost.
+    #[test]
+    fn write_errors_from_dropped_buffers_are_reported() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ErrorRecordingWriter {
+            inner: FailingWriter,
+            error: None,
+        };
+        // Like dicom-rs: buffer the output and drop the buffer without flushing it.
+        {
+            let mut buffered = std::io::BufWriter::new(&mut writer);
+            std::io::Write::write_all(&mut buffered, b"DICM").unwrap();
+        }
+        assert_eq!(writer.error.as_deref(), Some("disk full"));
+    }
+
+    /// Review P1 (5th round): saving over a file keeps its access permissions.
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_permissions_of_the_replaced_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_test_dir("permissions");
+        let path = dir.join("permissions.dcm");
+        write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path_text = path.to_str().unwrap();
+        let nodes = open_nodes(path_text).unwrap().nodes;
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        save_object_with_nodes(&mut obj, &nodes, &text, path_text).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(mode, 0o600);
+        assert!(dir_is_empty(&dir));
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// Review P2 (6th round): files with names close to the 255-byte limit can be saved.
+    #[test]
+    fn saving_over_a_file_with_a_long_name() {
+        let dir = temp_test_dir("long-name");
+        let path = dir.join(format!("{}.dcm", "a".repeat(246)));
+        write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
+        let path_text = path.to_str().unwrap();
+        let nodes = open_nodes(path_text).unwrap().nodes;
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let saved = save_object_with_nodes(&mut obj, &nodes, &text, path_text);
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        saved.unwrap();
+        assert!(contains(&written, b"PTV"));
+        assert!(dir_is_empty(&dir));
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// Review P2 (5th round): an unrelated file with a temporary-looking name is kept.
+    #[test]
+    fn saving_does_not_touch_other_files() {
+        let path = temp_path("unrelated.dcm");
+        write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
+        let unrelated = path.with_file_name(format!(
+            ".{}.taglet-saving",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&unrelated, b"keep me").unwrap();
+        let saved = save_unchanged(&path);
+        let kept = std::fs::read(&unrelated);
+        std::fs::remove_file(&unrelated).ok();
+        std::fs::remove_file(&path).ok();
+
+        saved.unwrap();
+        assert_eq!(kept.unwrap(), b"keep me");
     }
 }
