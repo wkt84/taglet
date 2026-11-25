@@ -232,13 +232,18 @@ fn read_nodes(
     end: u64,
     stop: impl Fn(Tag) -> bool + Copy,
 ) -> Result<Vec<IndexNode>, String> {
-    let mut nodes = Vec::new();
+    let mut nodes: Vec<IndexNode> = Vec::new();
     while reader.position < end {
         let Some(tag) = reader.peek_tag()? else {
             break;
         };
         if stop(tag) || tag == ITEM_DELIMITER {
             break;
+        }
+        // Splicing inserts elements in tag order and addresses them by tag, so tags
+        // must be unique and ascending.
+        if nodes.last().is_some_and(|last| last.tag() >= tag) {
+            return Err(format!("Element {tag} is out of order or repeated"));
         }
         nodes.push(read_node(reader)?);
     }

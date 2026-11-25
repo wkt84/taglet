@@ -78,7 +78,7 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
     let text = TextValues::read(path);
     // Files that can be saved by splicing can have any decoded value edited, since
     // splicing writes the encoded bytes itself (#8).
-    let spliceable = can_splice(&content.file_meta);
+    let spliceable = can_splice(path, &content);
     let mut read_only = false;
     for nodes in [&mut content.file_meta, &mut content.nodes] {
         read_only |= apply_text_values(nodes, &text, spliceable);
@@ -92,13 +92,27 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
     Ok(content)
 }
 
-/// Whether a file with this file meta information can be saved by splicing: a Part 10
-/// file whose data set is Explicit VR Little Endian.
-fn can_splice(file_meta: &[DicomNode]) -> bool {
-    file_meta.iter().any(|node| {
-        matches!(node, DicomNode::Element { tag, value, .. }
-            if tag == "(0002,0010)" && splice::supports_transfer_syntax(value))
-    })
+/// Whether value edits to this file can be saved by splicing: a Part 10 file whose
+/// data set is Explicit VR Little Endian, that can be indexed, has no group length
+/// elements, and whose file meta SOP UIDs match the data set's (see `plan_splice`).
+fn can_splice(path: &str, content: &DicomFileContent) -> bool {
+    let value_of = |nodes: &[DicomNode], wanted: &str| {
+        nodes.iter().find_map(|node| match node {
+            DicomNode::Element { tag, value, .. } if tag == wanted => {
+                Some(value.trim_end_matches(['\0', ' ']).to_string())
+            }
+            _ => None,
+        })
+    };
+    let meta_matches = |meta_tag: &str, dataset_tag: &str| {
+        let dataset = value_of(&content.nodes, dataset_tag);
+        dataset.is_none() || dataset == value_of(&content.file_meta, meta_tag)
+    };
+    value_of(&content.file_meta, "(0002,0010)")
+        .is_some_and(|uid| splice::supports_transfer_syntax(&uid))
+        && meta_matches("(0002,0002)", "(0008,0016)")
+        && meta_matches("(0002,0003)", "(0008,0018)")
+        && splice::FileIndex::read(path).is_ok_and(|index| !has_group_length(index.nodes()))
 }
 
 fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
@@ -797,6 +811,11 @@ fn plan_splice(
         return Ok(None);
     }
 
+    // Added elements are spliced only as edited text values; anything else (e.g. a
+    // non-text VR) is left to the full writer rather than dropped.
+    if diff.added.iter().any(|path| !edited.contains(path)) {
+        return Ok(None);
+    }
     let shown = shown_values(nodes);
     let mut edits = splice::Edits::default();
     let mut failures = Vec::new();
@@ -819,15 +838,14 @@ fn plan_splice(
                 return Ok(None);
             };
             match encode_spliced_value(vr, value, Some(&charset)) {
-                Ok(Some(bytes)) => {
-                    let element = splice::encode_element(tag, vr, &bytes)
-                        .map_err(|error| format!("Cannot save: {} ({error})", path.join(" / ")))?;
-                    edits
+                Ok(Some(bytes)) => match splice::encode_element(tag, vr, &bytes) {
+                    Ok(element) => edits
                         .insertions
                         .entry(parent.to_vec())
                         .or_default()
-                        .push((tag, element));
-                }
+                        .push((tag, element)),
+                    Err(error) => failures.push(format!("{} ({error})", path.join(" / "))),
+                },
                 Ok(None) => return Ok(None),
                 Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
             }
@@ -2031,7 +2049,7 @@ fn encode_edited_text(
         match dicom_rs_write(codec, stored) {
             Some(written) if charset.decode(vr, &written) == entered => Ok(None),
             _ => Err(
-                "it can only be saved when the other changes in this save are value edits; save other changes (such as added or removed elements) separately".to_string(),
+                "it can only be written by editing the file in place, which needs an Explicit VR Little Endian file and a save that does not add or remove sequences or items or change the Specific Character Set or SOP UIDs".to_string(),
             ),
         }
     }
@@ -4778,5 +4796,67 @@ mod tests {
 
         assert!(!removed_planned);
         assert!(!emptied_planned);
+    }
+
+    /// Review: added nodes that are not edited text values are left to the full writer
+    /// instead of being dropped by splicing.
+    #[test]
+    fn added_nodes_splicing_cannot_write_use_the_full_writer() {
+        let path = temp_path("splice-added-non-text.dcm");
+        write_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let mut node = element_node("(0028,0010)", "US", "512", &[]);
+        if let DicomNode::Element { editable, .. } = &mut node {
+            *editable = false;
+        }
+        nodes.push(node);
+        let planned = plan_for(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!planned);
+    }
+
+    /// Review: files with group lengths are saved by the full writer, so values it
+    /// cannot write back stay read-only and the save-blocked warning is shown.
+    #[test]
+    fn files_with_group_lengths_are_not_treated_as_spliceable() {
+        let path = temp_path("group-length.dcm");
+        let item = [
+            explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+            explicit_element(0x3006, 0x0026, b"LO", HAN_IR13),
+        ]
+        .concat();
+        let dataset = [
+            explicit_element(0x0008, 0x0000, b"UL", &[0, 0, 0, 0]),
+            base_elements(b"ISO_IR 192"),
+            defined_sequence(0x3006, 0x0020, &[item]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+    }
+
+    /// Review: files with repeated or unordered tags are not spliced.
+    #[test]
+    fn repeated_tags_are_not_indexed_for_splicing() {
+        let path = temp_path("repeated-tag.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID002"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let index = splice::FileIndex::read(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert!(index.unwrap_err().contains("out of order or repeated"));
     }
 }
