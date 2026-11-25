@@ -26,20 +26,25 @@ const UNDEFINED: u32 = u32::MAX;
 /// Transfer syntaxes whose data set is encoded as Explicit VR Little Endian.
 pub fn supports_transfer_syntax(uid: &str) -> bool {
     let uid = uid.trim_end_matches(['\0', ' ']);
-    !matches!(
-        uid,
-        uids::IMPLICIT_VR_LITTLE_ENDIAN
-            | "1.2.840.10008.1.2.2" // Explicit VR Big Endian (retired)
+    // Standard transfer syntaxes other than Implicit VR Little Endian (1.2.840.10008.1.2)
+    // all live under 1.2.840.10008.1.2. and encode the data set as Explicit VR Little
+    // Endian, except for Big Endian and the deflated ones.
+    uid.starts_with("1.2.840.10008.1.2.")
+        && !matches!(
+            uid,
+            "1.2.840.10008.1.2.2" // Explicit VR Big Endian (retired)
             | uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN
             | "1.2.840.10008.1.2.4.95" // JPIP Referenced Deflate
-    ) && uid.starts_with("1.2.840.10008.1.2")
+        )
 }
 
 #[derive(Debug, Clone)]
 pub enum IndexNode {
     Element {
         tag: Tag,
-        vr: VR,
+        /// `None` for VR bytes that are not a known VR.
+        vr: Option<VR>,
+        vr_bytes: [u8; 2],
         /// Offset of the element header.
         start: u64,
         /// Offset just after the value.
@@ -59,7 +64,7 @@ pub enum IndexNode {
 }
 
 impl IndexNode {
-    fn tag(&self) -> Tag {
+    pub fn tag(&self) -> Tag {
         match self {
             IndexNode::Element { tag, .. }
             | IndexNode::Sequence { tag, .. }
@@ -79,6 +84,8 @@ pub struct IndexItem {
 /// The layout of a Part 10 file.
 #[derive(Debug, Clone)]
 pub struct FileIndex {
+    /// The file's modification time when indexed, to detect a replaced file.
+    modified: Option<std::time::SystemTime>,
     /// Offset of the first data set element (after the file meta information).
     dataset_start: u64,
     file_length: u64,
@@ -88,7 +95,9 @@ pub struct FileIndex {
 impl FileIndex {
     pub fn read(path: &str) -> Result<Self, String> {
         let file = File::open(path).map_err(|error| error.to_string())?;
-        let file_length = file.metadata().map_err(|error| error.to_string())?.len();
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        let file_length = metadata.len();
+        let modified = metadata.modified().ok();
         let mut reader = Reader {
             inner: BufReader::new(file),
             position: 0,
@@ -110,6 +119,7 @@ impl FileIndex {
         let dataset_start = reader.position;
         let nodes = read_nodes(&mut reader, file_length, |_| false)?;
         Ok(Self {
+            modified,
             dataset_start,
             file_length,
             nodes,
@@ -326,10 +336,13 @@ fn read_node(reader: &mut Reader) -> Result<IndexNode, String> {
         });
     }
     reader.skip(u64::from(length))?;
-    let vr_text = std::str::from_utf8(&vr).unwrap_or("UN");
+    let known_vr = std::str::from_utf8(&vr)
+        .ok()
+        .and_then(|text| VR::from_str(text).ok());
     Ok(IndexNode::Element {
         tag,
-        vr: VR::from_str(vr_text).unwrap_or(VR::UN),
+        vr: known_vr,
+        vr_bytes: vr,
         start,
         end: reader.position,
     })
@@ -348,8 +361,8 @@ pub fn write_spliced(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut file = File::open(source).map_err(|error| error.to_string())?;
-    let length = file.metadata().map_err(|error| error.to_string())?.len();
-    if length != index.file_length {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if metadata.len() != index.file_length || metadata.modified().ok() != index.modified {
         return Err("The file changed since it was opened".to_string());
     }
     let mut writer = SpliceWriter {
@@ -435,9 +448,9 @@ impl SpliceWriter<'_> {
             return self.copy(node_start(node), node_end(node));
         }
         match node {
-            IndexNode::Element { tag, vr, .. } => {
+            IndexNode::Element { tag, vr_bytes, .. } => {
                 let value = &self.replacements[&path];
-                self.write(&element_header(*tag, *vr, value.len())?)?;
+                self.write(&element_header(*tag, *vr_bytes, value.len())?)?;
                 self.write(value)
             }
             IndexNode::Sequence {
@@ -511,9 +524,9 @@ impl SpliceWriter<'_> {
             return original();
         }
         match node {
-            IndexNode::Element { tag, vr, .. } => {
+            IndexNode::Element { tag, vr_bytes, .. } => {
                 let value = &self.replacements[&path];
-                let header = element_header(*tag, *vr, value.len())?;
+                let header = element_header(*tag, *vr_bytes, value.len())?;
                 u32::try_from(header.len() + value.len())
                     .map_err(|_| "An element is too long".to_string())
             }
@@ -549,8 +562,7 @@ impl SpliceWriter<'_> {
     }
 }
 
-fn element_header(tag: Tag, vr: VR, length: usize) -> Result<Vec<u8>, String> {
-    let vr_bytes = vr.to_bytes();
+fn element_header(tag: Tag, vr_bytes: [u8; 2], length: usize) -> Result<Vec<u8>, String> {
     let mut header = Vec::with_capacity(12);
     header.extend_from_slice(&tag.group().to_le_bytes());
     header.extend_from_slice(&tag.element().to_le_bytes());

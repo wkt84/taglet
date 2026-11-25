@@ -663,22 +663,24 @@ fn apply_validated_nodes_to_object(
 /// Endian file, the original file is copied and only the edited values (and the lengths
 /// that change with them) are rewritten, so every other byte is kept (#8). Otherwise
 /// the object is written through dicom-rs by `save_object_with_nodes`.
+///
+/// Returns whether `object` now matches the saved file. After a spliced save it is
+/// left as it was, and callers should read the file again when they need it.
 pub fn save_file_with_nodes(
     source: &str,
     object: &mut DefaultDicomObject,
     nodes: &[DicomNode],
     text: &TextValues,
     destination: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some((index, replacements)) = plan_splice(source, object, nodes, text)? else {
-        return save_object_with_nodes(object, nodes, text, destination);
+        save_object_with_nodes(object, nodes, text, destination)?;
+        return Ok(true);
     };
     write_file_atomically_with(destination, |out| {
         splice::write_spliced(source, &index, &replacements, out)
     })?;
-    *object = open_full_object(destination)
-        .map_err(|error| format!("Saved, but the file could not be read back: {error}"))?;
-    Ok(())
+    Ok(false)
 }
 
 /// Work out the replacements for saving by splicing, or `None` when the edits need the
@@ -692,15 +694,21 @@ fn plan_splice(
     if !splice::supports_transfer_syntax(object.meta().transfer_syntax()) {
         return Ok(None);
     }
+    // The full writer also repairs file meta UIDs that disagree with the data set.
+    if file_meta_needs_sync(object) {
+        return Ok(None);
+    }
     let Ok(index) = splice::FileIndex::read(source) else {
         return Ok(None);
     };
     if !same_structure(nodes, index.nodes()) {
         return Ok(None);
     }
-    // Validates the nodes and finds the edited values, as the full writer does.
-    let mut candidate = object.clone();
-    let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
+    // Validate the nodes and find the edited values, as the full writer does, without
+    // copying the object.
+    validate_private_nodes(object, nodes)?;
+    let mut edited = HashSet::new();
+    collect_edited_paths(object, nodes, text, &mut edited)?;
     if !edited.is_empty() && has_group_length(index.nodes()) {
         return Ok(None);
     }
@@ -766,7 +774,8 @@ fn encode_spliced_value(
     } else if entered.is_ascii() {
         entered.as_bytes().to_vec()
     } else {
-        return Err(format!("{vr} values can only contain ASCII characters"));
+        // Leave non-ASCII text in these VRs to the full writer, as before.
+        return Ok(None);
     };
     if bytes.len() % 2 == 1 {
         bytes.push(if vr == VR::UI { 0 } else { b' ' });
@@ -793,34 +802,45 @@ fn shown_values(nodes: &[DicomNode]) -> HashMap<Vec<String>, String> {
 }
 
 /// Whether the nodes have exactly the elements, sequences and items of the file, i.e.
-/// nothing was added or removed. Elements from Pixel Data on are not shown as nodes.
+/// nothing was added or removed. Top-level elements from Pixel Data (7FE0,0010) on are
+/// never shown as nodes (the file is opened up to Pixel Data), so they cannot be
+/// edited or removed and are copied as they are.
 fn same_structure(nodes: &[DicomNode], index: &[splice::IndexNode]) -> bool {
-    fn node_shape(nodes: &[DicomNode], root: bool, out: &mut Vec<String>) {
+    let skipped = |root: bool, tag: Tag| root && tag >= PIXEL_DATA;
+
+    fn node_shape(
+        nodes: &[DicomNode],
+        root: bool,
+        skipped: &dyn Fn(bool, Tag) -> bool,
+        out: &mut Vec<String>,
+    ) {
         for node in nodes {
+            let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
+                node;
+            if parse_tag(tag).is_ok_and(|tag| skipped(root, tag)) {
+                continue;
+            }
             match node {
-                DicomNode::Element { tag, path, .. } => {
-                    if root && parse_tag(tag).is_ok_and(|tag| tag >= PIXEL_DATA) {
-                        continue;
-                    }
-                    out.push(path.join("/"));
-                }
-                DicomNode::Sequence { path, items, .. } => {
+                DicomNode::Element { .. } => out.push(path.join("/")),
+                DicomNode::Sequence { items, .. } => {
                     out.push(format!("{}#{}", path.join("/"), items.len()));
                     for item in items {
-                        node_shape(item, false, out);
+                        node_shape(item, false, skipped, out);
                     }
                 }
             }
         }
     }
-    fn index_shape(nodes: &[splice::IndexNode], parent: &[String], out: &mut Vec<String>) {
+
+    fn index_shape(
+        nodes: &[splice::IndexNode],
+        parent: &[String],
+        skipped: &dyn Fn(bool, Tag) -> bool,
+        out: &mut Vec<String>,
+    ) {
         for node in nodes {
-            let tag = match node {
-                splice::IndexNode::Element { tag, .. }
-                | splice::IndexNode::Sequence { tag, .. }
-                | splice::IndexNode::Opaque { tag, .. } => *tag,
-            };
-            if parent.is_empty() && tag >= PIXEL_DATA {
+            let tag = node.tag();
+            if skipped(parent.is_empty(), tag) {
                 continue;
             }
             let mut path = parent.to_vec();
@@ -831,20 +851,82 @@ fn same_structure(nodes: &[DicomNode], index: &[splice::IndexNode]) -> bool {
                     for (index, item) in items.iter().enumerate() {
                         let mut item_path = path.clone();
                         item_path.push(format!("Item#{index}"));
-                        index_shape(item.nodes(), &item_path, out);
+                        index_shape(item.nodes(), &item_path, skipped, out);
                     }
                 }
                 _ => out.push(path.join("/")),
             }
         }
     }
+
     let mut from_nodes = Vec::new();
-    node_shape(nodes, true, &mut from_nodes);
+    node_shape(nodes, true, &skipped, &mut from_nodes);
     let mut from_index = Vec::new();
-    index_shape(index, &[], &mut from_index);
+    index_shape(index, &[], &skipped, &mut from_index);
     from_nodes.sort();
     from_index.sort();
     from_nodes == from_index
+}
+
+/// Whether saving through the full writer would change the file meta information,
+/// which `sync_file_meta_from_dataset` updates from the data set's SOP UIDs.
+fn file_meta_needs_sync(object: &DefaultDicomObject) -> bool {
+    let meta = object.meta();
+    let differs = |dataset: Option<String>, meta_value: &str| {
+        dataset.is_some_and(|uid| uid != meta_value.trim_end_matches(['\0', ' ']))
+    };
+    differs(
+        get_uid_string(object, tags::SOP_CLASS_UID),
+        &meta.media_storage_sop_class_uid,
+    ) || differs(
+        get_uid_string(object, tags::SOP_INSTANCE_UID),
+        &meta.media_storage_sop_instance_uid,
+    )
+}
+
+/// The paths of editable values in `nodes` that differ from `obj`, compared the same
+/// way as when applying nodes, without changing `obj`.
+fn collect_edited_paths(
+    obj: &InMemDicomObject,
+    nodes: &[DicomNode],
+    text: &TextValues,
+    edited: &mut HashSet<Vec<String>>,
+) -> Result<(), String> {
+    for node in nodes {
+        match node {
+            DicomNode::Element {
+                tag,
+                vr,
+                value,
+                editable,
+                path,
+                ..
+            } if *editable => {
+                let tag = parse_tag(tag)?;
+                if tag == PIXEL_DATA {
+                    continue;
+                }
+                let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
+                let unchanged = match text.get(path) {
+                    Some(read) => read.decoded == trim_padding(value),
+                    None => element_has_value(obj, tag, vr, value),
+                };
+                if is_text_editable(vr) && !unchanged {
+                    edited.insert(path.clone());
+                }
+            }
+            DicomNode::Sequence { tag, items, .. } => {
+                let tag = parse_tag(tag)?;
+                if let Some(obj_items) = sequence_items(obj, tag) {
+                    for (item, item_nodes) in obj_items.iter().zip(items.iter()) {
+                        collect_edited_paths(item, item_nodes, text, edited)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn has_group_length(nodes: &[splice::IndexNode]) -> bool {
@@ -866,7 +948,7 @@ fn indexed_element_vr(nodes: &[splice::IndexNode], path: &[String]) -> Option<VR
         | splice::IndexNode::Opaque { tag, .. } => format_tag(*tag) == *first,
     })?;
     match (node, rest) {
-        (splice::IndexNode::Element { vr, .. }, []) => Some(*vr),
+        (splice::IndexNode::Element { vr, .. }, []) => *vr,
         (splice::IndexNode::Sequence { items, .. }, [item, rest @ ..]) => {
             let index = item.strip_prefix("Item#")?.parse::<usize>().ok()?;
             indexed_element_vr(items.get(index)?.nodes(), rest)
@@ -3638,7 +3720,7 @@ mod tests {
             &text,
             destination.to_str().unwrap(),
         )
-        .and_then(|()| std::fs::read(&destination).map_err(|error| error.to_string()));
+        .and_then(|_| std::fs::read(&destination).map_err(|error| error.to_string()));
         std::fs::remove_file(&destination).ok();
         result
     }
@@ -3824,12 +3906,131 @@ mod tests {
             save_file(&path, &nodes)
         };
         let too_long = save_with(&["(0010,0010)"], "山".repeat(30_000));
-        let not_ascii = save_with(&["(0008,0060)"], "ＲＴ".to_string());
+        // Non-ASCII text in a CS value is left to the full writer, as before.
+        let mut not_ascii = opened.clone();
+        *find_element_mut(&mut not_ascii, &["(0008,0060)"]).unwrap() = "ＲＴ".to_string();
+        let path_text = path.to_str().unwrap();
+        let planned = plan_splice(
+            path_text,
+            &open_full_object(path_text).unwrap(),
+            &not_ascii,
+            &TextValues::try_read(path_text).unwrap(),
+        )
+        .unwrap();
         let after = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert!(too_long.unwrap_err().contains("(0010,0010)"));
-        assert!(not_ascii.unwrap_err().contains("(0008,0060)"));
+        assert!(planned.is_none());
         assert_eq!(after, original);
+    }
+
+    #[test]
+    fn splice_transfer_syntaxes() {
+        for uid in [
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            "1.2.840.10008.1.2.4.50",
+            "1.2.840.10008.1.2.4.90",
+            "1.2.840.10008.1.2.5",
+        ] {
+            assert!(splice::supports_transfer_syntax(uid), "{uid}");
+        }
+        for uid in [
+            uids::IMPLICIT_VR_LITTLE_ENDIAN,
+            "1.2.840.10008.1.2.2",
+            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
+            "1.2.840.10008.1.20",
+        ] {
+            assert!(!splice::supports_transfer_syntax(uid), "{uid}");
+        }
+    }
+
+    fn plan_for(path: &std::path::Path, nodes: &[DicomNode]) -> bool {
+        let path_text = path.to_str().unwrap();
+        plan_splice(
+            path_text,
+            &open_full_object(path_text).unwrap(),
+            nodes,
+            &TextValues::try_read(path_text).unwrap(),
+        )
+        .unwrap()
+        .is_some()
+    }
+
+    /// Top-level elements after Pixel Data's tag, such as (FFFC,FFFC) padding, are not
+    /// shown as nodes; splicing keeps them, also in files without Pixel Data.
+    #[test]
+    fn trailing_elements_are_kept_when_splicing() {
+        let path = temp_path("splice-trailing.dcm");
+        let padding = explicit_long_element(0xFFFC, 0xFFFC, b"OB", &[0, 0]);
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            padding.clone(),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let shown = find_element(&nodes, "(FFFC,FFFC)").is_some();
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "ID002".to_string();
+        let planned = plan_for(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!shown);
+        assert!(planned);
+        assert!(saved.unwrap().ends_with(&padding));
+    }
+
+    /// The full writer repairs file meta UIDs that disagree with the data set.
+    #[test]
+    fn mismatched_file_meta_is_not_spliced() {
+        let path = temp_path("splice-meta.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192").into_iter().collect::<Vec<_>>(),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat()
+        .windows(1)
+        .map(|byte| byte[0])
+        .collect::<Vec<_>>();
+        // The data set says 1.2.3.4; make the meta say something else.
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(RTSTRUCT_SOP_CLASS)
+            .media_storage_sop_instance_uid("9.9.9")
+            .build()
+            .unwrap();
+        let mut file = vec![0_u8; 128];
+        file.extend_from_slice(b"DICM");
+        meta.write(&mut file).unwrap();
+        file.extend(dataset);
+        std::fs::write(&path, file).unwrap();
+        let nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let planned = plan_for(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!planned);
+    }
+
+    /// Elements with VR bytes that are not a known VR are not rewritten by splicing.
+    #[test]
+    fn unknown_vrs_are_not_spliced() {
+        let path = temp_path("splice-unknown-vr.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let index = splice::FileIndex::read(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let path_vec = vec!["(0010,0020)".to_string()];
+        assert_eq!(indexed_element_vr(index.nodes(), &path_vec), Some(VR::LO));
+        assert_eq!(
+            indexed_element_vr(index.nodes(), &["(0010,0030)".to_string()]),
+            None
+        );
     }
 }

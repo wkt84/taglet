@@ -244,8 +244,9 @@ fn save_to_path(
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
 ) -> Result<(), String> {
-    // Text is written through dicom-rs, which cannot write every value back with its
-    // original bytes (e.g. text in a character set set only inside a sequence item).
+    // Text values read from the original bytes: their character sets are used to
+    // encode edits, and the full dicom-rs writer (used when the edits cannot be spliced
+    // into the original file) is checked against them.
     let text = TextValues::try_read(&source_path)
         .map_err(|error| format!("Could not check text values before saving: {error}"))?;
 
@@ -265,7 +266,13 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    save_file_with_nodes(&source_path, object, &nodes, &text, &destination_path)?;
+    let object_matches_file =
+        save_file_with_nodes(&source_path, object, &nodes, &text, &destination_path)?;
+    if !object_matches_file {
+        // Saved by copying the original file with only the edited values rewritten;
+        // the object is read again from the file when needed.
+        stored.full = None;
+    }
     stored.rt_struct = None;
 
     if source_path != destination_path {
