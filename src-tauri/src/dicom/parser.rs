@@ -1094,7 +1094,14 @@ fn plan_splice(
     }
     let mut conversion_failures = Vec::new();
     if !converted.is_empty() {
-        match convert_text(index.nodes(), text, &converted, &edited, &diff.removed) {
+        match convert_text(
+            index.nodes(),
+            text,
+            &new_declarations,
+            &converted,
+            &edited,
+            &diff.removed,
+        ) {
             Ok(replacements) => edits.replacements.extend(replacements),
             Err(failures) => conversion_failures = failures,
         }
@@ -1182,9 +1189,14 @@ fn node_declarations(
 /// new character set (`converted`, by container path), so that they read the same.
 /// Values that are edited (encoded with the new character set by the caller) or
 /// removed are skipped. Fails with the values that cannot be converted.
+///
+/// `read` holds the data set and items that were read (as keys); items that were not
+/// (in sequences after Pixel Data) take their character set from the nearest one that
+/// was, so their text counts as unread when that one is converted.
 fn convert_text(
     index: &[splice::IndexNode],
     text: &TextValues,
+    read: &HashMap<Vec<String>, String>,
     converted: &HashMap<Vec<String>, TextCharset>,
     edited: &HashSet<Vec<String>>,
     removed: &HashSet<Vec<String>>,
@@ -1218,19 +1230,28 @@ fn convert_text(
     let mut replacements = HashMap::new();
     let mut failures = Vec::new();
     for (path, vr) in elements {
-        let container = &path[..path.len() - 1];
-        let Some(charset) = converted.get(container) else {
-            continue;
-        };
         // Elements of unknown VR (e.g. private elements in Implicit VR files, read as
         // UN) are bytes to Taglet, so they are kept as they are.
         let Some(vr) = vr.filter(|vr| is_charset_sensitive(*vr)) else {
             continue;
         };
+        let shown = path.join(" / ");
+        let mut container = &path[..path.len() - 1];
+        while !read.contains_key(container) && container.len() >= 2 {
+            container = &container[..container.len() - 2];
+        }
+        let Some(charset) = converted.get(container) else {
+            continue;
+        };
+        if !read.contains_key(&path[..path.len() - 1]) {
+            failures.push(format!(
+                "{shown} (it is not read, so it cannot be converted)"
+            ));
+            continue;
+        }
         if edited.contains(&path) || removed.contains(&path) {
             continue;
         }
-        let shown = path.join(" / ");
         let Some(read) = text.get(&path).filter(|read| read.vr == vr) else {
             // E.g. text after Pixel Data, which is not read.
             failures.push(format!(
@@ -4707,6 +4728,47 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("cannot be written"), "{error}");
+        assert_eq!(after, original);
+    }
+
+    /// Text in items after Pixel Data is not read; when it would take the converted
+    /// character set, saving stops instead of leaving it in the old one.
+    #[test]
+    fn unread_text_after_pixel_data_blocks_conversion() {
+        let path = temp_path("convert-trailing.dcm");
+        let mut pixel = Vec::new();
+        pixel.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        pixel.extend_from_slice(b"OW\0\0");
+        pixel.extend_from_slice(&4_u32.to_le_bytes());
+        pixel.extend_from_slice(&[1, 2, 3, 4]);
+        let rest = [
+            explicit_element(0x0010, 0x0010, b"PN", YAMADA_IR87),
+            pixel,
+            explicit_element(0x7FE1, 0x0010, b"LO", b"VENDOR"),
+            sequence(
+                0x7FE1,
+                0x1001,
+                &[explicit_element(0x7FE1, 0x1002, b"LO", PROSTATE_IR87)],
+                true,
+            ),
+        ]
+        .concat();
+        write_part10(&path, Some(b"\\ISO 2022 IR 87"), &rest);
+        let original = std::fs::read(&path).unwrap();
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0010)"], "Yamada^Tarou");
+        let unchanged_charset = save_file(&path, &nodes);
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let converted = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(unchanged_charset.is_ok());
+        let error = converted.unwrap_err();
+        assert!(
+            error.contains("(7FE1,1001) / Item#0 / (7FE1,1002) (it is not read"),
+            "{error}"
+        );
         assert_eq!(after, original);
     }
 
