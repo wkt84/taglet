@@ -668,6 +668,8 @@ pub fn save_object_with_nodes(
     let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
     prepare_text_for_writing(&mut candidate, text, &edited)?;
     sync_file_meta_from_dataset(&mut candidate);
+    let explicit_vr = candidate.meta().transfer_syntax() != uids::IMPLICIT_VR_LITTLE_ENDIAN;
+    ensure_value_lengths_fit(&candidate, explicit_vr)?;
     write_file_atomically(&candidate, destination)?;
     *object = candidate;
     Ok(())
@@ -1295,6 +1297,103 @@ fn prepare_text_values(
             _ => {}
         }
     }
+}
+
+/// Fail when a text value would not fit the 16-bit value length field that Explicit VR
+/// transfer syntaxes use for many VRs (at most 65,534 bytes after padding). dicom-rs
+/// truncates the length silently, which would leave a file that cannot be read.
+fn ensure_value_lengths_fit(obj: &InMemDicomObject, explicit_vr: bool) -> Result<(), String> {
+    if !explicit_vr {
+        return Ok(());
+    }
+    let mut failures = Vec::new();
+    let mut codec = SpecificCharacterSet::default();
+    collect_oversized_values(obj, &[], &mut codec, &mut failures);
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let shown = failures
+        .iter()
+        .take(5)
+        .map(|(path, length)| format!("{} ({length} bytes)", path.join(" / ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "Cannot save: these values are longer than the 65,534 bytes their VR allows in this transfer syntax: {shown}{}",
+        if failures.len() > 5 { "; ..." } else { "" }
+    ))
+}
+
+fn collect_oversized_values(
+    obj: &InMemDicomObject,
+    parent_path: &[String],
+    codec: &mut SpecificCharacterSet,
+    failures: &mut Vec<(Vec<String>, usize)>,
+) {
+    for element in obj.iter() {
+        let tag = element.tag();
+        let mut path = parent_path.to_vec();
+        path.push(format_tag(tag));
+        match element.value() {
+            Value::Sequence(sequence) => {
+                for (index, item) in sequence.items().iter().enumerate() {
+                    let mut item_path = path.clone();
+                    item_path.push(format!("Item#{index}"));
+                    collect_oversized_values(item, &item_path, codec, failures);
+                }
+            }
+            Value::Primitive(value) => {
+                let strings = match value {
+                    PrimitiveValue::Str(text) => vec![text.to_string()],
+                    PrimitiveValue::Strs(texts) => texts.to_vec(),
+                    _ => continue,
+                };
+                if has_16_bit_length(element.vr()) {
+                    // ASCII-only VRs have the same length in every codec dicom-rs uses.
+                    let length = dicom_rs_write(codec, &strings)
+                        .map_or_else(|| strings.join("\\").len(), |bytes| bytes.len());
+                    let padded = length + length % 2;
+                    if padded > 0xFFFE {
+                        failures.push((path.clone(), padded));
+                    }
+                }
+                if tag == tags::SPECIFIC_CHARACTER_SET {
+                    *codec =
+                        dicom_rs_codec_after(codec.clone(), strings.first().map(String::as_str));
+                }
+            }
+            Value::PixelSequence(_) => {}
+        }
+    }
+}
+
+/// VRs whose value length is a 16-bit field in Explicit VR transfer syntaxes
+/// (PS3.5 7.1.2).
+fn has_16_bit_length(vr: VR) -> bool {
+    matches!(
+        vr,
+        VR::AE
+            | VR::AS
+            | VR::AT
+            | VR::CS
+            | VR::DA
+            | VR::DS
+            | VR::DT
+            | VR::FL
+            | VR::FD
+            | VR::IS
+            | VR::LO
+            | VR::LT
+            | VR::PN
+            | VR::SH
+            | VR::SL
+            | VR::SS
+            | VR::ST
+            | VR::TM
+            | VR::UI
+            | VR::UL
+            | VR::US
+    )
 }
 
 /// `bytes` without trailing padding (spaces and NULs).
@@ -3173,5 +3272,45 @@ mod tests {
         result.unwrap();
         assert_eq!(after_second, after_first);
         assert!(contains(&after_first, b"\x1b$B;3\x1b(BA "));
+    }
+
+    /// Review on #9: values longer than a 16-bit length allows are rejected before the
+    /// file is replaced.
+    #[test]
+    fn values_too_long_for_explicit_vr_block_saving() {
+        let dir = temp_test_dir("too-long");
+        let path = dir.join("too-long.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let path_text = path.to_str().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let opened = open_nodes(path_text).unwrap().nodes;
+        let add = |vr: &str, tag: &str, value: String| {
+            let mut nodes = opened.clone();
+            nodes.push(DicomNode::Element {
+                tag: tag.to_string(),
+                vr: vr.to_string(),
+                inferred_vr: None,
+                description: String::new(),
+                value,
+                length: 0,
+                path: vec![tag.to_string()],
+                editable: true,
+            });
+            nodes
+        };
+        let too_long = add("PN", "(0008,1048)", vec!["=山"; 6554].join("\\"));
+        let fits = add("LT", "(0008,4000)", "山".repeat(10_000));
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let rejected = save_object_with_nodes(&mut obj, &too_long, &text, path_text);
+        let after_rejected = std::fs::read(&path).unwrap();
+        let accepted = save_object_with_nodes(&mut obj, &fits, &text, path_text);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        let error = rejected.unwrap_err();
+        assert!(error.contains("(0008,1048)"), "{error}");
+        assert_eq!(after_rejected, before);
+        accepted.unwrap();
     }
 }
