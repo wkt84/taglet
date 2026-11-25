@@ -604,10 +604,12 @@ fn apply_validated_nodes_to_object(
     // not shown as nodes, also when there is no Pixel Data (e.g. (FFFC,FFFC) padding or
     // (FFFA,FFFA) Digital Signatures Sequence). Keep them unless the nodes show them,
     // as they do for raw data sets read without file meta information.
+    // Only elements that are already in the object count: an element just added after
+    // Pixel Data's tag says nothing about how the nodes were read.
     let nodes_show_trailing = nodes
         .iter()
         .filter_map(|node| node_tag(node).ok())
-        .any(|tag| tag > PIXEL_DATA);
+        .any(|tag| tag > PIXEL_DATA && existing_tags.contains(&tag));
     let keep_trailing = has_pixel_data || (root && !nodes_show_trailing);
 
     for tag in existing_tags {
@@ -4257,5 +4259,37 @@ mod tests {
         assert_eq!(unchanged.unwrap(), original);
         assert!(edited_result.unwrap_err().contains("digital signatures"));
         assert!(removed_result.unwrap_err().contains("digital signatures"));
+    }
+
+    /// Review on #10: adding an element after Pixel Data's tag does not remove unshown
+    /// trailing elements.
+    #[test]
+    fn adding_a_trailing_element_keeps_unshown_ones() {
+        let path = temp_path("full-writer-add-trailing.dcm");
+        let padding = explicit_long_element(0xFFFC, 0xFFFC, b"OB", &[0, 0]);
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            padding,
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes.push(DicomNode::Element {
+            tag: "(8001,0010)".to_string(),
+            vr: "LO".to_string(),
+            inferred_vr: None,
+            description: String::new(),
+            value: "VENDOR".to_string(),
+            length: 0,
+            path: vec!["(8001,0010)".to_string()],
+            editable: true,
+        });
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert!(contains(&saved, b"VENDOR"));
+        assert!(contains(&saved, &[0xFC, 0xFF, 0xFC, 0xFF]));
     }
 }
