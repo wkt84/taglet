@@ -790,27 +790,65 @@ fn is_implicit_vr(object: &DefaultDicomObject) -> bool {
 /// VR they were read with, and tags not in the dictionary (read back as UN with their
 /// bytes kept), are left alone.
 fn ensure_vrs_match_dictionary(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<(), String> {
-    for node in nodes {
+    ensure_vrs_match_dictionary_in(obj, nodes, &mut None)
+}
+
+/// `signed_pixel_data` follows the last Pixel Representation (0028,0103) in file order,
+/// across items, the way dicom-rs reads US or SS elements (such as Smallest Image Pixel
+/// Value) from Implicit VR files: SS after a non-zero value, US otherwise.
+fn ensure_vrs_match_dictionary_in(
+    obj: &InMemDicomObject,
+    nodes: &[DicomNode],
+    signed_pixel_data: &mut Option<bool>,
+) -> Result<(), String> {
+    // The saved data set is in tag order.
+    let mut ordered = nodes
+        .iter()
+        .map(|node| {
+            let tag = match node {
+                DicomNode::Element { tag, .. } | DicomNode::Sequence { tag, .. } => tag,
+            };
+            parse_tag(tag).map(|tag| (tag, node))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ordered.sort_by_key(|(tag, _)| *tag);
+    for (parsed, node) in ordered {
         match node {
-            DicomNode::Element { tag, vr, path, .. } => {
-                let parsed = parse_tag(tag)?;
+            DicomNode::Element {
+                vr, value, path, ..
+            } => {
                 let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
-                if obj.get(parsed).is_some_and(|element| element.vr() == vr) {
+                let unchanged_vr = obj.get(parsed).is_some_and(|element| element.vr() == vr);
+                if parsed == tags::PIXEL_REPRESENTATION {
+                    if let Some(first) = value
+                        .split('\\')
+                        .next()
+                        .and_then(|first| first.trim().parse::<u16>().ok())
+                    {
+                        *signed_pixel_data = Some(first != 0);
+                    }
+                }
+                if unchanged_vr {
                     continue;
                 }
                 let Some(entry) = StandardDataDictionary.by_tag(parsed) else {
                     continue;
                 };
-                let allowed: &[VR] = match entry.vr() {
-                    VirtualVr::Exact(exact) => &[exact],
-                    VirtualVr::Xs => &[VR::US, VR::SS],
-                    VirtualVr::Ox | VirtualVr::Px => &[VR::OB, VR::OW],
-                    VirtualVr::Lt => &[VR::US, VR::SS, VR::OW],
+                let signed = [VR::SS];
+                let unsigned = [VR::US];
+                let (allowed, reason): (&[VR], &str) = match entry.vr() {
+                    VirtualVr::Exact(exact) => (&[exact], ""),
+                    VirtualVr::Xs if *signed_pixel_data == Some(true) => {
+                        (&signed, " after Pixel Representation 1")
+                    }
+                    VirtualVr::Xs => (&unsigned, " unless Pixel Representation 1 comes first"),
+                    VirtualVr::Ox | VirtualVr::Px => (&[VR::OB, VR::OW], ""),
+                    VirtualVr::Lt => (&[VR::US, VR::SS, VR::OW], ""),
                     _ => continue,
                 };
                 if !allowed.contains(&vr) {
                     return Err(format!(
-                        "Cannot save: {} has VR {vr}, but Implicit VR files do not store VRs and readers take it as {}.",
+                        "Cannot save: {} has VR {vr}, but Implicit VR files do not store VRs and readers take it as {}{reason}.",
                         path.join(" / "),
                         allowed
                             .iter()
@@ -820,13 +858,14 @@ fn ensure_vrs_match_dictionary(obj: &InMemDicomObject, nodes: &[DicomNode]) -> R
                     ));
                 }
             }
-            DicomNode::Sequence { tag, items, .. } => {
+            DicomNode::Sequence { items, .. } => {
                 let empty = InMemDicomObject::new_empty();
-                let obj_items = sequence_items(obj, parse_tag(tag)?).unwrap_or_default();
+                let obj_items = sequence_items(obj, parsed).unwrap_or_default();
                 for (index, item_nodes) in items.iter().enumerate() {
-                    ensure_vrs_match_dictionary(
+                    ensure_vrs_match_dictionary_in(
                         obj_items.get(index).unwrap_or(&empty),
                         item_nodes,
+                        signed_pixel_data,
                     )?;
                 }
             }
@@ -4551,6 +4590,52 @@ mod tests {
         assert!(matching.is_ok());
         assert!(private.is_ok());
         assert_eq!(after, original);
+    }
+
+    /// dicom-rs reads US or SS elements from Implicit VR files as SS only after a
+    /// non-zero Pixel Representation, so only that VR is accepted. (Elements with
+    /// numeric VRs cannot be added yet, so this is checked without saving.)
+    #[test]
+    fn implicit_vr_us_or_ss_elements_follow_pixel_representation() {
+        let check = |pixel_representation: Option<&str>, vr: &str| {
+            let mut nodes = Vec::new();
+            // Before Pixel Representation in the list, after it in tag order.
+            nodes.push(element_node("(0028,0106)", vr, "1", &[]));
+            if let Some(representation) = pixel_representation {
+                nodes.push(element_node("(0028,0103)", "US", representation, &[]));
+            }
+            ensure_vrs_match_dictionary(&InMemDicomObject::new_empty(), &nodes)
+        };
+        // Pixel Representation in an earlier item still applies, as dicom-rs reads it.
+        let mut in_items = vec![DicomNode::Sequence {
+            tag: "(0008,1115)".to_string(),
+            description: String::new(),
+            length: 0,
+            items: vec![vec![element_node(
+                "(0028,0103)",
+                "US",
+                "1",
+                &["(0008,1115)", "Item#0"],
+            )]],
+            path: vec!["(0008,1115)".to_string()],
+        }];
+        in_items.push(element_node("(0028,0106)", "SS", "-1", &[]));
+        let signed_after_item =
+            ensure_vrs_match_dictionary(&InMemDicomObject::new_empty(), &in_items);
+
+        let error = check(None, "SS").unwrap_err();
+        assert!(
+            error.contains("(0028,0106) has VR SS") && error.contains("as US"),
+            "{error}"
+        );
+        assert!(check(Some("0"), "SS").unwrap_err().contains("as US"));
+        assert!(check(Some("1"), "US")
+            .unwrap_err()
+            .contains("as SS after Pixel Representation 1"));
+        assert!(check(None, "US").is_ok());
+        assert!(check(Some("0"), "US").is_ok());
+        assert!(check(Some("1"), "SS").is_ok());
+        assert!(signed_after_item.is_ok());
     }
 
     /// Files that dicom-rs writes as Implicit VR, with private elements and nested
