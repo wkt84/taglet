@@ -22,7 +22,8 @@ use dicom_parser::stateful::decode::StatefulDecode;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 
 use super::charset::{
-    dicom_rs_codec_after, dicom_rs_round_trips, is_charset_sensitive, TextCharset,
+    dicom_rs_codec_after, dicom_rs_codec_is_byte_transparent, dicom_rs_round_trips,
+    is_charset_sensitive, TextCharset,
 };
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
@@ -39,6 +40,9 @@ pub struct TextValue {
     /// Whether dicom-rs writes the original bytes back unchanged when the file is saved
     /// without changes.
     pub round_trips: bool,
+    /// Whether the value can be edited: dicom-rs reads and writes it byte for byte, so
+    /// Taglet can hand it the bytes it encodes itself.
+    pub editable: bool,
 }
 
 /// Text values keyed by node path, e.g. `["(3006,0020)", "Item#0", "(3006,0026)"]`.
@@ -203,6 +207,7 @@ where
                             vr,
                             decoded: charset.decode(vr, &bytes),
                             round_trips: dicom_rs_round_trips(&dicom_rs_codec, vr, &bytes),
+                            editable: dicom_rs_codec_is_byte_transparent(&dicom_rs_codec),
                             read_codec: dicom_rs_codec.clone(),
                             bytes,
                         },

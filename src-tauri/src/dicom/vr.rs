@@ -147,7 +147,8 @@ fn validate_cs(value: &str) -> ValidationResult {
 }
 
 fn validate_text(value: &str, max_len: usize, vr: &str) -> ValidationResult {
-    if value.len() > max_len {
+    // DICOM limits these VRs by characters, not by bytes.
+    if value.chars().count() > max_len {
         return ValidationResult::invalid(format!("{vr} must be {max_len} characters or fewer"));
     }
     if value.chars().any(|c| c.is_control()) {
