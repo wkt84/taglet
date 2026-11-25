@@ -129,7 +129,7 @@ impl FileIndex {
             return Err("Unexpected structure in the file meta information".to_string());
         }
         let dataset_start = reader.position;
-        let transfer_syntax = read_transfer_syntax(path, &meta)?;
+        let transfer_syntax = read_transfer_syntax(&mut reader, &meta)?;
         if !supports_transfer_syntax(&transfer_syntax) {
             return Err(format!(
                 "Transfer syntax {transfer_syntax} is not supported"
@@ -157,20 +157,18 @@ impl FileIndex {
 }
 
 /// The Transfer Syntax UID (0002,0010) from the indexed file meta information.
-fn read_transfer_syntax(path: &str, meta: &[IndexNode]) -> Result<String, String> {
-    let Some(IndexNode::Element { start, end, .. }) =
-        meta.iter().find(|node| node.tag() == Tag(0x0002, 0x0010))
+fn read_transfer_syntax(reader: &mut Reader, meta: &[IndexNode]) -> Result<String, String> {
+    let Some(IndexNode::Element {
+        vr_bytes,
+        start,
+        end,
+        ..
+    }) = meta.iter().find(|node| node.tag() == Tag(0x0002, 0x0010))
     else {
         return Err("The file meta information has no transfer syntax".to_string());
     };
-    // An Explicit VR UI element has an 8-byte header.
-    let value_start = start + 8;
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    file.seek(SeekFrom::Start(value_start))
-        .map_err(|error| error.to_string())?;
-    let mut value = vec![0_u8; end.saturating_sub(value_start) as usize];
-    file.read_exact(&mut value)
-        .map_err(|error| error.to_string())?;
+    let header_length = if has_32_bit_length(vr_bytes) { 12 } else { 8 };
+    let value = reader.read_at(start + header_length, *end)?;
     Ok(String::from_utf8_lossy(&value)
         .trim_end_matches(['\0', ' '])
         .to_string())
@@ -191,6 +189,22 @@ struct Reader {
 }
 
 impl Reader {
+    /// Read the bytes from `start` to `end`, then return to the current position.
+    fn read_at(&mut self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        let position = self.position;
+        let mut buffer = vec![0_u8; end.saturating_sub(start) as usize];
+        self.inner
+            .seek(SeekFrom::Start(start))
+            .map_err(|error| error.to_string())?;
+        self.position = start;
+        self.read_exact(&mut buffer)?;
+        self.inner
+            .seek(SeekFrom::Start(position))
+            .map_err(|error| error.to_string())?;
+        self.position = position;
+        Ok(buffer)
+    }
+
     fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), String> {
         self.inner
             .read_exact(buffer)

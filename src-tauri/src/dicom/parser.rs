@@ -737,6 +737,10 @@ pub fn save_file_with_nodes(
     opened: Option<splice::FileStamp>,
     nodes_show_trailing: bool,
 ) -> Result<bool, String> {
+    // Implicit VR files do not store VRs, so readers take them from the dictionary.
+    if is_implicit_vr(object) {
+        ensure_vrs_match_dictionary(object, nodes)?;
+    }
     // Editing signed data would leave signatures that no longer verify.
     if has_digital_signatures(object) && nodes_change_object(object, nodes, text) {
         return Err(
@@ -770,6 +774,65 @@ pub fn save_file_with_nodes(
         splice::write_spliced(source, &index, &edits, out)
     })?;
     Ok(false)
+}
+
+fn is_implicit_vr(object: &DefaultDicomObject) -> bool {
+    object
+        .meta()
+        .transfer_syntax()
+        .trim_end_matches(['\0', ' '])
+        == uids::IMPLICIT_VR_LITTLE_ENDIAN
+}
+
+/// Fail when an element would be saved to an Implicit VR file with a VR other than the
+/// one readers take from the dictionary: its value would read back wrong, and a value
+/// read as a sequence would leave a file that cannot be opened. Elements kept with the
+/// VR they were read with, and tags not in the dictionary (read back as UN with their
+/// bytes kept), are left alone.
+fn ensure_vrs_match_dictionary(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<(), String> {
+    for node in nodes {
+        match node {
+            DicomNode::Element { tag, vr, path, .. } => {
+                let parsed = parse_tag(tag)?;
+                let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
+                if obj.get(parsed).is_some_and(|element| element.vr() == vr) {
+                    continue;
+                }
+                let Some(entry) = StandardDataDictionary.by_tag(parsed) else {
+                    continue;
+                };
+                let allowed: &[VR] = match entry.vr() {
+                    VirtualVr::Exact(exact) => &[exact],
+                    VirtualVr::Xs => &[VR::US, VR::SS],
+                    VirtualVr::Ox | VirtualVr::Px => &[VR::OB, VR::OW],
+                    VirtualVr::Lt => &[VR::US, VR::SS, VR::OW],
+                    _ => continue,
+                };
+                if !allowed.contains(&vr) {
+                    return Err(format!(
+                        "Cannot save: {} has VR {vr}, but Implicit VR files do not store VRs and readers take it as {}.",
+                        path.join(" / "),
+                        allowed
+                            .iter()
+                            .map(|vr| vr.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    ));
+                }
+            }
+            DicomNode::Sequence { tag, items, .. } => {
+                let empty = InMemDicomObject::new_empty();
+                let obj_items = sequence_items(obj, parse_tag(tag)?).unwrap_or_default();
+                for (index, item_nodes) in items.iter().enumerate() {
+                    ensure_vrs_match_dictionary(
+                        obj_items.get(index).unwrap_or(&empty),
+                        item_nodes,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Work out the edits for saving by splicing, or `None` when the changes need the
@@ -4366,8 +4429,8 @@ mod tests {
 
         let saved = saved.unwrap();
         let reopened = reopen("implicit-edit-reopened.dcm", &saved);
-        // Only the name and its 32-bit length field differ (both names are 13 bytes,
-        // padded to 14).
+        // Only the name differs: both names are 13 bytes, padded to 14, so even the
+        // length field is unchanged. Changed lengths are covered by the next test.
         let name = "山田^太郎".as_bytes();
         let name_start = original
             .windows(name.len())
@@ -4444,6 +4507,50 @@ mod tests {
             value_and_editable(&reopened, "(3006,0026)"),
             ("ﾊﾝ".to_string(), true)
         );
+    }
+
+    /// Implicit VR files do not store VRs, so an element added with a VR other than the
+    /// dictionary's would read back wrong; as a sequence, the file could not be opened.
+    #[test]
+    fn implicit_vr_elements_must_use_the_dictionary_vr() {
+        let path = temp_path("implicit-vr-check.dcm");
+        let original = write_implicit_mixed_charset_file(&path);
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let save_with = |added: DicomNode| {
+            let mut nodes = opened.clone();
+            nodes.insert(0, added);
+            save_file(&path, &nodes)
+        };
+        let as_sequence = save_with(element_node("(0008,1140)", "LO", "abc", &[]));
+        let as_text = save_with(element_node("(0028,0010)", "IS", "512", &[]));
+        let in_item = {
+            let mut nodes = opened.clone();
+            let Some(DicomNode::Sequence { items, .. }) = nodes.iter_mut().find(
+                |node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0020)"),
+            ) else {
+                panic!("sequence not found");
+            };
+            items[0].insert(
+                0,
+                element_node("(0008,1140)", "LO", "abc", &["(3006,0020)", "Item#0"]),
+            );
+            save_file(&path, &nodes)
+        };
+        let matching = save_with(element_node("(0008,1030)", "LO", "head", &[]));
+        let private = save_with(element_node("(0009,0010)", "LO", "VENDOR", &[]));
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let as_sequence = as_sequence.unwrap_err();
+        assert!(as_sequence.contains("(0008,1140)"), "{as_sequence}");
+        assert!(as_sequence.contains("SQ"), "{as_sequence}");
+        assert!(as_text.unwrap_err().contains("readers take it as US"));
+        assert!(in_item
+            .unwrap_err()
+            .contains("(3006,0020) / Item#0 / (0008,1140)"));
+        assert!(matching.is_ok());
+        assert!(private.is_ok());
+        assert_eq!(after, original);
     }
 
     /// Files that dicom-rs writes as Implicit VR, with private elements and nested
