@@ -639,7 +639,10 @@ fn apply_validated_nodes_to_object(
                 // Values decoded by Taglet are compared as shown, not with dicom-rs's
                 // string, which can differ from what was shown.
                 let unchanged = match text.get(path) {
-                    Some(read) => read.decoded == trim_padding(value),
+                    Some(read) => {
+                        read.decoded == trim_padding(value)
+                            && obj.get(tag).is_some_and(|element| element.vr() == vr)
+                    }
                     None => element_has_value(obj, tag, vr, value),
                 };
                 if is_text_editable(vr) && !unchanged {
@@ -678,8 +681,10 @@ fn apply_validated_nodes_to_object(
 /// that change with them) are rewritten, so every other byte is kept (#8). Otherwise
 /// the object is written through dicom-rs by `save_object_with_nodes`.
 ///
-/// `allow_splice` must be false when `source` may have changed since `object` and
-/// `nodes` were read from it; the full writer is used then.
+/// `opened` is the source file's stamp when `object` and `nodes` were read from it.
+/// Without one, the full writer is used. With one, the save fails if the file no longer
+/// matches it when it is indexed or just before it is replaced, so that changes made
+/// by another program are not overwritten.
 ///
 /// Returns whether `object` now matches the saved file. After a spliced save it is
 /// left as it was, and callers should read the file again when they need it.
@@ -689,7 +694,7 @@ pub fn save_file_with_nodes(
     nodes: &[DicomNode],
     text: &TextValues,
     destination: &str,
-    allow_splice: bool,
+    opened: Option<splice::FileStamp>,
 ) -> Result<bool, String> {
     // Editing signed data would leave signatures that no longer verify.
     if has_digital_signatures(object) && nodes_change_object(object, nodes, text) {
@@ -698,16 +703,19 @@ pub fn save_file_with_nodes(
                 .to_string(),
         );
     }
-    let planned = if allow_splice {
-        plan_splice(source, object, nodes, text)?
-    } else {
-        None
+    // Overwriting the source must not replace a file changed since it was opened.
+    let guard = opened
+        .filter(|_| source == destination)
+        .map(|stamp| (source, stamp));
+    let planned = match opened {
+        Some(stamp) => plan_splice(source, object, nodes, text, stamp)?,
+        None => None,
     };
     let Some((index, replacements)) = planned else {
-        save_object_with_nodes(object, nodes, text, destination)?;
+        save_object_with_nodes_guarded(object, nodes, text, destination, guard)?;
         return Ok(true);
     };
-    write_file_atomically_with(destination, |out| {
+    write_file_atomically_with(destination, guard, |out| {
         splice::write_spliced(source, &index, &replacements, out)
     })?;
     Ok(false)
@@ -720,6 +728,7 @@ fn plan_splice(
     object: &DefaultDicomObject,
     nodes: &[DicomNode],
     text: &TextValues,
+    opened: splice::FileStamp,
 ) -> Result<Option<(splice::FileIndex, splice::Replacements)>, String> {
     if !splice::supports_transfer_syntax(object.meta().transfer_syntax()) {
         return Ok(None);
@@ -731,6 +740,9 @@ fn plan_splice(
     let Ok(index) = splice::FileIndex::read(source) else {
         return Ok(None);
     };
+    if index.stamp() != Some(opened) {
+        return Err(FILE_CHANGED_ON_DISK.to_string());
+    }
     if !same_structure(nodes, index.nodes()) {
         return Ok(None);
     }
@@ -1017,7 +1029,10 @@ fn collect_edited_paths(
                 }
                 let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
                 let unchanged = match text.get(path) {
-                    Some(read) => read.decoded == trim_padding(value),
+                    Some(read) => {
+                        read.decoded == trim_padding(value)
+                            && obj.get(tag).is_some_and(|element| element.vr() == vr)
+                    }
                     None => element_has_value(obj, tag, vr, value),
                 };
                 if is_text_editable(vr) && !unchanged {
@@ -1068,11 +1083,27 @@ fn indexed_element_vr(nodes: &[splice::IndexNode], path: &[String]) -> Option<VR
 
 /// Apply nodes to a copy of `object`, check the text values and write the copy to
 /// `destination`. `object` is updated only when the file was written.
+#[cfg(test)]
 pub fn save_object_with_nodes(
     object: &mut DefaultDicomObject,
     nodes: &[DicomNode],
     text: &TextValues,
     destination: &str,
+) -> Result<(), String> {
+    save_object_with_nodes_guarded(object, nodes, text, destination, None)
+}
+
+/// The message for a file changed by another program since it was opened.
+pub const FILE_CHANGED_ON_DISK: &str = "The file was changed by another program after it was opened. Open it again before saving, so that those changes are not overwritten.";
+
+/// `save_object_with_nodes`, failing before the destination is replaced when the file
+/// at `guard`'s path no longer has `guard`'s stamp.
+fn save_object_with_nodes_guarded(
+    object: &mut DefaultDicomObject,
+    nodes: &[DicomNode],
+    text: &TextValues,
+    destination: &str,
+    guard: Option<(&str, splice::FileStamp)>,
 ) -> Result<(), String> {
     let mut candidate = object.clone();
     let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
@@ -1080,15 +1111,19 @@ pub fn save_object_with_nodes(
     sync_file_meta_from_dataset(&mut candidate);
     let explicit_vr = candidate.meta().transfer_syntax() != uids::IMPLICIT_VR_LITTLE_ENDIAN;
     ensure_value_lengths_fit(&candidate, explicit_vr)?;
-    write_file_atomically(&candidate, destination)?;
+    write_file_atomically(&candidate, destination, guard)?;
     *object = candidate;
     Ok(())
 }
 
 /// Write to a new temporary file next to `destination` and move it into place, so that
 /// a failed write never leaves `destination` truncated or replaced by a partial file.
-fn write_file_atomically(object: &DefaultDicomObject, destination: &str) -> Result<(), String> {
-    write_file_atomically_with(destination, |out| {
+fn write_file_atomically(
+    object: &DefaultDicomObject,
+    destination: &str,
+    guard: Option<(&str, splice::FileStamp)>,
+) -> Result<(), String> {
+    write_file_atomically_with(destination, guard, |out| {
         object.write_all(out).map_err(|error| error.to_string())
     })
 }
@@ -1096,10 +1131,17 @@ fn write_file_atomically(object: &DefaultDicomObject, destination: &str) -> Resu
 /// Like `write_file_atomically`, with the file content written by `write`.
 fn write_file_atomically_with(
     destination: &str,
+    guard: Option<(&str, splice::FileStamp)>,
     write: impl FnOnce(&mut dyn std::io::Write) -> Result<(), String>,
 ) -> Result<(), String> {
     let (temporary, file) = create_temporary_save_file(destination)?;
     let result = write_checked(file, write)
+        .and_then(|()| match guard {
+            Some((path, stamp)) if splice::file_stamp(path) != Some(stamp) => {
+                Err(FILE_CHANGED_ON_DISK.to_string())
+            }
+            _ => Ok(()),
+        })
         .and_then(|()| copy_existing_permissions(destination, &temporary))
         .and_then(|()| std::fs::rename(&temporary, destination).map_err(|error| error.to_string()));
     if result.is_err() {
@@ -3828,7 +3870,7 @@ mod tests {
             nodes,
             &text,
             destination.to_str().unwrap(),
-            true,
+            splice::file_stamp(source_text),
         )
         .and_then(|_| std::fs::read(&destination).map_err(|error| error.to_string()));
         std::fs::remove_file(&destination).ok();
@@ -3956,6 +3998,7 @@ mod tests {
             &open_full_object(path_text).unwrap(),
             &nodes,
             &TextValues::try_read(path_text).unwrap(),
+            splice::file_stamp(path_text).unwrap(),
         )
         .unwrap();
         assert!(planned.is_some(), "saving should splice");
@@ -3988,7 +4031,8 @@ mod tests {
         let path_text = path.to_str().unwrap();
         let object = open_full_object(path_text).unwrap();
         let text = TextValues::try_read(path_text).unwrap();
-        assert!(plan_splice(path_text, &object, &added, &text)
+        let stamp = splice::file_stamp(path_text).unwrap();
+        assert!(plan_splice(path_text, &object, &added, &text, stamp)
             .unwrap()
             .is_none());
         let added_result = save_file(&path, &added);
@@ -4025,6 +4069,7 @@ mod tests {
             &open_full_object(path_text).unwrap(),
             &not_ascii,
             &TextValues::try_read(path_text).unwrap(),
+            splice::file_stamp(path_text).unwrap(),
         )
         .unwrap();
         let after = std::fs::read(&path).unwrap();
@@ -4062,6 +4107,7 @@ mod tests {
             &open_full_object(path_text).unwrap(),
             nodes,
             &TextValues::try_read(path_text).unwrap(),
+            splice::file_stamp(path_text).unwrap(),
         )
         .unwrap()
         .is_some()
@@ -4291,5 +4337,74 @@ mod tests {
         let saved = saved.unwrap();
         assert!(contains(&saved, b"VENDOR"));
         assert!(contains(&saved, &[0xFC, 0xFF, 0xFC, 0xFF]));
+    }
+
+    /// Review on #10: a file changed after the stamp was taken is not overwritten, by
+    /// splicing or by the full writer.
+    #[test]
+    fn saving_fails_when_the_file_changed_after_opening() {
+        let dir = temp_test_dir("changed-while-saving");
+        let path = dir.join("changed.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let path_text = path.to_str().unwrap();
+        let opened_stamp = splice::file_stamp(path_text);
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "LocalID".to_string();
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        // Another program changes the file (here: its length) after it was opened.
+        let mut changed = std::fs::read(&path).unwrap();
+        changed.extend_from_slice(&explicit_long_element(0xFFFC, 0xFFFC, b"OB", &[0, 0]));
+        std::fs::write(&path, &changed).unwrap();
+
+        let spliced =
+            save_file_with_nodes(path_text, &mut obj, &nodes, &text, path_text, opened_stamp);
+        let mut added = nodes.clone();
+        added.push(DicomNode::Element {
+            tag: "(0008,1030)".to_string(),
+            vr: "LO".to_string(),
+            inferred_vr: None,
+            description: String::new(),
+            value: "HEAD".to_string(),
+            length: 0,
+            path: vec!["(0008,1030)".to_string()],
+            editable: true,
+        });
+        let full =
+            save_file_with_nodes(path_text, &mut obj, &added, &text, path_text, opened_stamp);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        assert_eq!(spliced.unwrap_err(), FILE_CHANGED_ON_DISK);
+        assert_eq!(full.unwrap_err(), FILE_CHANGED_ON_DISK);
+        assert_eq!(after, changed);
+    }
+
+    /// Review on #10: changing only the VR of an element (same value) is saved.
+    #[test]
+    fn changing_only_the_vr_is_saved() {
+        let path = temp_path("vr-only.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        if let Some(DicomNode::Element { vr, .. }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0020)"))
+        {
+            *vr = "SH".to_string();
+        }
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[0x10, 0x00, 0x20, 0x00]);
+        expected.extend_from_slice(b"SH");
+        assert!(contains(&saved, &expected));
     }
 }

@@ -375,6 +375,13 @@ pub fn write_spliced(
     writer.copy(index.dataset_end(), index.file_length)
 }
 
+impl FileIndex {
+    /// The file's length and modification time when it was indexed.
+    pub fn stamp(&self) -> Option<FileStamp> {
+        self.modified.map(|modified| (self.file_length, modified))
+    }
+}
+
 impl IndexItem {
     pub fn nodes(&self) -> &[IndexNode] {
         &self.nodes
@@ -570,8 +577,11 @@ fn checked_length(total: u64, what: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("{what} became too long"))
 }
 
+/// A file's length and modification time, to tell whether it changed.
+pub type FileStamp = (u64, std::time::SystemTime);
+
 /// The length and modification time of a file, to tell whether it changed.
-pub fn file_stamp(path: &str) -> Option<(u64, std::time::SystemTime)> {
+pub fn file_stamp(path: &str) -> Option<FileStamp> {
     let metadata = std::fs::metadata(path).ok()?;
     Some((metadata.len(), metadata.modified().ok()?))
 }

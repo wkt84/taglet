@@ -6,7 +6,9 @@ use dicom_object::DefaultDicomObject;
 use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
-use crate::dicom::parser::{open_full_object, open_nodes, rt_struct_data, save_file_with_nodes};
+use crate::dicom::parser::{
+    open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, FILE_CHANGED_ON_DISK,
+};
 use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
 
@@ -281,16 +283,13 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    // Splicing copies the file on disk, so it must be known to be the file the nodes
-    // came from.
-    let unchanged_on_disk = opened_stamp.is_some();
     let object_matches_file = save_file_with_nodes(
         &source_path,
         object,
         &nodes,
         &text,
         &destination_path,
-        unchanged_on_disk,
+        opened_stamp,
     )?;
     if !object_matches_file || source_path != destination_path {
         // After a spliced save the object is read again from the file when needed.
@@ -328,10 +327,7 @@ fn ensure_unchanged_since_opened(
     path: &str,
 ) -> Result<(), String> {
     if opened.is_some() && opened != file_stamp(path) {
-        return Err(
-            "The file was changed by another program after it was opened. Open it again before saving, so that those changes are not overwritten."
-                .to_string(),
-        );
+        return Err(FILE_CHANGED_ON_DISK.to_string());
     }
     Ok(())
 }
