@@ -583,7 +583,7 @@ pub fn apply_nodes_to_object_with_text(
 ) -> Result<HashSet<Vec<String>>, String> {
     validate_private_nodes(obj, nodes)?;
     let mut edited = HashSet::new();
-    apply_validated_nodes_to_object(obj, nodes, text, &mut edited)?;
+    apply_validated_nodes_to_object(obj, nodes, text, &mut edited, true)?;
     Ok(edited)
 }
 
@@ -592,6 +592,7 @@ fn apply_validated_nodes_to_object(
     nodes: &[DicomNode],
     text: &TextValues,
     edited: &mut HashSet<Vec<String>>,
+    root: bool,
 ) -> Result<(), String> {
     let desired_tags = nodes
         .iter()
@@ -599,9 +600,18 @@ fn apply_validated_nodes_to_object(
         .collect::<Result<HashSet<_>, _>>()?;
     let existing_tags = obj.iter().map(|element| element.tag()).collect::<Vec<_>>();
     let has_pixel_data = obj.get(PIXEL_DATA).is_some();
+    // Files are opened up to Pixel Data, so top-level elements from (7FE0,0010) on are
+    // not shown as nodes, also when there is no Pixel Data (e.g. (FFFC,FFFC) padding or
+    // (FFFA,FFFA) Digital Signatures Sequence). Keep them unless the nodes show them,
+    // as they do for raw data sets read without file meta information.
+    let nodes_show_trailing = nodes
+        .iter()
+        .filter_map(|node| node_tag(node).ok())
+        .any(|tag| tag > PIXEL_DATA);
+    let keep_trailing = has_pixel_data || (root && !nodes_show_trailing);
 
     for tag in existing_tags {
-        if has_pixel_data && tag >= PIXEL_DATA {
+        if keep_trailing && tag >= PIXEL_DATA {
             continue;
         }
         if tag != PIXEL_DATA && !desired_tags.contains(&tag) {
@@ -646,7 +656,9 @@ fn apply_validated_nodes_to_object(
                 obj.update_value(tag, |value| {
                     if let Some(sequence_items) = value.items_mut() {
                         for (item, next_nodes) in sequence_items.iter_mut().zip(items.iter()) {
-                            let _ = apply_validated_nodes_to_object(item, next_nodes, text, edited);
+                            let _ = apply_validated_nodes_to_object(
+                                item, next_nodes, text, edited, false,
+                            );
                         }
                     }
                 });
@@ -4074,5 +4086,67 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!planned);
+    }
+
+    /// Saving through the full writer keeps top-level elements after Pixel Data's tag in
+    /// files without Pixel Data; they are not shown as nodes, so they were not removed.
+    #[test]
+    fn full_writer_keeps_trailing_elements_without_pixel_data() {
+        let path = temp_path("full-writer-trailing.dcm");
+        let padding = explicit_long_element(0xFFFC, 0xFFFC, b"OB", &[0, 0]);
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            padding.clone(),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        // Adding an element needs the full writer.
+        nodes.push(DicomNode::Element {
+            tag: "(0008,1030)".to_string(),
+            vr: "LO".to_string(),
+            inferred_vr: None,
+            description: String::new(),
+            value: "HEAD".to_string(),
+            length: 0,
+            path: vec!["(0008,1030)".to_string()],
+            editable: true,
+        });
+        let planned = plan_for(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!planned);
+        let saved = saved.unwrap();
+        assert!(contains(&saved, b"HEAD"));
+        assert!(contains(&saved, &[0xFC, 0xFF, 0xFC, 0xFF]));
+    }
+
+    /// Raw data sets without file meta information show trailing elements as nodes, so
+    /// removing one of them removes it. (When all of them are removed, they cannot be
+    /// told apart from elements that were never shown, and are kept.)
+    #[test]
+    fn removing_a_shown_trailing_element_removes_it() {
+        let path = temp_path("raw-trailing.dcm");
+        let dataset = [
+            implicit_element(0x0008, 0x0060, b"RTSTRUCT"),
+            implicit_element(0x0010, 0x0020, b"ID001"),
+            implicit_element(0x7FE1, 0x0010, b"VENDOR"),
+            implicit_element(0xFFFC, 0xFFFC, b"\0\0"),
+        ]
+        .concat();
+        std::fs::write(&path, dataset).unwrap();
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        let shown = find_element(&nodes, "(FFFC,FFFC)").is_some();
+        remove_element(&mut nodes, "(FFFC,FFFC)");
+        let mut obj = open_full_object(path_text).unwrap();
+        apply_nodes_to_object(&mut obj, &nodes).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(shown);
+        assert!(obj.get(Tag(0xFFFC, 0xFFFC)).is_none());
+        assert!(obj.get(Tag(0x7FE1, 0x0010)).is_some());
     }
 }
