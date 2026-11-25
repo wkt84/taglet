@@ -242,6 +242,17 @@ npm run test:e2e -- --headed
 
 失敗時のスクリーンショットと trace は `test-results/` に保存されます。
 
+### Windows のテストビルド
+
+リリースとは別に、テスト用の Windows ビルドを GitHub Actions で作れます（`.github/workflows/test-build.yml`）。タグやリリースは作らず、自動アップデート用のファイルも作りません。
+
+- Actions タブの「Test Build (Windows)」で「Run workflow」を押し、ブランチを選んで実行する
+- または、Pull Request に `build:windows` ラベルを付ける（付けている間は、push のたびにビルドし直す）
+
+インストーラー（`.msi` / `.exe`）は、実行結果ページの Artifacts から zip でダウンロードできます（14 日間保存）。同時に Windows 上で `cargo test --lib` も実行します。コード署名はしていないため、起動時に SmartScreen の警告が出ます（「詳細情報」→「実行」で起動できます）。
+
+`Build Taglet`（`build.yml`）はリリース用です。ブランチで手動実行すると、ブランチ名のタグとリリースが作られるので、テストには使わないでください。
+
 ## ライセンス
 
 MIT
