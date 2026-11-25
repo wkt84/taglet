@@ -1265,13 +1265,18 @@ fn prepare_text_values(
                 let original = context.text.get(&path).filter(|original| {
                     !context.edited.contains(&path)
                         && dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
-                            .is_some_and(|read| read.join("\\") == stored.join("\\"))
+                            .is_some_and(|read| {
+                                trim_padding(&read.join("\\")) == trim_padding(&stored.join("\\"))
+                            })
                 });
                 match original {
                     Some(original) => {
-                        let keeps_value = dicom_rs_write(codec, &stored)
-                            .is_some_and(|written| written == original.bytes)
-                            && charset.decode(original.vr, &original.bytes) == original.decoded;
+                        // Odd-length values get a padding byte on disk, which values
+                        // Taglet stored after encoding do not have yet.
+                        let keeps_value = dicom_rs_write(codec, &stored).is_some_and(|written| {
+                            trim_padding_bytes(&written) == trim_padding_bytes(&original.bytes)
+                        }) && charset.decode(original.vr, &original.bytes)
+                            == original.decoded;
                         if !keeps_value {
                             let reason = "its bytes or meaning would change".to_string();
                             failures.push((path, reason));
@@ -1290,6 +1295,15 @@ fn prepare_text_values(
             _ => {}
         }
     }
+}
+
+/// `bytes` without trailing padding (spaces and NULs).
+fn trim_padding_bytes(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != b' ' && *byte != 0)
+        .map_or(0, |index| index + 1);
+    &bytes[..end]
 }
 
 /// Encode edited text. Returns `Ok(Some(parts))` with strings to store when dicom-rs
@@ -3133,5 +3147,31 @@ mod tests {
             error.contains("(3006,0020) / Item#0 / (3006,0026)"),
             "{error}"
         );
+    }
+
+    /// Review on #9: odd-length Japanese text, padded on disk, can be saved again from
+    /// the cached object.
+    #[test]
+    fn saving_odd_length_japanese_text_twice() {
+        let dir = temp_test_dir("odd-length");
+        let path = dir.join("odd-length.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "山A".to_string();
+        let mut obj = open_full_object(path_text).unwrap();
+
+        let first = TextValues::try_read(path_text).unwrap();
+        save_object_with_nodes(&mut obj, &nodes, &first, path_text).unwrap();
+        let after_first = std::fs::read(&path).unwrap();
+        let second = TextValues::try_read(path_text).unwrap();
+        let result = save_object_with_nodes(&mut obj, &nodes, &second, path_text);
+        let after_second = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        result.unwrap();
+        assert_eq!(after_second, after_first);
+        assert!(contains(&after_first, b"\x1b$B;3\x1b(BA "));
     }
 }
