@@ -249,6 +249,16 @@ fn save_to_path(
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
 ) -> Result<(), String> {
+    // The shown nodes come from the file as it was opened (or last saved). If another
+    // program changed it since, saving them would silently undo those changes.
+    let opened_stamp = store
+        .objects
+        .lock()
+        .map_err(|_| "DICOM store lock poisoned".to_string())?
+        .get(&source_path)
+        .and_then(|stored| stored.stamp);
+    ensure_unchanged_since_opened(opened_stamp, &source_path)?;
+
     // Text values read from the original bytes: their character sets are used to
     // encode edits, and the full dicom-rs writer (used when the edits cannot be spliced
     // into the original file) is checked against them.
@@ -271,8 +281,9 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    // Splicing copies the file on disk, so it must be the file the nodes came from.
-    let unchanged_on_disk = stored.stamp.is_some() && stored.stamp == file_stamp(&source_path);
+    // Splicing copies the file on disk, so it must be known to be the file the nodes
+    // came from.
+    let unchanged_on_disk = opened_stamp.is_some();
     let object_matches_file = save_file_with_nodes(
         &source_path,
         object,
@@ -308,4 +319,42 @@ fn save_to_path(
         .map_err(|_| "DICOM store lock poisoned".to_string())? = Some(destination_path);
 
     Ok(())
+}
+
+/// Fail when the file at `path` no longer has the length and modification time it had
+/// when it was opened (or last saved).
+fn ensure_unchanged_since_opened(
+    opened: Option<(u64, std::time::SystemTime)>,
+    path: &str,
+) -> Result<(), String> {
+    if opened.is_some() && opened != file_stamp(path) {
+        return Err(
+            "The file was changed by another program after it was opened. Open it again before saving, so that those changes are not overwritten."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_files_changed_after_opening() {
+        let path = std::env::temp_dir().join(format!("taglet-{}-stamp.dcm", std::process::id()));
+        std::fs::write(&path, b"original").unwrap();
+        let path_text = path.to_str().unwrap();
+        let opened = file_stamp(path_text);
+        let unchanged = ensure_unchanged_since_opened(opened, path_text);
+        std::fs::write(&path, b"changed by another program").unwrap();
+        let changed = ensure_unchanged_since_opened(opened, path_text);
+        std::fs::remove_file(&path).ok();
+
+        assert!(opened.is_some());
+        assert!(unchanged.is_ok());
+        assert!(changed.unwrap_err().contains("changed by another program"));
+        // Without a recorded stamp, saving is not blocked.
+        assert!(ensure_unchanged_since_opened(None, path_text).is_ok());
+    }
 }
