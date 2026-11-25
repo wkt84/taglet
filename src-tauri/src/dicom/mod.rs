@@ -1,3 +1,4 @@
+pub mod charset;
 pub mod model;
 pub mod parser;
 mod private;

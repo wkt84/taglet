@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 chrono = "0.4"
 base64 = "0.22"
 dicom-core = "0.7"
+encoding_rs = "0.8"
 dicom-dictionary-std = "0.7"
 dicom-encoding = "0.7"
 dicom-object = "0.7"

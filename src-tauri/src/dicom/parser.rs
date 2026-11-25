@@ -18,6 +18,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::str::FromStr;
 
+use super::charset::Iso2022Charset;
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
     RtPlanBeam, RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition,
@@ -57,6 +58,8 @@ const MISSING_FILE_META_WARNING: &str =
     "File meta information header is missing. The dataset was read as Implicit VR Little Endian.";
 const MAX_RAW_DISPLAY_VALUE_LENGTH: u32 = 1_048_576;
 const MAX_RAW_DISPLAY_ELEMENTS: usize = 20_000;
+const ISO2022_READ_ONLY_WARNING: &str =
+    "This file uses a Japanese ISO 2022 character set. Text containing Japanese characters is shown read-only; editing it is not supported yet.";
 const RAW_DATASET_START_GROUPS: &[u16] = &[
     0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x3006, 0x300A, 0x300C,
 ];
@@ -72,10 +75,15 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
             if pixel_data_likely_present(&obj) && !nodes.iter().any(is_pixel_data_node) {
                 nodes.push(pixel_data_placeholder_node());
             }
+            let warnings = if dataset_charset(&obj, None).is_some() {
+                vec![ISO2022_READ_ONLY_WARNING.to_string()]
+            } else {
+                Vec::new()
+            };
             Ok(DicomFileContent {
                 file_meta,
                 nodes,
-                warnings: Vec::new(),
+                warnings,
             })
         }
         Err(standard_error) => {
@@ -84,10 +92,14 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
                     "Could not read as DICOM Part 10 ({standard_error}) or raw Implicit VR Little Endian dataset ({raw_error})"
                 )
             })?;
+            let mut warnings = vec![MISSING_FILE_META_WARNING.to_string()];
+            if nodes_declare_iso2022(&nodes) {
+                warnings.push(ISO2022_READ_ONLY_WARNING.to_string());
+            }
             Ok(DicomFileContent {
                 file_meta: Vec::new(),
                 nodes,
-                warnings: vec![MISSING_FILE_META_WARNING.to_string()],
+                warnings,
             })
         }
     }
@@ -353,6 +365,7 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
         });
     };
 
+    let charset = dataset_charset(obj, None);
     let beams = beam_items
         .iter()
         .enumerate()
@@ -364,7 +377,11 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
             RtPlanBeam {
                 beam_index,
                 beam_number: get_i32(beam, BEAM_NUMBER),
-                beam_name: get_string(beam, BEAM_NAME),
+                beam_name: get_text(
+                    beam,
+                    BEAM_NAME,
+                    dataset_charset(beam, charset.as_ref()).as_ref(),
+                ),
                 devices: beam_limiting_device_definitions(beam),
                 control_points,
             }
@@ -384,6 +401,7 @@ pub fn rt_plan_bev_info(obj: &DefaultDicomObject) -> Result<RtPlanBevInfo, Strin
 }
 
 pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> {
+    let charset = dataset_charset(obj, None);
     let modality = get_string(obj, tags::MODALITY);
     if modality.as_deref() != Some("RTSTRUCT") {
         return Ok(RtStructData {
@@ -393,7 +411,7 @@ pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> 
                     "RT Structure Set viewer is available for RTSTRUCT objects only".to_string(),
                 ),
                 modality,
-                structure_set_label: get_string(obj, STRUCTURE_SET_LABEL),
+                structure_set_label: get_text(obj, STRUCTURE_SET_LABEL, charset.as_ref()),
                 rois: Vec::new(),
                 slices: Vec::new(),
                 bounds: None,
@@ -402,7 +420,7 @@ pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> 
         });
     }
 
-    let roi_names = structure_set_roi_names(obj);
+    let roi_names = structure_set_roi_names(obj, charset.as_ref());
     let roi_contours = rt_struct_contours(obj, &roi_names);
     let rois = rt_struct_rois(obj, &roi_names, &roi_contours);
     let slices = rt_struct_slices(&roi_contours);
@@ -418,7 +436,7 @@ pub fn rt_struct_data(obj: &DefaultDicomObject) -> Result<RtStructData, String> 
                 Some("ROI Contour Sequence is missing or contains no contour data".to_string())
             },
             modality,
-            structure_set_label: get_string(obj, STRUCTURE_SET_LABEL),
+            structure_set_label: get_text(obj, STRUCTURE_SET_LABEL, charset.as_ref()),
             rois,
             slices,
             bounds,
@@ -477,6 +495,15 @@ pub fn rt_struct_slice_contours_from_data(
 }
 
 pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<DicomNode> {
+    object_to_nodes_with_charset(obj, parent_path, None)
+}
+
+fn object_to_nodes_with_charset(
+    obj: &InMemDicomObject,
+    parent_path: Vec<String>,
+    inherited_charset: Option<&Iso2022Charset>,
+) -> Vec<DicomNode> {
+    let charset = dataset_charset(obj, inherited_charset);
     obj.iter()
         .map(|element| {
             let tag = element.tag();
@@ -497,7 +524,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                         .map(|(index, item)| {
                             let mut item_path = path.clone();
                             item_path.push(format!("Item#{index}"));
-                            object_to_nodes(item, item_path)
+                            object_to_nodes_with_charset(item, item_path, charset.as_ref())
                         })
                         .collect(),
                 },
@@ -514,6 +541,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                 _ => {
                     let vr = element.header().vr();
                     let (value, inferred_vr) = display_element_value(tag, vr, element.value());
+                    let (value, redecoded) = redecode_text(charset.as_ref(), vr, value);
                     DicomNode::Element {
                         tag: tag_text,
                         vr: vr.to_string().to_owned(),
@@ -522,7 +550,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                         value,
                         length: length_to_u32(element.length()),
                         path,
-                        editable: tag != PIXEL_DATA && is_text_editable(vr),
+                        editable: tag != PIXEL_DATA && is_text_editable(vr) && !redecoded,
                     }
                 }
             }
@@ -679,7 +707,7 @@ fn read_raw_implicit_vr_little_endian_nodes(path: &str) -> Result<Vec<DicomNode>
     let mut reader =
         LazyDataSetReader::new_with_ts_cs(file, transfer_syntax, SpecificCharacterSet::default())
             .map_err(|error| error.to_string())?;
-    let (mut nodes, found_pixel_data) = read_dataset_nodes(&mut reader, Vec::new(), false)?;
+    let (mut nodes, found_pixel_data) = read_dataset_nodes(&mut reader, Vec::new(), false, None)?;
     if found_pixel_data && !nodes.iter().any(is_pixel_data_node) {
         nodes.push(pixel_data_placeholder_node());
     }
@@ -718,11 +746,13 @@ fn read_dataset_nodes<S>(
     reader: &mut LazyDataSetReader<S>,
     parent_path: Vec<String>,
     stop_at_item_end: bool,
+    inherited_charset: Option<&Iso2022Charset>,
 ) -> Result<(Vec<DicomNode>, bool), String>
 where
     S: StatefulDecode,
 {
     let mut nodes = Vec::new();
+    let mut charset = inherited_charset.cloned();
 
     loop {
         let Some(token) = next_data_token(reader)? else {
@@ -753,12 +783,16 @@ where
                         format_tag(header.tag)
                     ));
                 };
+                if header.tag == tags::SPECIFIC_CHARACTER_SET {
+                    charset = charset_from_value(&value);
+                }
                 nodes.push(primitive_token_to_node(
                     header.tag,
                     header.vr,
                     header.len,
                     value,
                     &parent_path,
+                    charset.as_ref(),
                 ));
             }
             token @ LazyDataToken::LazyValue { header, .. } => {
@@ -783,19 +817,24 @@ where
                 let DataToken::PrimitiveValue(value) = value_token else {
                     return Err(format!("Unexpected DICOM value token {value_token}"));
                 };
+                if tag == tags::SPECIFIC_CHARACTER_SET {
+                    charset = charset_from_value(&value);
+                }
                 nodes.push(primitive_token_to_node(
                     tag,
                     vr,
                     length,
                     value,
                     &parent_path,
+                    charset.as_ref(),
                 ));
             }
             LazyDataToken::SequenceStart { tag, len } => {
                 let tag_text = format_tag(tag);
                 let mut path = parent_path.clone();
                 path.push(tag_text.clone());
-                let (items, found_pixel_data) = read_sequence_items(reader, path.clone())?;
+                let (items, found_pixel_data) =
+                    read_sequence_items(reader, path.clone(), charset.as_ref())?;
                 nodes.push(DicomNode::Sequence {
                     tag: tag_text,
                     description: description_for(tag),
@@ -832,6 +871,7 @@ where
 fn read_sequence_items<S>(
     reader: &mut LazyDataSetReader<S>,
     sequence_path: Vec<String>,
+    charset: Option<&Iso2022Charset>,
 ) -> Result<(Vec<Vec<DicomNode>>, bool), String>
 where
     S: StatefulDecode,
@@ -847,7 +887,8 @@ where
             LazyDataToken::ItemStart { .. } => {
                 let mut item_path = sequence_path.clone();
                 item_path.push(format!("Item#{}", items.len()));
-                let (nodes, found_pixel_data) = read_dataset_nodes(reader, item_path, true)?;
+                let (nodes, found_pixel_data) =
+                    read_dataset_nodes(reader, item_path, true, charset)?;
                 items.push(nodes);
                 if found_pixel_data {
                     return Ok((items, true));
@@ -879,12 +920,14 @@ fn primitive_token_to_node(
     length: Length,
     value: PrimitiveValue,
     parent_path: &[String],
+    charset: Option<&Iso2022Charset>,
 ) -> DicomNode {
     let tag_text = format_tag(tag);
     let mut path = parent_path.to_vec();
     path.push(tag_text.clone());
     let value = Value::Primitive(value);
     let (value, inferred_vr) = display_element_value(tag, vr, &value);
+    let (value, redecoded) = redecode_text(charset, vr, value);
 
     DicomNode::Element {
         tag: tag_text,
@@ -894,7 +937,7 @@ fn primitive_token_to_node(
         value,
         length: length_to_u32(length),
         path,
-        editable: tag != PIXEL_DATA && is_text_editable(vr),
+        editable: tag != PIXEL_DATA && is_text_editable(vr) && !redecoded,
     }
 }
 
@@ -943,6 +986,50 @@ fn display_value(value: &Value<InMemDicomObject>) -> String {
         Value::PixelSequence(_) => "[Binary Data]".to_string(),
         Value::Sequence(sequence) => format!("[Sequence: {} item(s)]", sequence.items().len()),
     }
+}
+
+/// The Japanese ISO 2022 character set in effect for a dataset or sequence item.
+/// A Specific Character Set in the item itself overrides the inherited one.
+fn dataset_charset(
+    obj: &InMemDicomObject,
+    inherited: Option<&Iso2022Charset>,
+) -> Option<Iso2022Charset> {
+    match obj.get(tags::SPECIFIC_CHARACTER_SET) {
+        Some(element) => element
+            .to_str()
+            .ok()
+            .and_then(|value| Iso2022Charset::from_specific_character_set(&value)),
+        None => inherited.cloned(),
+    }
+}
+
+fn charset_from_value(value: &PrimitiveValue) -> Option<Iso2022Charset> {
+    Iso2022Charset::from_specific_character_set(&value.to_str())
+}
+
+fn nodes_declare_iso2022(nodes: &[DicomNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        DicomNode::Element { tag, value, .. } => {
+            tag == "(0008,0005)" && Iso2022Charset::from_specific_character_set(value).is_some()
+        }
+        DicomNode::Sequence { .. } => false,
+    })
+}
+
+/// Re-decode text that dicom-rs read without Japanese ISO 2022 support.
+/// The returned flag is true when the value was re-decoded; such values are read-only
+/// so that saving writes back the original bytes.
+fn redecode_text(charset: Option<&Iso2022Charset>, vr: VR, value: String) -> (String, bool) {
+    match charset.and_then(|charset| charset.redecode(vr, &value)) {
+        Some(decoded) => (decoded, true),
+        None => (value, false),
+    }
+}
+
+fn get_text(obj: &InMemDicomObject, tag: Tag, charset: Option<&Iso2022Charset>) -> Option<String> {
+    let element = obj.get(tag)?;
+    let value = get_string(obj, tag)?;
+    Some(redecode_text(charset, element.vr(), value).0)
 }
 
 fn display_element_value(
@@ -1149,14 +1236,17 @@ fn sequence_items(obj: &InMemDicomObject, tag: Tag) -> Option<&[InMemDicomObject
     })
 }
 
-fn structure_set_roi_names(obj: &InMemDicomObject) -> HashMap<i32, String> {
+fn structure_set_roi_names(
+    obj: &InMemDicomObject,
+    charset: Option<&Iso2022Charset>,
+) -> HashMap<i32, String> {
     sequence_items(obj, STRUCTURE_SET_ROI_SEQUENCE)
         .map(|items| {
             items
                 .iter()
                 .filter_map(|item| {
                     let roi_number = get_i32(item, ROI_NUMBER)?;
-                    let name = get_string(item, ROI_NAME)?;
+                    let name = get_text(item, ROI_NAME, dataset_charset(item, charset).as_ref())?;
                     Some((roi_number, name))
                 })
                 .collect()
@@ -1193,7 +1283,7 @@ fn rt_struct_rois(
                     let roi_number = get_i32(item, ROI_NUMBER)?;
                     Some(RtStructRoi {
                         roi_number,
-                        name: get_string(item, ROI_NAME),
+                        name: roi_names.get(&roi_number).cloned(),
                         color: colors.get(&roi_number).copied(),
                         contour_count: *contour_counts.get(&roi_number).unwrap_or(&0),
                     })
@@ -1807,5 +1897,217 @@ mod tests {
                 .unwrap();
             assert_eq!(encoded, expected);
         }
+    }
+
+    /// PS3.5 Annex H.3.1, JIS X 0208 with ASCII.
+    const YAMADA_IR87: &[u8] =
+        b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B=\x1b$B$d$^$@\x1b(B^\x1b$B$?$m$&\x1b(B";
+    /// "前立腺" (prostate) in JIS X 0208.
+    const PROSTATE_IR87: &[u8] = b"\x1b$BA0N)A#\x1b(B";
+
+    fn explicit_element(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(if vr == b"UI" { 0 } else { b' ' });
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(vr);
+        out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn implicit_element(group: u16, element: u16, value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(b' ');
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn undefined_length_sequence(group: u16, element: u16, items: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(b"SQ\0\0");
+        out.extend_from_slice(&u32::MAX.to_le_bytes());
+        for item in items {
+            out.extend_from_slice(&[0xFE, 0xFF, 0x00, 0xE0]);
+            out.extend_from_slice(&u32::MAX.to_le_bytes());
+            out.extend_from_slice(item);
+            out.extend_from_slice(&[0xFE, 0xFF, 0x0D, 0xE0, 0, 0, 0, 0]);
+        }
+        out.extend_from_slice(&[0xFE, 0xFF, 0xDD, 0xE0, 0, 0, 0, 0]);
+        out
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("taglet-{}-{name}", std::process::id()))
+    }
+
+    /// A Part 10 RT Structure Set with Japanese text in the dataset and in a sequence item.
+    fn write_iso2022_rtstruct(path: &std::path::Path, charset: &str) {
+        let sop_class = b"1.2.840.10008.5.1.4.1.1.481.3";
+        let mut dataset = Vec::new();
+        dataset.extend(explicit_element(0x0008, 0x0005, b"CS", charset.as_bytes()));
+        dataset.extend(explicit_element(0x0008, 0x0016, b"UI", sop_class));
+        dataset.extend(explicit_element(0x0008, 0x0018, b"UI", b"1.2.3.4"));
+        dataset.extend(explicit_element(0x0008, 0x0060, b"CS", b"RTSTRUCT"));
+        dataset.extend(explicit_element(0x0010, 0x0010, b"PN", YAMADA_IR87));
+        dataset.extend(explicit_element(0x0010, 0x0020, b"LO", b"ID001"));
+        dataset.extend(undefined_length_sequence(
+            0x3006,
+            0x0020,
+            &[[
+                explicit_element(0x3006, 0x0022, b"IS", b"1"),
+                explicit_element(0x3006, 0x0026, b"LO", PROSTATE_IR87),
+            ]
+            .concat()],
+        ));
+
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(std::str::from_utf8(sop_class).unwrap())
+            .media_storage_sop_instance_uid("1.2.3.4")
+            .build()
+            .unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(&[0; 128]);
+        file.extend_from_slice(b"DICM");
+        meta.write(&mut file).unwrap();
+        file.extend(dataset);
+        std::fs::write(path, file).unwrap();
+    }
+
+    fn find_element<'a>(nodes: &'a [DicomNode], wanted: &str) -> Option<&'a DicomNode> {
+        nodes.iter().find_map(|node| match node {
+            DicomNode::Element { tag, .. } if tag == wanted => Some(node),
+            DicomNode::Sequence { items, .. } => {
+                items.iter().find_map(|item| find_element(item, wanted))
+            }
+            _ => None,
+        })
+    }
+
+    fn element_value_and_editable(nodes: &[DicomNode], wanted: &str) -> (String, bool) {
+        match find_element(nodes, wanted) {
+            Some(DicomNode::Element {
+                value, editable, ..
+            }) => (value.clone(), *editable),
+            _ => panic!("{wanted} not found"),
+        }
+    }
+
+    #[test]
+    fn displays_iso2022_japanese_text_read_only() {
+        for charset in [
+            "\\ISO 2022 IR 87",
+            "ISO 2022 IR 87",
+            "ISO 2022 IR 6\\ISO 2022 IR 87",
+        ] {
+            let path = temp_path("iso2022-display.dcm");
+            write_iso2022_rtstruct(&path, charset);
+            let content = open_nodes(path.to_str().unwrap()).unwrap();
+            std::fs::remove_file(&path).ok();
+
+            assert_eq!(
+                element_value_and_editable(&content.nodes, "(0010,0010)"),
+                ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), false),
+                "{charset:?}"
+            );
+            assert_eq!(
+                element_value_and_editable(&content.nodes, "(3006,0026)"),
+                ("前立腺".to_string(), false),
+                "{charset:?}"
+            );
+            // ASCII-only text stays editable.
+            assert_eq!(
+                element_value_and_editable(&content.nodes, "(0010,0020)"),
+                ("ID001".to_string(), true)
+            );
+            assert!(content
+                .warnings
+                .iter()
+                .any(|warning| warning == ISO2022_READ_ONLY_WARNING));
+        }
+    }
+
+    #[test]
+    fn rt_struct_roi_names_use_iso2022_decoding() {
+        let path = temp_path("iso2022-roi.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let obj = open_full_object(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let data = rt_struct_data(&obj).unwrap();
+        let names = data
+            .info
+            .rois
+            .iter()
+            .map(|roi| roi.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![Some("前立腺".to_string())]);
+    }
+
+    #[test]
+    fn saving_iso2022_file_preserves_original_bytes() {
+        let source = temp_path("iso2022-save-source.dcm");
+        let destination = temp_path("iso2022-save-destination.dcm");
+        write_iso2022_rtstruct(&source, "\\ISO 2022 IR 87");
+
+        let nodes = open_nodes(source.to_str().unwrap()).unwrap().nodes;
+        let mut obj = open_full_object(source.to_str().unwrap()).unwrap();
+        apply_nodes_to_object(&mut obj, &nodes).unwrap();
+        obj.write_to_file(&destination).unwrap();
+        let written = std::fs::read(&destination).unwrap();
+        std::fs::remove_file(&source).ok();
+        std::fs::remove_file(&destination).ok();
+
+        let contains = |needle: &[u8]| written.windows(needle.len()).any(|w| w == needle);
+        assert!(contains(YAMADA_IR87));
+        assert!(contains(PROSTATE_IR87));
+        assert!(contains(b"\\ISO 2022 IR 87"));
+    }
+
+    #[test]
+    fn raw_dataset_fallback_decodes_iso2022_text() {
+        let path = temp_path("iso2022-raw.dcm");
+        let dataset = [
+            implicit_element(0x0008, 0x0005, b"\\ISO 2022 IR 87"),
+            implicit_element(0x0008, 0x0060, b"RTSTRUCT"),
+            implicit_element(0x0010, 0x0010, YAMADA_IR87),
+        ]
+        .concat();
+        std::fs::write(&path, dataset).unwrap();
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            element_value_and_editable(&content.nodes, "(0010,0010)"),
+            ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), false)
+        );
+        assert!(content
+            .warnings
+            .iter()
+            .any(|warning| warning == ISO2022_READ_ONLY_WARNING));
+    }
+
+    #[test]
+    fn files_without_japanese_charset_are_unchanged() {
+        let path = temp_path("latin1.dcm");
+        write_iso2022_rtstruct(&path, "ISO_IR 100");
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let (_, editable) = element_value_and_editable(&content.nodes, "(0010,0010)");
+        assert!(editable);
+        assert!(content.warnings.is_empty());
     }
 }
