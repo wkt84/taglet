@@ -6,10 +6,7 @@ use dicom_object::DefaultDicomObject;
 use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
-use crate::dicom::parser::{
-    apply_nodes_to_object, ensure_text_round_trips, open_full_object, open_nodes, rt_struct_data,
-    sync_file_meta_from_dataset,
-};
+use crate::dicom::parser::{open_full_object, open_nodes, rt_struct_data, save_object_with_nodes};
 use crate::dicom::text_values::TextValues;
 
 struct StoredDicomObject {
@@ -268,13 +265,8 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    apply_nodes_to_object(object, &nodes)?;
-    ensure_text_round_trips(object, &text)?;
-    sync_file_meta_from_dataset(object);
+    save_object_with_nodes(object, &nodes, &text, &destination_path)?;
     stored.rt_struct = None;
-    object
-        .write_to_file(&destination_path)
-        .map_err(|error| error.to_string())?;
 
     if source_path != destination_path {
         objects.insert(

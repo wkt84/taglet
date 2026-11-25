@@ -19,7 +19,9 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::str::FromStr;
 
-use super::charset::{dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, trim_padding};
+use super::charset::{
+    dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, trim_padding, TextCharset,
+};
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
     RtPlanBeam, RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition,
@@ -629,6 +631,25 @@ fn apply_validated_nodes_to_object(
     Ok(())
 }
 
+/// Apply nodes to a copy of `object`, check the text values and write the copy to
+/// `destination`. `object` is updated only when the file was written.
+pub fn save_object_with_nodes(
+    object: &mut DefaultDicomObject,
+    nodes: &[DicomNode],
+    text: &TextValues,
+    destination: &str,
+) -> Result<(), String> {
+    let mut candidate = object.clone();
+    apply_nodes_to_object(&mut candidate, nodes)?;
+    ensure_text_round_trips(&candidate, text)?;
+    sync_file_meta_from_dataset(&mut candidate);
+    candidate
+        .write_to_file(destination)
+        .map_err(|error| error.to_string())?;
+    *object = candidate;
+    Ok(())
+}
+
 pub fn sync_file_meta_from_dataset(obj: &mut DefaultDicomObject) {
     let sop_class_uid = get_uid_string(obj, tags::SOP_CLASS_UID);
     let sop_instance_uid = get_uid_string(obj, tags::SOP_INSTANCE_UID);
@@ -1031,7 +1052,14 @@ fn element_has_value(obj: &InMemDicomObject, tag: Tag, vr: VR, value: &str) -> b
 pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Result<(), String> {
     let mut failures = Vec::new();
     let mut codec = SpecificCharacterSet::default();
-    collect_text_write_failures(obj, &[], text, &mut codec, &mut failures);
+    collect_text_write_failures(
+        obj,
+        &[],
+        &TextCharset::default(),
+        text,
+        &mut codec,
+        &mut failures,
+    );
     if failures.is_empty() {
         return Ok(());
     }
@@ -1042,7 +1070,7 @@ pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Res
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "Saving is disabled for this file: these text values would not be written back with their original bytes: {shown}{}",
+        "Saving is disabled for this file: these read-only text values would change their bytes or meaning: {shown}{}",
         if failures.len() > 5 { ", ..." } else { "" }
     ))
 }
@@ -1050,10 +1078,19 @@ pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Res
 fn collect_text_write_failures(
     obj: &InMemDicomObject,
     parent_path: &[String],
+    inherited_charset: &TextCharset,
     text: &TextValues,
     codec: &mut SpecificCharacterSet,
     failures: &mut Vec<Vec<String>>,
 ) {
+    // The character set that the saved file declares for this dataset or item.
+    let charset = match obj.get(tags::SPECIFIC_CHARACTER_SET) {
+        Some(element) => element
+            .to_str()
+            .map(|value| TextCharset::from_specific_character_set(&value))
+            .unwrap_or_default(),
+        None => inherited_charset.clone(),
+    };
     for element in obj.iter() {
         let tag = element.tag();
         let mut path = parent_path.to_vec();
@@ -1063,7 +1100,7 @@ fn collect_text_write_failures(
                 for (index, item) in sequence.items().iter().enumerate() {
                     let mut item_path = path.clone();
                     item_path.push(format!("Item#{index}"));
-                    collect_text_write_failures(item, &item_path, text, codec, failures);
+                    collect_text_write_failures(item, &item_path, &charset, text, codec, failures);
                 }
             }
             Value::Primitive(value) if tag == tags::SPECIFIC_CHARACTER_SET => {
@@ -1088,8 +1125,12 @@ fn collect_text_write_failures(
                     // Edited by the user: written as entered.
                     continue;
                 }
+                // Unedited text must keep its bytes and, under the character sets the
+                // saved file declares, its meaning.
                 let written = dicom_rs_write(codec, &stored);
-                if written.as_deref() != Some(original.bytes.as_slice()) {
+                if written.as_deref() != Some(original.bytes.as_slice())
+                    || charset.decode(original.vr, &original.bytes) != original.decoded
+                {
                     failures.push(path);
                 }
             }
@@ -2130,11 +2171,12 @@ mod tests {
         let source_text = source.to_str().unwrap();
         let text = TextValues::try_read(source_text)?;
         let mut obj = open_full_object(source_text)?;
-        apply_nodes_to_object(&mut obj, nodes)?;
-        ensure_text_round_trips(&obj, &text)?;
         let destination = source.with_extension("saved.dcm");
-        obj.write_to_file(&destination)
-            .map_err(|error| error.to_string())?;
+        let saved = save_object_with_nodes(&mut obj, nodes, &text, destination.to_str().unwrap());
+        if saved.is_err() {
+            std::fs::remove_file(&destination).ok();
+        }
+        saved?;
         let written = std::fs::read(&destination).map_err(|error| error.to_string())?;
         std::fs::remove_file(&destination).ok();
         Ok(written)
@@ -2443,6 +2485,70 @@ mod tests {
         assert!(
             error.contains("(0040,A730) / Item#0 / (0040,A160)"),
             "{error}"
+        );
+    }
+
+    fn remove_element(nodes: &mut Vec<DicomNode>, tag_to_remove: &str) {
+        nodes
+            .retain(|node| !matches!(node, DicomNode::Element { tag, .. } if tag == tag_to_remove));
+    }
+
+    /// Review P1 (3rd round): changing or removing a declaration so that unedited
+    /// read-only text would mean something else blocks saving, including in items that
+    /// inherit the declaration.
+    #[test]
+    fn changing_the_declaration_of_read_only_text_blocks_saving() {
+        let path = temp_path("ir13-declaration-edited.dcm");
+        write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, HAN_IR13));
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        assert_eq!(
+            value_and_editable(&opened, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+
+        let mut changed = opened.clone();
+        *find_element_mut(&mut changed, &["(0008,0005)"]).unwrap() = "ISO_IR 100".to_string();
+        let changed_result = save_nodes(&path, &changed);
+
+        let mut removed = opened.clone();
+        remove_element(&mut removed, "(0008,0005)");
+        let removed_result = save_nodes(&path, &removed);
+
+        let unchanged_result = save_nodes(&path, &opened);
+        std::fs::remove_file(&path).ok();
+
+        for result in [changed_result, removed_result] {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+                "{error}"
+            );
+        }
+        assert!(contains(&unchanged_result.unwrap(), HAN_IR13));
+    }
+
+    /// Review P2 (3rd round): a rejected save leaves the cached object untouched.
+    #[test]
+    fn rejected_save_does_not_change_the_object() {
+        let path = temp_path("rejected-save.dcm");
+        let rest = roi_sequence(Some(b"ISO 2022 IR 100\\ISO 2022 IR 87"), b"Caf\xe9");
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(0008,0005)"]).unwrap() =
+            "ISO_IR 192".to_string();
+        *find_element_mut(&mut nodes, &["(0008,0060)"]).unwrap() = "CT".to_string();
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let destination = temp_path("rejected-save-destination.dcm");
+        let result = save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert_eq!(
+            get_string(&obj, tags::MODALITY).as_deref(),
+            Some("RTSTRUCT")
         );
     }
 }
