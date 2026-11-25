@@ -571,19 +571,25 @@ pub fn apply_nodes_to_object(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
 ) -> Result<(), String> {
-    apply_nodes_to_object_with_text(obj, nodes, &TextValues::default()).map(|_| ())
+    apply_nodes_to_object_with_text(obj, nodes, &TextValues::default(), false).map(|_| ())
 }
 
 /// Apply nodes, comparing values that `text` decoded with their decoded form. Returns
 /// the paths of the values that were edited or added.
+///
+/// `nodes_show_trailing` tells whether the nodes were read past Pixel Data's tag (raw
+/// data sets without file meta information). Part 10 files are opened up to Pixel
+/// Data, so their top-level elements from (7FE0,0010) on are not shown and are kept.
 pub fn apply_nodes_to_object_with_text(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
     text: &TextValues,
+    nodes_show_trailing: bool,
 ) -> Result<HashSet<Vec<String>>, String> {
     validate_private_nodes(obj, nodes)?;
     let mut edited = HashSet::new();
-    apply_validated_nodes_to_object(obj, nodes, text, &mut edited, true)?;
+    let keep_trailing = !nodes_show_trailing;
+    apply_validated_nodes_to_object(obj, nodes, text, &mut edited, keep_trailing)?;
     Ok(edited)
 }
 
@@ -592,7 +598,7 @@ fn apply_validated_nodes_to_object(
     nodes: &[DicomNode],
     text: &TextValues,
     edited: &mut HashSet<Vec<String>>,
-    root: bool,
+    keep_unshown_trailing: bool,
 ) -> Result<(), String> {
     let desired_tags = nodes
         .iter()
@@ -600,17 +606,9 @@ fn apply_validated_nodes_to_object(
         .collect::<Result<HashSet<_>, _>>()?;
     let existing_tags = obj.iter().map(|element| element.tag()).collect::<Vec<_>>();
     let has_pixel_data = obj.get(PIXEL_DATA).is_some();
-    // Files are opened up to Pixel Data, so top-level elements from (7FE0,0010) on are
-    // not shown as nodes, also when there is no Pixel Data (e.g. (FFFC,FFFC) padding or
-    // (FFFA,FFFA) Digital Signatures Sequence). Keep them unless the nodes show them,
-    // as they do for raw data sets read without file meta information.
-    // Only elements that are already in the object count: an element just added after
-    // Pixel Data's tag says nothing about how the nodes were read.
-    let nodes_show_trailing = nodes
-        .iter()
-        .filter_map(|node| node_tag(node).ok())
-        .any(|tag| tag > PIXEL_DATA && existing_tags.contains(&tag));
-    let keep_trailing = has_pixel_data || (root && !nodes_show_trailing);
+    // Elements from Pixel Data on are kept: in items as before, and at the top level
+    // whenever the nodes do not show them (see `apply_nodes_to_object_with_text`).
+    let keep_trailing = has_pixel_data || keep_unshown_trailing;
 
     for tag in existing_tags {
         if keep_trailing && tag >= PIXEL_DATA {
@@ -695,6 +693,7 @@ pub fn save_file_with_nodes(
     text: &TextValues,
     destination: &str,
     opened: Option<splice::FileStamp>,
+    nodes_show_trailing: bool,
 ) -> Result<bool, String> {
     // Editing signed data would leave signatures that no longer verify.
     if has_digital_signatures(object) && nodes_change_object(object, nodes, text) {
@@ -707,15 +706,25 @@ pub fn save_file_with_nodes(
     let guard = opened
         .filter(|_| source == destination)
         .map(|stamp| (source, stamp));
-    let planned = match opened {
+    // Splicing reads the source while writing, also when saving under another name.
+    let splice_guard = opened.map(|stamp| (source, stamp));
+    // Splicing needs Part 10 files, which are opened up to Pixel Data.
+    let planned = match opened.filter(|_| !nodes_show_trailing) {
         Some(stamp) => plan_splice(source, object, nodes, text, stamp)?,
         None => None,
     };
     let Some((index, replacements)) = planned else {
-        save_object_with_nodes_guarded(object, nodes, text, destination, guard)?;
+        save_object_with_nodes_guarded(
+            object,
+            nodes,
+            text,
+            destination,
+            guard,
+            nodes_show_trailing,
+        )?;
         return Ok(true);
     };
-    write_file_atomically_with(destination, guard, |out| {
+    write_file_atomically_with(destination, splice_guard, |out| {
         splice::write_spliced(source, &index, &replacements, out)
     })?;
     Ok(false)
@@ -1095,7 +1104,7 @@ pub fn save_object_with_nodes(
     text: &TextValues,
     destination: &str,
 ) -> Result<(), String> {
-    save_object_with_nodes_guarded(object, nodes, text, destination, None)
+    save_object_with_nodes_guarded(object, nodes, text, destination, None, false)
 }
 
 /// The message for a file changed by another program since it was opened.
@@ -1109,9 +1118,10 @@ fn save_object_with_nodes_guarded(
     text: &TextValues,
     destination: &str,
     guard: Option<(&str, splice::FileStamp)>,
+    nodes_show_trailing: bool,
 ) -> Result<(), String> {
     let mut candidate = object.clone();
-    let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
+    let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text, nodes_show_trailing)?;
     prepare_text_for_writing(&mut candidate, text, &edited)?;
     sync_file_meta_from_dataset(&mut candidate);
     let explicit_vr = candidate.meta().transfer_syntax() != uids::IMPLICIT_VR_LITTLE_ENDIAN;
@@ -3876,6 +3886,7 @@ mod tests {
             &text,
             destination.to_str().unwrap(),
             splice::file_stamp(source_text),
+            false,
         )
         .and_then(|_| std::fs::read(&destination).map_err(|error| error.to_string()));
         std::fs::remove_file(&destination).ok();
@@ -4271,7 +4282,7 @@ mod tests {
         let shown = find_element(&nodes, "(FFFC,FFFC)").is_some();
         remove_element(&mut nodes, "(FFFC,FFFC)");
         let mut obj = open_full_object(path_text).unwrap();
-        apply_nodes_to_object(&mut obj, &nodes).unwrap();
+        apply_nodes_to_object_with_text(&mut obj, &nodes, &TextValues::default(), true).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert!(shown);
@@ -4362,8 +4373,15 @@ mod tests {
         changed.extend_from_slice(&explicit_long_element(0xFFFC, 0xFFFC, b"OB", &[0, 0]));
         std::fs::write(&path, &changed).unwrap();
 
-        let spliced =
-            save_file_with_nodes(path_text, &mut obj, &nodes, &text, path_text, opened_stamp);
+        let spliced = save_file_with_nodes(
+            path_text,
+            &mut obj,
+            &nodes,
+            &text,
+            path_text,
+            opened_stamp,
+            false,
+        );
         let mut added = nodes.clone();
         added.push(DicomNode::Element {
             tag: "(0008,1030)".to_string(),
@@ -4375,8 +4393,15 @@ mod tests {
             path: vec!["(0008,1030)".to_string()],
             editable: true,
         });
-        let full =
-            save_file_with_nodes(path_text, &mut obj, &added, &text, path_text, opened_stamp);
+        let full = save_file_with_nodes(
+            path_text,
+            &mut obj,
+            &added,
+            &text,
+            path_text,
+            opened_stamp,
+            false,
+        );
         let after = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
@@ -4430,5 +4455,63 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!planned);
+    }
+
+    /// Review on #10: after adding an element after Pixel Data's tag and saving, saving
+    /// again keeps the file's unshown trailing elements.
+    #[test]
+    fn saving_twice_after_adding_a_trailing_element_keeps_unshown_ones() {
+        let dir = temp_test_dir("add-trailing-twice");
+        let path = dir.join("add-trailing-twice.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            explicit_long_element(0xFFFC, 0xFFFC, b"OB", &[0, 0]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        nodes.push(DicomNode::Element {
+            tag: "(8001,0010)".to_string(),
+            vr: "LO".to_string(),
+            inferred_vr: None,
+            description: String::new(),
+            value: "VENDOR".to_string(),
+            length: 0,
+            path: vec!["(8001,0010)".to_string()],
+            editable: true,
+        });
+        let mut obj = open_full_object(path_text).unwrap();
+        let first_text = TextValues::try_read(path_text).unwrap();
+        let first_stamp = splice::file_stamp(path_text);
+        let first = save_file_with_nodes(
+            path_text,
+            &mut obj,
+            &nodes,
+            &first_text,
+            path_text,
+            first_stamp,
+            false,
+        );
+        let second_text = TextValues::try_read(path_text).unwrap();
+        let second_stamp = splice::file_stamp(path_text);
+        let second = save_file_with_nodes(
+            path_text,
+            &mut obj,
+            &nodes,
+            &second_text,
+            path_text,
+            second_stamp,
+            false,
+        );
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        first.unwrap();
+        second.unwrap();
+        assert!(contains(&saved, b"VENDOR"));
+        assert!(contains(&saved, &[0xFC, 0xFF, 0xFC, 0xFF]));
     }
 }

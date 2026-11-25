@@ -18,6 +18,9 @@ struct StoredDicomObject {
     /// The file's length and modification time when it was opened or last saved, to
     /// tell whether another program changed it since.
     stamp: Option<(u64, std::time::SystemTime)>,
+    /// Whether the shown nodes include top-level elements after Pixel Data's tag, as
+    /// they do for raw data sets read without file meta information.
+    nodes_show_trailing: bool,
 }
 
 #[derive(Default)]
@@ -201,7 +204,10 @@ pub async fn open_dicom_file(
     path: String,
     store: State<'_, DicomStore>,
 ) -> Result<DicomFileContent, String> {
+    // Taken before reading, so that a change made while reading is noticed on save.
+    let stamp = file_stamp(&path);
     let content = open_nodes(&path)?;
+    let nodes_show_trailing = content.file_meta.is_empty();
     store
         .objects
         .lock()
@@ -211,7 +217,8 @@ pub async fn open_dicom_file(
             StoredDicomObject {
                 full: None,
                 rt_struct: None,
-                stamp: file_stamp(&path),
+                stamp,
+                nodes_show_trailing,
             },
         );
     *store
@@ -253,12 +260,13 @@ fn save_to_path(
 ) -> Result<(), String> {
     // The shown nodes come from the file as it was opened (or last saved). If another
     // program changed it since, saving them would silently undo those changes.
-    let opened_stamp = store
+    let (opened_stamp, nodes_show_trailing) = store
         .objects
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())?
         .get(&source_path)
-        .and_then(|stored| stored.stamp);
+        .map(|stored| (stored.stamp, stored.nodes_show_trailing))
+        .unwrap_or((None, false));
     ensure_unchanged_since_opened(opened_stamp, &source_path)?;
 
     // Text values read from the original bytes: their character sets are used to
@@ -290,6 +298,7 @@ fn save_to_path(
         &text,
         &destination_path,
         opened_stamp,
+        nodes_show_trailing,
     )?;
     if !object_matches_file || source_path != destination_path {
         // After a spliced save the object is read again from the file when needed.
@@ -309,6 +318,7 @@ fn save_to_path(
                 full: None,
                 rt_struct: None,
                 stamp: file_stamp(&destination_path),
+                nodes_show_trailing,
             },
         );
     }
