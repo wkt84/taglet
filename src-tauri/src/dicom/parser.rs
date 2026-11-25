@@ -911,8 +911,11 @@ fn same_structure(nodes: &[DicomNode], index: &[splice::IndexNode]) -> bool {
         }
     }
 
+    // Nodes after Pixel Data's tag (other than its placeholder) were added by the
+    // user, as the file's own are never shown; count them so that they are saved.
+    let skipped_node = |root: bool, tag: Tag| root && tag == PIXEL_DATA;
     let mut from_nodes = Vec::new();
-    node_shape(nodes, true, &skipped, &mut from_nodes);
+    node_shape(nodes, true, &skipped_node, &mut from_nodes);
     let mut from_index = Vec::new();
     index_shape(index, &[], &skipped, &mut from_index);
     from_nodes.sort();
@@ -962,7 +965,9 @@ fn nodes_change_object(obj: &InMemDicomObject, nodes: &[DicomNode], text: &TextV
         for node in nodes {
             let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
                 node;
-            if root && parse_tag(tag).is_ok_and(|tag| tag >= PIXEL_DATA) {
+            // Only Pixel Data's placeholder stands for something not shown; other nodes
+            // after its tag were added.
+            if root && parse_tag(tag).is_ok_and(|tag| tag == PIXEL_DATA) {
                 continue;
             }
             match node {
@@ -4406,5 +4411,24 @@ mod tests {
         expected.extend_from_slice(&[0x10, 0x00, 0x20, 0x00]);
         expected.extend_from_slice(b"SH");
         assert!(contains(&saved, &expected));
+    }
+
+    /// Review on #10: an empty sequence added after Pixel Data's tag is saved.
+    #[test]
+    fn added_sequences_after_pixel_data_are_saved() {
+        let path = temp_path("splice-add-trailing-sequence.dcm");
+        write_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes.push(DicomNode::Sequence {
+            tag: "(FFFA,FFFA)".to_string(),
+            description: String::new(),
+            length: 0,
+            path: vec!["(FFFA,FFFA)".to_string()],
+            items: Vec::new(),
+        });
+        let planned = plan_for(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!planned);
     }
 }
