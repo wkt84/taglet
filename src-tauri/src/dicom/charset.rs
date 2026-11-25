@@ -250,17 +250,33 @@ pub fn dicom_rs_codec_after(
         .unwrap_or(current)
 }
 
+/// The strings dicom-rs holds after reading a value with `codec`: one per value, split
+/// at `\\` bytes except for single-valued VRs. `None` when decoding fails.
+pub fn dicom_rs_read(codec: &SpecificCharacterSet, vr: VR, bytes: &[u8]) -> Option<Vec<String>> {
+    if is_single_valued_text(vr) {
+        Some(vec![codec.decode(bytes).ok()?])
+    } else {
+        bytes
+            .split(|byte| *byte == b'\\')
+            .map(|part| codec.decode(part).ok())
+            .collect()
+    }
+}
+
+/// The bytes dicom-rs writes for the given strings with `codec`.
+pub fn dicom_rs_write(codec: &SpecificCharacterSet, parts: &[String]) -> Option<Vec<u8>> {
+    let encoded = parts
+        .iter()
+        .map(|part| codec.encode(part).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(encoded.join(&b'\\'))
+}
+
 /// Whether dicom-rs, reading and writing a value with `codec`, writes back the same bytes.
 pub fn dicom_rs_round_trips(codec: &SpecificCharacterSet, vr: VR, bytes: &[u8]) -> bool {
-    let round_trips = |part: &[u8]| match codec.decode(part) {
-        Ok(text) => codec.encode(&text).is_ok_and(|encoded| encoded == part),
-        Err(_) => false,
-    };
-    if is_single_valued_text(vr) {
-        round_trips(bytes)
-    } else {
-        bytes.split(|byte| *byte == b'\\').all(round_trips)
-    }
+    dicom_rs_read(codec, vr, bytes)
+        .and_then(|parts| dicom_rs_write(codec, &parts))
+        .is_some_and(|written| written == bytes)
 }
 
 #[cfg(test)]

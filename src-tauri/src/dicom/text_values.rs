@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-use dicom_core::Tag;
+use dicom_core::{Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_encoding::text::SpecificCharacterSet;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
@@ -26,13 +26,18 @@ use super::charset::{
 };
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
-const MAX_TEXT_VALUE_LENGTH: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TextValue {
+    pub vr: VR,
+    /// The original bytes of the value.
+    pub bytes: Vec<u8>,
+    /// The codec dicom-rs used to read the value.
+    pub read_codec: SpecificCharacterSet,
     /// The value decoded with the character set in effect for its dataset or item.
     pub decoded: String,
-    /// Whether dicom-rs writes the original bytes back unchanged when saving.
+    /// Whether dicom-rs writes the original bytes back unchanged when the file is saved
+    /// without changes.
     pub round_trips: bool,
 }
 
@@ -49,7 +54,9 @@ impl TextValues {
         Self::try_read(path).unwrap_or_default()
     }
 
-    fn try_read(path: &str) -> Result<Self, String> {
+    /// Read the text values of a file, failing when the file cannot be walked. Saving
+    /// uses this so that values that could not be checked never pass as safe.
+    pub fn try_read(path: &str) -> Result<Self, String> {
         let mut file = File::open(path).map_err(|error| error.to_string())?;
         let mut head = [0_u8; 132];
         let head_len = read_up_to(&mut file, &mut head)?;
@@ -183,9 +190,7 @@ where
                     *charset = TextCharset::from_specific_character_set(&value.to_str());
                     dicom_rs_codec =
                         dicom_rs_codec_after(dicom_rs_codec, strings.first().map(String::as_str));
-                } else if is_charset_sensitive(vr)
-                    && length.get().is_some_and(|len| len <= MAX_TEXT_VALUE_LENGTH)
-                {
+                } else if is_charset_sensitive(vr) && length.get().is_some() {
                     let mut bytes = Vec::new();
                     token
                         .read_value_into(&mut bytes)
@@ -195,8 +200,11 @@ where
                     values.insert(
                         element_path,
                         TextValue {
+                            vr,
                             decoded: charset.decode(vr, &bytes),
                             round_trips: dicom_rs_round_trips(&dicom_rs_codec, vr, &bytes),
+                            read_codec: dicom_rs_codec.clone(),
+                            bytes,
                         },
                     );
                 } else {

@@ -7,6 +7,9 @@ use crate::dicom::text_values::TextValues;
 
 #[tauri::command]
 pub async fn get_rt_plan_bev_info(store: State<'_, DicomStore>) -> Result<RtPlanBevInfo, String> {
-    let text = TextValues::read(&store.current_path()?);
-    store.with_current_full_object(|object| rt_plan_bev_info(object, &text))
+    // Read the text values and the object from the same file, even if the current file
+    // changes meanwhile.
+    let path = store.current_path()?;
+    let text = TextValues::read(&path);
+    store.with_full_object(&path, |object| rt_plan_bev_info(object, &text))
 }

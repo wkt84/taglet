@@ -2,7 +2,7 @@ use base64::Engine;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
 use dicom_core::header::{HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
-use dicom_core::{Tag, VR};
+use dicom_core::{DataElement, Tag, VR};
 use dicom_dictionary_std::{tags, uids, StandardDataDictionary};
 use dicom_encoding::text::SpecificCharacterSet;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::str::FromStr;
 
-use super::charset::trim_padding;
+use super::charset::{dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, trim_padding};
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
     RtPlanBeam, RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition,
@@ -78,7 +78,7 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
     if read_only {
         content.warnings.push(TEXT_READ_ONLY_WARNING.to_string());
     }
-    if ensure_text_round_trips(&text).is_err() {
+    if !text.paths_not_round_tripping().is_empty() {
         content.warnings.push(TEXT_SAVE_BLOCKED_WARNING.to_string());
     }
     Ok(content)
@@ -603,8 +603,14 @@ fn apply_validated_nodes_to_object(
                     continue;
                 }
                 let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
-                if is_text_editable(vr) {
-                    obj.put_str(tag, vr, value);
+                if is_text_editable(vr) && !element_has_value(obj, tag, vr, value) {
+                    if tag == tags::SPECIFIC_CHARACTER_SET {
+                        // Keep multiple values, which dicom-rs needs to switch character sets.
+                        let values = value.split('\\').map(str::to_string).collect();
+                        obj.put(DataElement::new(tag, vr, PrimitiveValue::Strs(values)));
+                    } else {
+                        obj.put_str(tag, vr, value);
+                    }
                 }
             }
             DicomNode::Sequence { tag, items, .. } => {
@@ -1008,13 +1014,28 @@ pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues) -> bool {
     replaced
 }
 
-/// Fail when saving through dicom-rs would change the bytes of some text value.
-pub fn ensure_text_round_trips(text: &TextValues) -> Result<(), String> {
-    let paths = text.paths_not_round_tripping();
-    if paths.is_empty() {
+/// Whether an element already holds the displayed value, so that saving can keep the
+/// element as read (including its multiple values) instead of rewriting it.
+fn element_has_value(obj: &InMemDicomObject, tag: Tag, vr: VR, value: &str) -> bool {
+    obj.get(tag).is_some_and(|element| {
+        element.vr() == vr
+            && element
+                .to_str()
+                .is_ok_and(|current| trim_padding(&current) == trim_padding(value))
+    })
+}
+
+/// Fail when saving `obj` through dicom-rs would change the bytes of a text value that
+/// was not edited. The check follows the character set declarations that will actually
+/// be written, the way dicom-rs's writer switches codecs.
+pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut codec = SpecificCharacterSet::default();
+    collect_text_write_failures(obj, &[], text, &mut codec, &mut failures);
+    if failures.is_empty() {
         return Ok(());
     }
-    let shown = paths
+    let shown = failures
         .iter()
         .take(5)
         .map(|path| path.join(" / "))
@@ -1022,8 +1043,59 @@ pub fn ensure_text_round_trips(text: &TextValues) -> Result<(), String> {
         .join(", ");
     Err(format!(
         "Saving is disabled for this file: these text values would not be written back with their original bytes: {shown}{}",
-        if paths.len() > 5 { ", ..." } else { "" }
+        if failures.len() > 5 { ", ..." } else { "" }
     ))
+}
+
+fn collect_text_write_failures(
+    obj: &InMemDicomObject,
+    parent_path: &[String],
+    text: &TextValues,
+    codec: &mut SpecificCharacterSet,
+    failures: &mut Vec<Vec<String>>,
+) {
+    for element in obj.iter() {
+        let tag = element.tag();
+        let mut path = parent_path.to_vec();
+        path.push(format_tag(tag));
+        match element.value() {
+            Value::Sequence(sequence) => {
+                for (index, item) in sequence.items().iter().enumerate() {
+                    let mut item_path = path.clone();
+                    item_path.push(format!("Item#{index}"));
+                    collect_text_write_failures(item, &item_path, text, codec, failures);
+                }
+            }
+            Value::Primitive(value) if tag == tags::SPECIFIC_CHARACTER_SET => {
+                let name = match value {
+                    PrimitiveValue::Str(name) => Some(name.as_str()),
+                    PrimitiveValue::Strs(names) => names.first().map(String::as_str),
+                    _ => None,
+                };
+                *codec = dicom_rs_codec_after(codec.clone(), name);
+            }
+            Value::Primitive(value) => {
+                let Some(original) = text.get(&path) else {
+                    continue;
+                };
+                let stored = match value {
+                    PrimitiveValue::Str(text) => vec![text.to_string()],
+                    PrimitiveValue::Strs(texts) => texts.to_vec(),
+                    _ => continue,
+                };
+                let read = dicom_rs_read(&original.read_codec, original.vr, &original.bytes);
+                if read.as_ref().is_some_and(|read| *read != stored) {
+                    // Edited by the user: written as entered.
+                    continue;
+                }
+                let written = dicom_rs_write(codec, &stored);
+                if written.as_deref() != Some(original.bytes.as_slice()) {
+                    failures.push(path);
+                }
+            }
+            Value::PixelSequence(_) => {}
+        }
+    }
 }
 
 /// Text decoded with the character set in effect for its dataset or item, when known.
@@ -2049,10 +2121,17 @@ mod tests {
     /// Open, apply the displayed nodes unchanged and save like `save_to_path` does.
     fn save_unchanged(source: &std::path::Path) -> Result<Vec<u8>, String> {
         let source_text = source.to_str().unwrap();
-        ensure_text_round_trips(&TextValues::read(source_text))?;
         let nodes = open_nodes(source_text)?.nodes;
+        save_nodes(source, &nodes)
+    }
+
+    /// Apply nodes and save like `save_to_path` does.
+    fn save_nodes(source: &std::path::Path, nodes: &[DicomNode]) -> Result<Vec<u8>, String> {
+        let source_text = source.to_str().unwrap();
+        let text = TextValues::try_read(source_text)?;
         let mut obj = open_full_object(source_text)?;
-        apply_nodes_to_object(&mut obj, &nodes)?;
+        apply_nodes_to_object(&mut obj, nodes)?;
+        ensure_text_round_trips(&obj, &text)?;
         let destination = source.with_extension("saved.dcm");
         obj.write_to_file(&destination)
             .map_err(|error| error.to_string())?;
@@ -2277,5 +2356,93 @@ mod tests {
             ("100¥‾".to_string(), false)
         );
         assert!(contains(&written, b"100\\~"));
+    }
+
+    fn explicit_long_element(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(b' ');
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(vr);
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn find_element_mut<'a>(
+        nodes: &'a mut [DicomNode],
+        wanted_path: &[&str],
+    ) -> Option<&'a mut String> {
+        nodes.iter_mut().find_map(|node| match node {
+            DicomNode::Element { path, value, .. } if path == wanted_path => Some(value),
+            DicomNode::Sequence { items, .. } => items
+                .iter_mut()
+                .find_map(|item| find_element_mut(item, wanted_path)),
+            _ => None,
+        })
+    }
+
+    /// Review P1 (2nd round): an unedited multi-valued Specific Character Set in an item
+    /// must be saved as read, so that dicom-rs switches codecs the same way on writing.
+    #[test]
+    fn unedited_multi_valued_item_charset_is_saved_as_read() {
+        let path = temp_path("item-ir100-ir87-under-utf8.dcm");
+        let roi_name = b"Caf\xe9 \x1b$B;3ED\x1b(B";
+        let rest = roi_sequence(Some(b"ISO 2022 IR 100\\ISO 2022 IR 87"), roi_name);
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        let written = save_unchanged(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("Café 山田".to_string(), false)
+        );
+        let written = written.unwrap();
+        assert!(contains(&written, roi_name));
+        assert!(contains(&written, b"ISO 2022 IR 100\\ISO 2022 IR 87"));
+    }
+
+    /// Saving is checked against the declarations that will be written.
+    #[test]
+    fn editing_an_item_charset_blocks_saving_read_only_text() {
+        let path = temp_path("item-charset-edited.dcm");
+        let rest = roi_sequence(Some(b"ISO 2022 IR 100\\ISO 2022 IR 87"), b"Caf\xe9");
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(0008,0005)"]).unwrap() =
+            "ISO_IR 192".to_string();
+        let saved = save_nodes(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
+        );
+    }
+
+    /// Review P2 (2nd round): values larger than 16 MiB are checked too.
+    #[test]
+    fn large_text_values_are_checked_before_saving() {
+        let path = temp_path("item-large-ut.dcm");
+        let mut value = vec![b'A'; 16 * 1024 * 1024 + 2];
+        value.extend_from_slice(HAN_IR13);
+        let mut item = explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13");
+        item.extend(explicit_long_element(0x0040, 0xA160, b"UT", &value));
+        let rest = sequence(0x0040, 0xA730, &[item], true);
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let saved = save_unchanged(&path);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(0040,A730) / Item#0 / (0040,A160)"),
+            "{error}"
+        );
     }
 }
