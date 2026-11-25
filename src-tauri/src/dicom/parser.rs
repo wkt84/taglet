@@ -20,7 +20,8 @@ use std::io::{BufReader, Read};
 use std::str::FromStr;
 
 use super::charset::{
-    dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, is_charset_sensitive, trim_padding,
+    byte_transparent_string, dicom_rs_codec_after, dicom_rs_codec_is_byte_transparent,
+    dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_single_valued_text, trim_padding,
     TextCharset,
 };
 use super::model::{
@@ -64,7 +65,7 @@ const MISSING_FILE_META_WARNING: &str =
 const MAX_RAW_DISPLAY_VALUE_LENGTH: u32 = 1_048_576;
 const MAX_RAW_DISPLAY_ELEMENTS: usize = 20_000;
 const TEXT_READ_ONLY_WARNING: &str =
-    "Some text uses a character set Taglet cannot edit yet (such as Japanese ISO 2022). It is shown read-only.";
+    "Some text is in a character set that cannot be written back in its place (e.g. set only inside a sequence item). It is shown read-only.";
 const TEXT_SAVE_BLOCKED_WARNING: &str =
     "Some text in this file cannot be written back without changing its bytes, so saving is disabled for this file.";
 const RAW_DATASET_START_GROUPS: &[u16] = &[
@@ -564,17 +565,28 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
         .collect()
 }
 
+#[cfg(test)]
 pub fn apply_nodes_to_object(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
 ) -> Result<(), String> {
+    apply_nodes_to_object_with_text(obj, nodes, &TextValues::default())
+}
+
+/// Apply nodes, treating values shown as decoded by `text` as unedited.
+pub fn apply_nodes_to_object_with_text(
+    obj: &mut InMemDicomObject,
+    nodes: &[DicomNode],
+    text: &TextValues,
+) -> Result<(), String> {
     validate_private_nodes(obj, nodes)?;
-    apply_validated_nodes_to_object(obj, nodes)
+    apply_validated_nodes_to_object(obj, nodes, text)
 }
 
 fn apply_validated_nodes_to_object(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
+    text: &TextValues,
 ) -> Result<(), String> {
     let desired_tags = nodes
         .iter()
@@ -599,6 +611,7 @@ fn apply_validated_nodes_to_object(
                 vr,
                 value,
                 editable,
+                path,
                 ..
             } if *editable => {
                 let tag = parse_tag(tag)?;
@@ -606,7 +619,11 @@ fn apply_validated_nodes_to_object(
                     continue;
                 }
                 let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
-                if is_text_editable(vr) && !element_has_value(obj, tag, vr, value) {
+                let shown_as_read = text
+                    .get(path)
+                    .is_some_and(|read| read.decoded == trim_padding(value));
+                if is_text_editable(vr) && !shown_as_read && !element_has_value(obj, tag, vr, value)
+                {
                     if tag == tags::SPECIFIC_CHARACTER_SET {
                         // Keep multiple values, which dicom-rs needs to switch character sets.
                         let values = value.split('\\').map(str::to_string).collect();
@@ -621,7 +638,7 @@ fn apply_validated_nodes_to_object(
                 obj.update_value(tag, |value| {
                     if let Some(sequence_items) = value.items_mut() {
                         for (item, next_nodes) in sequence_items.iter_mut().zip(items.iter()) {
-                            let _ = apply_validated_nodes_to_object(item, next_nodes);
+                            let _ = apply_validated_nodes_to_object(item, next_nodes, text);
                         }
                     }
                 });
@@ -641,8 +658,8 @@ pub fn save_object_with_nodes(
     destination: &str,
 ) -> Result<(), String> {
     let mut candidate = object.clone();
-    apply_nodes_to_object(&mut candidate, nodes)?;
-    ensure_text_round_trips(&candidate, text)?;
+    apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
+    prepare_text_for_writing(&mut candidate, text)?;
     sync_file_meta_from_dataset(&mut candidate);
     write_file_atomically(&candidate, destination)?;
     *object = candidate;
@@ -1093,8 +1110,8 @@ fn display_value(value: &Value<InMemDicomObject>) -> String {
 }
 
 /// Replace text values that dicom-rs decoded differently from the character set in
-/// effect for their dataset or item. Replaced values are read-only, because saving
-/// writes text through dicom-rs. Returns whether any value was replaced.
+/// effect for their dataset or item. Values that dicom-rs cannot write byte for byte
+/// become read-only. Returns whether any value became read-only.
 pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues) -> bool {
     let mut replaced = false;
     for node in nodes {
@@ -1110,8 +1127,8 @@ pub fn apply_text_values(nodes: &mut [DicomNode], text: &TextValues) -> bool {
                 };
                 if trim_padding(value) != text_value.decoded {
                     *value = text_value.decoded.clone();
-                    *editable = false;
-                    replaced = true;
+                    *editable &= text_value.editable;
+                    replaced |= !text_value.editable;
                 }
             }
             DicomNode::Sequence { items, .. } => {
@@ -1135,13 +1152,24 @@ fn element_has_value(obj: &InMemDicomObject, tag: Tag, vr: VR, value: &str) -> b
     })
 }
 
-/// Fail when saving `obj` through dicom-rs would change the bytes of a text value that
-/// was not edited. The check follows the character set declarations that will actually
-/// be written, the way dicom-rs's writer switches codecs.
-pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Result<(), String> {
+/// Prepare the text values of `obj` for writing through dicom-rs, and fail when a value
+/// would not be saved as shown.
+///
+/// The check follows the character set declarations that will be written, and the way
+/// dicom-rs's writer switches codecs:
+/// - Unedited text must keep its bytes and, under the declared character sets, its
+///   meaning.
+/// - Edited or added text is encoded with the declared character set (e.g. ISO 2022
+///   JIS). Where dicom-rs writes byte for byte, the encoded bytes are handed to it as a
+///   string; otherwise dicom-rs encodes the text itself. Either way the written bytes
+///   must decode back to the entered text.
+pub fn prepare_text_for_writing(
+    obj: &mut InMemDicomObject,
+    text: &TextValues,
+) -> Result<(), String> {
     let mut failures = Vec::new();
     let mut codec = SpecificCharacterSet::default();
-    collect_text_write_failures(
+    prepare_text_values(
         obj,
         &[],
         &TextCharset::default(),
@@ -1159,13 +1187,13 @@ pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Res
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "Cannot save: these text values would not be saved as shown (their characters or bytes would change): {shown}{}",
+        "Cannot save: these text values cannot be saved as shown in this file's character set: {shown}{}",
         if failures.len() > 5 { ", ..." } else { "" }
     ))
 }
 
-fn collect_text_write_failures(
-    obj: &InMemDicomObject,
+fn prepare_text_values(
+    obj: &mut InMemDicomObject,
     parent_path: &[String],
     inherited_charset: &TextCharset,
     text: &TextValues,
@@ -1180,17 +1208,25 @@ fn collect_text_write_failures(
             .unwrap_or_default(),
         None => inherited_charset.clone(),
     };
-    for element in obj.iter() {
-        let tag = element.tag();
+    let element_tags = obj.iter().map(|element| element.tag()).collect::<Vec<_>>();
+    for tag in element_tags {
         let mut path = parent_path.to_vec();
         path.push(format_tag(tag));
+        let Some(element) = obj.get(tag) else {
+            continue;
+        };
+        let vr = element.vr();
         match element.value() {
-            Value::Sequence(sequence) => {
-                for (index, item) in sequence.items().iter().enumerate() {
-                    let mut item_path = path.clone();
-                    item_path.push(format!("Item#{index}"));
-                    collect_text_write_failures(item, &item_path, &charset, text, codec, failures);
-                }
+            Value::Sequence(_) => {
+                obj.update_value(tag, |value| {
+                    if let Some(items) = value.items_mut() {
+                        for (index, item) in items.iter_mut().enumerate() {
+                            let mut item_path = path.clone();
+                            item_path.push(format!("Item#{index}"));
+                            prepare_text_values(item, &item_path, &charset, text, codec, failures);
+                        }
+                    }
+                });
             }
             Value::Primitive(value) if tag == tags::SPECIFIC_CHARACTER_SET => {
                 let name = match value {
@@ -1200,40 +1236,73 @@ fn collect_text_write_failures(
                 };
                 *codec = dicom_rs_codec_after(codec.clone(), name);
             }
-            Value::Primitive(value) => {
-                let vr = element.vr();
-                if !is_charset_sensitive(vr) {
-                    continue;
-                }
+            Value::Primitive(value) if is_charset_sensitive(vr) => {
                 let stored = match value {
                     PrimitiveValue::Str(text) => vec![text.to_string()],
                     PrimitiveValue::Strs(texts) => texts.to_vec(),
                     _ => continue,
                 };
-                let written = dicom_rs_write(codec, &stored);
                 let original = text.get(&path).filter(|original| {
                     dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
                         .is_some_and(|read| read == stored)
                 });
-                let keeps_value = match (original, written) {
-                    // Unedited text must keep its bytes and, under the character sets the
-                    // saved file declares, its meaning.
-                    (Some(original), Some(written)) => {
-                        written == original.bytes
-                            && charset.decode(original.vr, &original.bytes) == original.decoded
+                match original {
+                    Some(original) => {
+                        let keeps_value = dicom_rs_write(codec, &stored)
+                            .is_some_and(|written| written == original.bytes)
+                            && charset.decode(original.vr, &original.bytes) == original.decoded;
+                        if !keeps_value {
+                            failures.push(path);
+                        }
                     }
-                    // Edited or added text must read back as entered.
-                    (None, Some(written)) => {
-                        charset.decode(vr, &written) == trim_padding(&stored.join("\\"))
-                    }
-                    (_, None) => false,
-                };
-                if !keeps_value {
-                    failures.push(path);
+                    None => match encode_edited_text(&charset, codec, vr, &stored) {
+                        Some(Some(parts)) => {
+                            let value = PrimitiveValue::Strs(parts.into());
+                            obj.put(DataElement::new(tag, vr, value));
+                        }
+                        Some(None) => {}
+                        None => failures.push(path),
+                    },
                 }
             }
-            Value::PixelSequence(_) => {}
+            _ => {}
         }
+    }
+}
+
+/// Encode edited text. Returns `Some(Some(parts))` with strings to store when dicom-rs
+/// must be handed pre-encoded bytes, `Some(None)` when the stored text can be written
+/// as it is, and `None` when the text cannot be saved as entered.
+fn encode_edited_text(
+    charset: &TextCharset,
+    codec: &SpecificCharacterSet,
+    vr: VR,
+    stored: &[String],
+) -> Option<Option<Vec<String>>> {
+    let entered = stored.join("\\");
+    let entered = trim_padding(&entered);
+    let expected = charset.encode(vr, entered)?;
+    if charset.decode(vr, &expected) != entered {
+        return None;
+    }
+    if dicom_rs_codec_is_byte_transparent(codec) {
+        let values = if is_single_valued_text(vr) {
+            vec![entered]
+        } else {
+            entered.split('\\').collect()
+        };
+        let parts = values
+            .into_iter()
+            .map(|value| {
+                charset
+                    .encode(vr, value)
+                    .map(|bytes| byte_transparent_string(&bytes))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (dicom_rs_write(codec, &parts)? == expected).then_some(Some(parts))
+    } else {
+        let written = dicom_rs_write(codec, stored)?;
+        (charset.decode(vr, &written) == entered).then_some(None)
     }
 }
 
@@ -2287,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn displays_iso2022_japanese_text_read_only() {
+    fn displays_iso2022_japanese_text_editable() {
         for charset in [
             "\\ISO 2022 IR 87",
             "ISO 2022 IR 87",
@@ -2300,12 +2369,12 @@ mod tests {
 
             assert_eq!(
                 value_and_editable(&content.nodes, "(0010,0010)"),
-                ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), false),
+                ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), true),
                 "{charset:?}"
             );
             assert_eq!(
                 value_and_editable(&content.nodes, "(3006,0026)"),
-                ("前立腺".to_string(), false),
+                ("前立腺".to_string(), true),
                 "{charset:?}"
             );
             // ASCII-only text stays editable.
@@ -2313,7 +2382,7 @@ mod tests {
                 value_and_editable(&content.nodes, "(0010,0020)"),
                 ("ID001".to_string(), true)
             );
-            assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+            assert!(!has_warning(&content, TEXT_READ_ONLY_WARNING));
             assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
         }
     }
@@ -2363,9 +2432,9 @@ mod tests {
 
         assert_eq!(
             value_and_editable(&content.nodes, "(0010,0010)"),
-            ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), false)
+            ("Yamada^Tarou=山田^太郎=やまだ^たろう".to_string(), true)
         );
-        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+        assert!(!has_warning(&content, TEXT_READ_ONLY_WARNING));
     }
 
     #[test]
@@ -2441,16 +2510,17 @@ mod tests {
         );
         assert_eq!(
             value_and_editable(&content.nodes, "(300E,0008)"),
-            ("鈴木^花子".to_string(), false)
+            ("鈴木^花子".to_string(), true)
         );
         assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
         assert!(contains(&written, reviewer));
         assert!(contains(&written, b"Caf\xe9"));
     }
 
-    /// Review P3: a character set given only inside a sequence item still warns.
+    /// A character set given only inside a sequence item is decoded, and its text stays
+    /// editable because dicom-rs reads and writes it byte for byte.
     #[test]
-    fn warns_when_only_an_item_declares_a_japanese_charset() {
+    fn decodes_a_charset_declared_only_in_an_item() {
         let path = temp_path("item-only-charset.dcm");
         write_part10(&path, None, &roi_sequence(Some(b"ISO_IR 13"), HAN_IR13));
         let content = open_nodes(path.to_str().unwrap()).unwrap();
@@ -2458,9 +2528,9 @@ mod tests {
 
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0026)"),
-            ("ﾊﾝ".to_string(), false)
+            ("ﾊﾝ".to_string(), true)
         );
-        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+        assert!(!has_warning(&content, TEXT_READ_ONLY_WARNING));
 
         let raw_path = temp_path("item-only-charset-raw.dcm");
         let mut item = implicit_element(0x0008, 0x0005, b"ISO_IR 13");
@@ -2476,9 +2546,9 @@ mod tests {
 
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0026)"),
-            ("ﾊﾝ".to_string(), false)
+            ("ﾊﾝ".to_string(), true)
         );
-        assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
+        assert!(!has_warning(&content, TEXT_READ_ONLY_WARNING));
     }
 
     /// Review P2: JIS X 0201 Romaji yen sign and overline without escape sequences.
@@ -2493,7 +2563,7 @@ mod tests {
 
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0006)"),
-            ("100¥‾".to_string(), false)
+            ("100¥‾".to_string(), true)
         );
         assert!(contains(&written, b"100\\~"));
     }
@@ -2540,7 +2610,7 @@ mod tests {
 
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0026)"),
-            ("Café 山田".to_string(), false)
+            ("Café 山田".to_string(), true)
         );
         let written = written.unwrap();
         assert!(contains(&written, roi_name));
@@ -2595,13 +2665,13 @@ mod tests {
     /// read-only text would mean something else blocks saving, including in items that
     /// inherit the declaration.
     #[test]
-    fn changing_the_declaration_of_read_only_text_blocks_saving() {
+    fn changing_the_declaration_of_unedited_text_blocks_saving() {
         let path = temp_path("ir13-declaration-edited.dcm");
         write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, HAN_IR13));
         let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
         assert_eq!(
             value_and_editable(&opened, "(3006,0026)"),
-            ("ﾊﾝ".to_string(), false)
+            ("ﾊﾝ".to_string(), true)
         );
 
         let mut changed = opened.clone();
@@ -2794,5 +2864,145 @@ mod tests {
 
         saved.unwrap();
         assert_eq!(kept.unwrap(), b"keep me");
+    }
+
+    /// Save `nodes` over a copy of `source` and reopen it.
+    fn save_and_reopen(
+        source: &std::path::Path,
+        nodes: &[DicomNode],
+    ) -> Result<(Vec<u8>, DicomFileContent), String> {
+        let source_text = source.to_str().unwrap();
+        let text = TextValues::try_read(source_text)?;
+        let mut obj = open_full_object(source_text)?;
+        let destination = source.with_extension("reopened.dcm");
+        let destination_text = destination.to_str().unwrap();
+        let result =
+            save_object_with_nodes(&mut obj, nodes, &text, destination_text).and_then(|()| {
+                let written = std::fs::read(&destination).map_err(|error| error.to_string())?;
+                Ok((written, open_nodes(destination_text)?))
+            });
+        std::fs::remove_file(&destination).ok();
+        result
+    }
+
+    /// Phase 2: Japanese text is edited and saved with ISO 2022 escape sequences.
+    #[test]
+    fn edited_japanese_text_is_saved_in_jis() {
+        let path = temp_path("phase2-edit.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let name = "Suzuki^Hanako=鈴木^花子=すずき^はなこ";
+        *find_element_mut(&mut nodes, &["(0010,0010)"]).unwrap() = name.to_string();
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"]).unwrap() =
+            "膀胱".to_string();
+        let saved = save_and_reopen(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let (written, reopened) = saved.unwrap();
+        let charset = TextCharset::from_specific_character_set("\\ISO 2022 IR 87");
+        assert!(contains(&written, &charset.encode(VR::PN, name).unwrap()));
+        assert!(contains(&written, b"\x1b$Bg/fy\x1b(B"));
+        assert_eq!(
+            value_and_editable(&reopened.nodes, "(0010,0010)"),
+            (name.to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&reopened.nodes, "(3006,0026)"),
+            ("膀胱".to_string(), true)
+        );
+    }
+
+    /// Phase 2: half-width katakana and kanji are saved as in PS3.5 Annex H.3.2.
+    #[test]
+    fn edited_text_matches_annex_h_3_2() {
+        let path = temp_path("phase2-h32.dcm");
+        let rest = explicit_element(0x0010, 0x0010, b"PN", b"Yamada^Tarou");
+        write_part10(&path, Some(b"ISO 2022 IR 13\\ISO 2022 IR 87"), &rest);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0010)"]).unwrap() =
+            "ﾔﾏﾀﾞ^ﾀﾛｳ=山田^太郎=やまだ^たろう".to_string();
+        let saved = save_and_reopen(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let h32: &[u8] = b"\xd4\xcf\xc0\xde^\xc0\xdb\xb3=\x1b$B;3ED\x1b(J^\x1b$BB@O:\x1b(J=\x1b$B$d$^$@\x1b(J^\x1b$B$?$m$&\x1b(J";
+        assert!(contains(&saved.unwrap().0, h32));
+    }
+
+    /// Phase 2: an added element and multiple values, one with a 0x5C byte in a kanji.
+    #[test]
+    fn added_and_multi_valued_japanese_text_is_saved() {
+        let path = temp_path("phase2-added.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let (kanji, _) = encoding_rs::EUC_JP.decode_without_bom_handling(&[0xBF, 0xDC]);
+        let values = format!("頭部{kanji}\\ABC");
+        nodes.push(DicomNode::Element {
+            tag: "(0008,1030)".to_string(),
+            vr: "LO".to_string(),
+            inferred_vr: None,
+            description: String::new(),
+            value: values.clone(),
+            length: 0,
+            path: vec!["(0008,1030)".to_string()],
+            editable: true,
+        });
+        let saved = save_and_reopen(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let (_, reopened) = saved.unwrap();
+        assert_eq!(
+            value_and_editable(&reopened.nodes, "(0008,1030)"),
+            (values, true)
+        );
+    }
+
+    /// Phase 2: text the declared character sets cannot hold is not saved.
+    #[test]
+    fn unencodable_edits_block_saving() {
+        let path = temp_path("phase2-unencodable.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let results = ["😀", "ｶﾅ", "丂"].map(|text| {
+            let mut nodes = opened.clone();
+            *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = text.to_string();
+            save_and_reopen(&path, &nodes)
+        });
+        std::fs::remove_file(&path).ok();
+
+        for result in results {
+            let error = result.unwrap_err();
+            assert!(error.contains("(0010,0020)"), "{error}");
+        }
+    }
+
+    /// Phase 2: text where dicom-rs does not write byte for byte stays read-only and
+    /// cannot be saved in a Japanese character set.
+    #[test]
+    fn japanese_edits_under_a_utf8_codec_block_saving() {
+        let path = temp_path("phase2-utf8-parent.dcm");
+        let rest = roi_sequence(Some(b"\\ISO 2022 IR 87"), PROSTATE_IR87);
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let roi_name = ["(3006,0020)", "Item#0", "(3006,0026)"];
+        let shown = value_and_editable(&nodes, "(3006,0026)");
+        // Force an edit as if the value were editable.
+        if let Some(DicomNode::Element {
+            editable, value, ..
+        }) = nodes.iter_mut().find_map(|node| match node {
+            DicomNode::Sequence { items, .. } => items[0]
+                .iter_mut()
+                .find(|node| matches!(node, DicomNode::Element { path, .. } if path == &roi_name)),
+            _ => None,
+        }) {
+            *editable = true;
+            *value = "膀胱".to_string();
+        }
+        let saved = save_and_reopen(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(shown, ("前立腺".to_string(), false));
+        assert!(saved
+            .unwrap_err()
+            .contains("(3006,0020) / Item#0 / (3006,0026)"));
     }
 }

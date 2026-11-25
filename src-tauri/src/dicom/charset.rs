@@ -36,10 +36,28 @@ impl TextCharset {
             .map(|term| term.trim_matches(|c: char| c == ' ' || c == '\0'))
             .collect::<Vec<_>>();
         if terms.iter().any(|term| is_japanese_term(term)) {
-            return TextCharset::Iso2022(Iso2022Charset::from_first_term(terms[0]));
+            return TextCharset::Iso2022(Iso2022Charset::from_terms(&terms));
         }
         // Unknown first terms fall back to the default repertoire, like dicom-rs does.
         TextCharset::Codec(SpecificCharacterSet::from_code(terms[0]).unwrap_or_default())
+    }
+
+    /// Encode text for a value, one value at a time so that every value starts in the
+    /// initial character set. `None` when some character cannot be represented.
+    pub fn encode(&self, vr: VR, text: &str) -> Option<Vec<u8>> {
+        let values = if is_single_valued_text(vr) {
+            vec![text]
+        } else {
+            text.split('\\').collect()
+        };
+        let encoded = values
+            .into_iter()
+            .map(|value| match self {
+                TextCharset::Iso2022(charset) => charset.encode(vr, value),
+                TextCharset::Codec(codec) => codec.encode(value).ok(),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(encoded.join(&b'\\'))
     }
 
     /// Decode a value's bytes, without trailing padding.
@@ -80,19 +98,94 @@ enum G1 {
 pub struct Iso2022Charset {
     initial_g0: G0,
     initial_g1: G1,
+    /// Whether JIS X 0208 (ISO 2022 IR 87) is declared, so that it can be used when
+    /// encoding.
+    has_jis0208: bool,
 }
 
 impl Iso2022Charset {
-    fn from_first_term(term: &str) -> Self {
-        let (initial_g0, initial_g1) = match normalize_term(term).as_str() {
+    fn from_terms(terms: &[&str]) -> Self {
+        let (initial_g0, initial_g1) = match normalize_term(terms[0]).as_str() {
             "ISO_IR 13" | "ISO 2022 IR 13" => (G0::JisRoman, G1::Katakana),
             "ISO_IR 100" | "ISO 2022 IR 100" => (G0::Ascii, G1::Latin1),
             _ => (G0::Ascii, G1::None),
         };
+        let has_jis0208 = terms
+            .iter()
+            .any(|term| normalize_term(term) == "ISO 2022 IR 87");
         Self {
             initial_g0,
             initial_g1,
+            has_jis0208,
         }
+    }
+
+    /// Encode one value. Characters are taken from the initial character sets where
+    /// possible and from JIS X 0208 otherwise. Before delimiters and at the end of the
+    /// value the encoder switches back to the initial G0 set (PS3.5 6.1.2.5.3, H.3).
+    /// JIS X 0212 and switching G1 are not used.
+    fn encode(&self, vr: VR, value: &str) -> Option<Vec<u8>> {
+        let single_valued = is_single_valued_text(vr);
+        let mut out = Vec::with_capacity(value.len() * 2);
+        let mut g0 = self.initial_g0;
+        let switch_g0 = |out: &mut Vec<u8>, g0: &mut G0, target: G0| {
+            if *g0 != target {
+                out.extend_from_slice(match target {
+                    G0::Ascii => b"\x1b(B".as_slice(),
+                    G0::JisRoman => b"\x1b(J".as_slice(),
+                    G0::Jis0208 => b"\x1b$B".as_slice(),
+                    G0::Jis0212 => b"\x1b$(D".as_slice(),
+                });
+                *g0 = target;
+            }
+        };
+
+        for c in value.chars() {
+            let code = u32::from(c);
+            if c.is_ascii() {
+                // JIS X 0201 Romaji differs from ASCII only at 0x5C and 0x7E.
+                let roman_ok = c != '\\' && c != '~';
+                let target = if self.initial_g0 == G0::JisRoman && roman_ok {
+                    G0::JisRoman
+                } else {
+                    G0::Ascii
+                };
+                if !(g0 == G0::Ascii || (g0 == G0::JisRoman && roman_ok)) {
+                    switch_g0(&mut out, &mut g0, target);
+                }
+                out.push(c as u8);
+            } else if (c == '\u{00A5}' && single_valued) || c == '\u{203E}' {
+                // Yen sign and overline exist only in JIS X 0201 Romaji.
+                if self.initial_g0 != G0::JisRoman {
+                    return None;
+                }
+                switch_g0(&mut out, &mut g0, G0::JisRoman);
+                out.push(if c == '\u{00A5}' { b'\\' } else { b'~' });
+            } else if (0xFF61..=0xFF9F).contains(&code) {
+                // Half-width katakana in G1.
+                if self.initial_g1 != G1::Katakana {
+                    return None;
+                }
+                out.push(0xA1 + (code - 0xFF61) as u8);
+            } else if self.initial_g1 == G1::Latin1 && (0xA0..=0xFF).contains(&code) {
+                out.push(code as u8);
+            } else {
+                if !self.has_jis0208 {
+                    return None;
+                }
+                let mut buffer = [0_u8; 4];
+                let (euc, _, had_errors) = EUC_JP.encode(c.encode_utf8(&mut buffer));
+                match euc.as_ref() {
+                    [first, second] if !had_errors && *first >= 0xA1 && *second >= 0xA1 => {
+                        switch_g0(&mut out, &mut g0, G0::Jis0208);
+                        out.extend_from_slice(&[first & 0x7F, second & 0x7F]);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        switch_g0(&mut out, &mut g0, self.initial_g0);
+        Some(out)
     }
 
     /// Returns `None` for escape sequences this decoder does not know.
@@ -225,7 +318,7 @@ pub fn is_charset_sensitive(vr: VR) -> bool {
 }
 
 /// Text VRs that hold a single value, so that `\` is not a value delimiter.
-fn is_single_valued_text(vr: VR) -> bool {
+pub fn is_single_valued_text(vr: VR) -> bool {
     matches!(vr, VR::ST | VR::LT | VR::UT)
 }
 
@@ -270,6 +363,17 @@ pub fn dicom_rs_write(codec: &SpecificCharacterSet, parts: &[String]) -> Option<
         .map(|part| codec.encode(part).ok())
         .collect::<Option<Vec<_>>>()?;
     Some(encoded.join(&b'\\'))
+}
+
+/// Whether dicom-rs maps every byte to one character and back with `codec`
+/// (ISO-8859-1), so that any bytes can be passed through it as a string.
+pub fn dicom_rs_codec_is_byte_transparent(codec: &SpecificCharacterSet) -> bool {
+    matches!(codec.name().as_ref(), "ISO_IR 6" | "ISO_IR 100")
+}
+
+/// The string that dicom-rs writes as exactly `bytes` with a byte-transparent codec.
+pub fn byte_transparent_string(bytes: &[u8]) -> String {
+    latin1(bytes)
 }
 
 /// Whether dicom-rs, reading and writing a value with `codec`, writes back the same bytes.
@@ -421,5 +525,61 @@ mod tests {
         assert!(dicom_rs_round_trips(&latin1, VR::LO, b"\xca\xdd"));
         assert!(!dicom_rs_round_trips(&utf8, VR::LO, b"\xca\xdd"));
         assert!(dicom_rs_round_trips(&utf8, VR::LO, "前立腺".as_bytes()));
+    }
+
+    #[test]
+    fn encodes_annex_h_examples() {
+        // H.3.1 and H.3.2 give the exact bytes, including where escape sequences go.
+        assert_eq!(
+            charset("\\ISO 2022 IR 87")
+                .encode(VR::PN, "Yamada^Tarou=山田^太郎=やまだ^たろう")
+                .unwrap(),
+            YAMADA_IR87
+        );
+        let h32 = b"\xd4\xcf\xc0\xde^\xc0\xdb\xb3=\x1b$B;3ED\x1b(J^\x1b$BB@O:\x1b(J=\x1b$B$d$^$@\x1b(J^\x1b$B$?$m$&\x1b(J";
+        assert_eq!(
+            charset("ISO 2022 IR 13\\ISO 2022 IR 87")
+                .encode(VR::PN, "ﾔﾏﾀﾞ^ﾀﾛｳ=山田^太郎=やまだ^たろう")
+                .unwrap(),
+            h32
+        );
+    }
+
+    #[test]
+    fn encoded_text_decodes_back() {
+        let cases = [
+            ("\\ISO 2022 IR 87", VR::LO, "前立腺\\PTV 70Gy\\直腸"),
+            ("\\ISO 2022 IR 87", VR::LT, "一行目\r\n二行目 \\ 記号"),
+            ("ISO 2022 IR 13\\ISO 2022 IR 87", VR::SH, "ｶﾅ漢字ABC"),
+            ("ISO_IR 13", VR::ST, "100¥‾ ﾃｽﾄ"),
+            ("ISO 2022 IR 100\\ISO 2022 IR 87", VR::LO, "Café 山田"),
+        ];
+        for (value, vr, text) in cases {
+            let charset = charset(value);
+            let bytes = charset.encode(vr, text).unwrap();
+            assert_eq!(charset.decode(vr, &bytes), text, "{value:?} {text:?}");
+        }
+    }
+
+    #[test]
+    fn plain_ascii_needs_no_escape_sequences() {
+        assert_eq!(
+            charset("\\ISO 2022 IR 87").encode(VR::LO, "PTV").unwrap(),
+            b"PTV"
+        );
+        assert_eq!(charset("ISO_IR 13").encode(VR::LO, "PTV").unwrap(), b"PTV");
+    }
+
+    #[test]
+    fn rejects_characters_the_declared_sets_cannot_hold() {
+        // No JIS X 0208 declared.
+        assert_eq!(charset("ISO_IR 13").encode(VR::LO, "患者"), None);
+        // No JIS X 0201 Katakana declared.
+        assert_eq!(charset("\\ISO 2022 IR 87").encode(VR::LO, "ｶﾅ"), None);
+        // Outside JIS X 0208.
+        assert_eq!(charset("\\ISO 2022 IR 87").encode(VR::LO, "😀"), None);
+        assert_eq!(charset("\\ISO 2022 IR 87").encode(VR::LO, "£"), None);
+        // A yen sign would be the value delimiter in a multi-valued VR.
+        assert_eq!(charset("ISO_IR 13").encode(VR::LO, "¥"), None);
     }
 }
