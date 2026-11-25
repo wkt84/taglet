@@ -20,9 +20,9 @@ use std::io::{BufReader, Read};
 use std::str::FromStr;
 
 use super::charset::{
-    byte_transparent_string, declaration_terms, dicom_rs_codec_after,
-    dicom_rs_codec_is_byte_transparent, dicom_rs_read, dicom_rs_write, is_charset_sensitive,
-    is_single_valued_text, is_writable_declaration, trim_padding, TextCharset,
+    byte_transparent_string, dicom_rs_codec_after, dicom_rs_codec_is_byte_transparent,
+    dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_single_valued_text,
+    is_writable_declaration, trim_padding, TextCharset,
 };
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
@@ -1018,19 +1018,17 @@ fn plan_splice(
     node_declarations(nodes, &[], "", &mut new_declarations)?;
     let mut converted = HashMap::new();
     for (container, declaration) in &new_declarations {
+        let charset = TextCharset::from_specific_character_set(declaration);
         let old = old_declarations
             .get(container)
-            .map(|old: &String| declaration_terms(old));
-        if old != Some(declaration_terms(declaration)) {
+            .map(|old: &String| TextCharset::from_specific_character_set(old));
+        if old.as_ref() != Some(&charset) {
             // Declarations Taglet cannot write text in are left to the full writer, which
             // saves them when no text changes meaning, as before.
             if !is_writable_declaration(declaration) {
                 return Ok(None);
             }
-            converted.insert(
-                container.clone(),
-                TextCharset::from_specific_character_set(declaration),
-            );
+            converted.insert(container.clone(), charset);
         }
     }
 
@@ -1094,18 +1092,30 @@ fn plan_splice(
             Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
         }
     }
+    let mut conversion_failures = Vec::new();
     if !converted.is_empty() {
         match convert_text(index.nodes(), text, &converted, &edited, &diff.removed) {
             Ok(replacements) => edits.replacements.extend(replacements),
-            Err(mut conversion_failures) => failures.append(&mut conversion_failures),
+            Err(failures) => conversion_failures = failures,
         }
     }
-    if !failures.is_empty() {
-        failures.sort();
-        return Err(format!(
-            "Cannot save: these text values cannot be saved as shown: {}",
-            failures.join("; ")
-        ));
+    if !failures.is_empty() || !conversion_failures.is_empty() {
+        let mut reasons = Vec::new();
+        if !failures.is_empty() {
+            failures.sort();
+            reasons.push(format!(
+                "these text values cannot be saved as shown: {}",
+                failures.join("; ")
+            ));
+        }
+        if !conversion_failures.is_empty() {
+            conversion_failures.sort();
+            reasons.push(format!(
+                "changing the Specific Character Set needs these values written in the new character set, which is not possible: {}",
+                conversion_failures.join("; ")
+            ));
+        }
+        return Err(format!("Cannot save: {}", reasons.join(". ")));
     }
     edits.removals = diff.removed;
     Ok(Some((index, edits)))
@@ -1212,6 +1222,8 @@ fn convert_text(
         let Some(charset) = converted.get(container) else {
             continue;
         };
+        // Elements of unknown VR (e.g. private elements in Implicit VR files, read as
+        // UN) are bytes to Taglet, so they are kept as they are.
         let Some(vr) = vr.filter(|vr| is_charset_sensitive(*vr)) else {
             continue;
         };
@@ -2434,7 +2446,7 @@ fn encode_edited_text(
         match dicom_rs_write(codec, stored) {
             Some(written) if charset.decode(vr, &written) == entered => Ok(None),
             _ => Err(
-                "it can only be written by editing the file in place, which needs an Explicit or Implicit VR Little Endian file and a save that does not add or remove sequences or items, change the SOP UIDs, or change the Specific Character Set to one Taglet cannot write text in".to_string(),
+                "it can only be written by editing the file in place, which is possible for Explicit or Implicit VR Little Endian files without group length elements, when the save does not add or remove sequences or items or change the SOP UIDs, and, when the Specific Character Set changes, if Taglet can write text in the new one".to_string(),
             ),
         }
     }
@@ -4714,6 +4726,49 @@ mod tests {
                 && error.contains("not valid in the current character set"),
             "{error}"
         );
+    }
+
+    /// A declaration dicom-rs does not know (here a misspelling of ISO_IR 192) is not
+    /// taken as the character set it resembles: the text is neither left unconverted
+    /// nor garbled.
+    #[test]
+    fn misspelled_declarations_do_not_garble_text() {
+        let path = temp_path("convert-misspelled.dcm");
+        write_part10(
+            &path,
+            Some(b"ISO_IR 192"),
+            &explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+        );
+        let original = std::fs::read(&path).unwrap();
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "ISO IR 192");
+        let saved = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(saved.is_err());
+        assert_eq!(after, original);
+    }
+
+    /// ISO 2022 values may designate their G1 set themselves (here ESC ) I).
+    #[test]
+    fn text_designating_its_own_g1_set_is_converted() {
+        let path = temp_path("convert-g1.dcm");
+        write_part10(
+            &path,
+            Some(b"\\ISO 2022 IR 13"),
+            &explicit_element(0x0010, 0x0020, b"LO", b"\x1b)I\xca\xdd"),
+        );
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        assert_eq!(value_and_editable(&nodes, "(0010,0020)").0, "ﾊﾝ");
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert!(contains(&saved, "ﾊﾝ".as_bytes()));
+        let reopened = reopen("convert-g1-reopened.dcm", &saved);
+        assert_eq!(value_and_editable(&reopened, "(0010,0020)").0, "ﾊﾝ");
     }
 
     #[test]
