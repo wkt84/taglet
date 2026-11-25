@@ -44,7 +44,7 @@ impl TextCharset {
 
     /// Encode text for a value, one value at a time so that every value starts in the
     /// initial character set. `None` when some character cannot be represented.
-    pub fn encode(&self, vr: VR, text: &str) -> Option<Vec<u8>> {
+    pub fn encode(&self, vr: VR, text: &str) -> Result<Vec<u8>, EncodeError> {
         let values = if is_single_valued_text(vr) {
             vec![text]
         } else {
@@ -54,10 +54,17 @@ impl TextCharset {
             .into_iter()
             .map(|value| match self {
                 TextCharset::Iso2022(charset) => charset.encode(vr, value),
-                TextCharset::Codec(codec) => codec.encode(value).ok(),
+                TextCharset::Codec(codec) => codec.encode(value).map_err(|_| {
+                    let mut buffer = [0_u8; 4];
+                    let c = value
+                        .chars()
+                        .find(|c| codec.encode(c.encode_utf8(&mut buffer)).is_err())
+                        .unwrap_or(char::REPLACEMENT_CHARACTER);
+                    EncodeError::Unrepresentable(c)
+                }),
             })
-            .collect::<Option<Vec<_>>>()?;
-        Some(encoded.join(&b'\\'))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(encoded.join(&b'\\'))
     }
 
     /// Decode a value's bytes, without trailing padding.
@@ -68,6 +75,37 @@ impl TextCharset {
         };
         let decoded = decoded.unwrap_or_else(|| latin1(bytes));
         trim_padding(&decoded).to_string()
+    }
+}
+
+/// Why text cannot be encoded in a value's character set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    /// The declared character sets have no code for this character.
+    Unrepresentable(char),
+    /// The character needs a code extension (escape sequence), which a single-valued
+    /// Specific Character Set does not allow (PS3.3 C.12.1.1.2).
+    CodeExtensionNotAllowed(char),
+    /// The first (alphabetic) component group of a Person Name must not use code
+    /// extensions (PS3.5 6.2.1.2).
+    FirstPersonNameGroup(char),
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::Unrepresentable(c) => {
+                write!(f, "'{c}' cannot be written in this file's character set")
+            }
+            EncodeError::CodeExtensionNotAllowed(c) => write!(
+                f,
+                "'{c}' needs an escape sequence, which this file's single-valued Specific Character Set does not allow"
+            ),
+            EncodeError::FirstPersonNameGroup(c) => write!(
+                f,
+                "'{c}' cannot be in the first (alphabetic) name group; put kanji and kana after '=', e.g. \"Yamada^Taro=山田^太郎\" or \"=山田^太郎\""
+            ),
+        }
     }
 }
 
@@ -101,6 +139,10 @@ pub struct Iso2022Charset {
     /// Whether JIS X 0208 (ISO 2022 IR 87) is declared, so that it can be used when
     /// encoding.
     has_jis0208: bool,
+    /// Whether escape sequences may be written. Not with a single-valued declaration
+    /// such as "ISO_IR 13" (PS3.3 C.12.1.1.2); a lone "ISO 2022 IR 87", seen in the
+    /// field, still uses them as there is no other way to write kanji.
+    code_extensions: bool,
 }
 
 impl Iso2022Charset {
@@ -117,6 +159,7 @@ impl Iso2022Charset {
             initial_g0,
             initial_g1,
             has_jis0208,
+            code_extensions: terms.len() > 1 || has_jis0208,
         }
     }
 
@@ -124,20 +167,36 @@ impl Iso2022Charset {
     /// possible and from JIS X 0208 otherwise. Before delimiters and at the end of the
     /// value the encoder switches back to the initial G0 set (PS3.5 6.1.2.5.3, H.3).
     /// JIS X 0212 and switching G1 are not used.
-    fn encode(&self, vr: VR, value: &str) -> Option<Vec<u8>> {
+    fn encode(&self, vr: VR, value: &str) -> Result<Vec<u8>, EncodeError> {
         let single_valued = is_single_valued_text(vr);
         let mut out = Vec::with_capacity(value.len() * 2);
         let mut g0 = self.initial_g0;
-        let switch_g0 = |out: &mut Vec<u8>, g0: &mut G0, target: G0| {
-            if *g0 != target {
-                out.extend_from_slice(match target {
-                    G0::Ascii => b"\x1b(B".as_slice(),
-                    G0::JisRoman => b"\x1b(J".as_slice(),
-                    G0::Jis0208 => b"\x1b$B".as_slice(),
-                    G0::Jis0212 => b"\x1b$(D".as_slice(),
-                });
-                *g0 = target;
+        let mut first_name_group = vr == VR::PN;
+        let switch_g0 = |out: &mut Vec<u8>,
+                         g0: &mut G0,
+                         target: G0,
+                         c: char,
+                         first_name_group: bool|
+         -> Result<(), EncodeError> {
+            if *g0 == target {
+                return Ok(());
             }
+            if target != self.initial_g0 {
+                if first_name_group {
+                    return Err(EncodeError::FirstPersonNameGroup(c));
+                }
+                if !self.code_extensions {
+                    return Err(EncodeError::CodeExtensionNotAllowed(c));
+                }
+            }
+            out.extend_from_slice(match target {
+                G0::Ascii => b"\x1b(B".as_slice(),
+                G0::JisRoman => b"\x1b(J".as_slice(),
+                G0::Jis0208 => b"\x1b$B".as_slice(),
+                G0::Jis0212 => b"\x1b$(D".as_slice(),
+            });
+            *g0 = target;
+            Ok(())
         };
 
         for c in value.chars() {
@@ -151,41 +210,45 @@ impl Iso2022Charset {
                     G0::Ascii
                 };
                 if !(g0 == G0::Ascii || (g0 == G0::JisRoman && roman_ok)) {
-                    switch_g0(&mut out, &mut g0, target);
+                    switch_g0(&mut out, &mut g0, target, c, first_name_group)?;
                 }
                 out.push(c as u8);
+                if c == '=' {
+                    first_name_group = false;
+                }
             } else if (c == '\u{00A5}' && single_valued) || c == '\u{203E}' {
                 // Yen sign and overline exist only in JIS X 0201 Romaji.
                 if self.initial_g0 != G0::JisRoman {
-                    return None;
+                    return Err(EncodeError::Unrepresentable(c));
                 }
-                switch_g0(&mut out, &mut g0, G0::JisRoman);
+                switch_g0(&mut out, &mut g0, G0::JisRoman, c, first_name_group)?;
                 out.push(if c == '\u{00A5}' { b'\\' } else { b'~' });
             } else if (0xFF61..=0xFF9F).contains(&code) {
-                // Half-width katakana in G1.
+                // Half-width katakana in G1, a single-byte set without code extension.
                 if self.initial_g1 != G1::Katakana {
-                    return None;
+                    return Err(EncodeError::Unrepresentable(c));
                 }
                 out.push(0xA1 + (code - 0xFF61) as u8);
             } else if self.initial_g1 == G1::Latin1 && (0xA0..=0xFF).contains(&code) {
                 out.push(code as u8);
             } else {
                 if !self.has_jis0208 {
-                    return None;
+                    return Err(EncodeError::Unrepresentable(c));
                 }
                 let mut buffer = [0_u8; 4];
                 let (euc, _, had_errors) = EUC_JP.encode(c.encode_utf8(&mut buffer));
                 match euc.as_ref() {
                     [first, second] if !had_errors && *first >= 0xA1 && *second >= 0xA1 => {
-                        switch_g0(&mut out, &mut g0, G0::Jis0208);
+                        switch_g0(&mut out, &mut g0, G0::Jis0208, c, first_name_group)?;
                         out.extend_from_slice(&[first & 0x7F, second & 0x7F]);
                     }
-                    _ => return None,
+                    _ => return Err(EncodeError::Unrepresentable(c)),
                 }
             }
         }
-        switch_g0(&mut out, &mut g0, self.initial_g0);
-        Some(out)
+        let initial = self.initial_g0;
+        switch_g0(&mut out, &mut g0, initial, ' ', false)?;
+        Ok(out)
     }
 
     /// Returns `None` for escape sequences this decoder does not know.
@@ -573,13 +636,45 @@ mod tests {
     #[test]
     fn rejects_characters_the_declared_sets_cannot_hold() {
         // No JIS X 0208 declared.
-        assert_eq!(charset("ISO_IR 13").encode(VR::LO, "患者"), None);
+        assert!(charset("ISO_IR 13").encode(VR::LO, "患者").is_err());
         // No JIS X 0201 Katakana declared.
-        assert_eq!(charset("\\ISO 2022 IR 87").encode(VR::LO, "ｶﾅ"), None);
+        assert!(charset("\\ISO 2022 IR 87").encode(VR::LO, "ｶﾅ").is_err());
         // Outside JIS X 0208.
-        assert_eq!(charset("\\ISO 2022 IR 87").encode(VR::LO, "😀"), None);
-        assert_eq!(charset("\\ISO 2022 IR 87").encode(VR::LO, "£"), None);
+        assert!(charset("\\ISO 2022 IR 87").encode(VR::LO, "😀").is_err());
+        assert!(charset("\\ISO 2022 IR 87").encode(VR::LO, "£").is_err());
         // A yen sign would be the value delimiter in a multi-valued VR.
-        assert_eq!(charset("ISO_IR 13").encode(VR::LO, "¥"), None);
+        assert!(charset("ISO_IR 13").encode(VR::LO, "¥").is_err());
+    }
+
+    #[test]
+    fn first_person_name_group_stays_in_the_initial_repertoire() {
+        let ir87 = charset("\\ISO 2022 IR 87");
+        assert_eq!(
+            ir87.encode(VR::PN, "山田^太郎"),
+            Err(EncodeError::FirstPersonNameGroup('山'))
+        );
+        assert!(ir87.encode(VR::PN, "=山田^太郎").is_ok());
+        assert!(ir87.encode(VR::PN, "Yamada^Taro=山田^太郎").is_ok());
+        // Other VRs may use kanji anywhere.
+        assert!(ir87.encode(VR::LO, "山田^太郎").is_ok());
+        // Half-width katakana in G1 needs no code extension.
+        assert!(charset("ISO 2022 IR 13\\ISO 2022 IR 87")
+            .encode(VR::PN, "ﾔﾏﾀﾞ^ﾀﾛｳ=山田^太郎")
+            .is_ok());
+    }
+
+    #[test]
+    fn single_valued_declarations_use_no_escape_sequences() {
+        let ir13 = charset("ISO_IR 13");
+        assert_eq!(
+            ir13.encode(VR::LO, "PTV~"),
+            Err(EncodeError::CodeExtensionNotAllowed('~'))
+        );
+        assert!(ir13.encode(VR::ST, "100¥‾ ﾃｽﾄ").is_ok());
+        // With code extensions declared, ASCII can be switched to.
+        let bytes = charset("ISO 2022 IR 13\\ISO 2022 IR 87")
+            .encode(VR::LO, "PTV~")
+            .unwrap();
+        assert_eq!(bytes, b"PTV\x1b(B~\x1b(J");
     }
 }

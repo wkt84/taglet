@@ -570,23 +570,27 @@ pub fn apply_nodes_to_object(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
 ) -> Result<(), String> {
-    apply_nodes_to_object_with_text(obj, nodes, &TextValues::default())
+    apply_nodes_to_object_with_text(obj, nodes, &TextValues::default()).map(|_| ())
 }
 
-/// Apply nodes, treating values shown as decoded by `text` as unedited.
+/// Apply nodes, comparing values that `text` decoded with their decoded form. Returns
+/// the paths of the values that were edited or added.
 pub fn apply_nodes_to_object_with_text(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
     text: &TextValues,
-) -> Result<(), String> {
+) -> Result<HashSet<Vec<String>>, String> {
     validate_private_nodes(obj, nodes)?;
-    apply_validated_nodes_to_object(obj, nodes, text)
+    let mut edited = HashSet::new();
+    apply_validated_nodes_to_object(obj, nodes, text, &mut edited)?;
+    Ok(edited)
 }
 
 fn apply_validated_nodes_to_object(
     obj: &mut InMemDicomObject,
     nodes: &[DicomNode],
     text: &TextValues,
+    edited: &mut HashSet<Vec<String>>,
 ) -> Result<(), String> {
     let desired_tags = nodes
         .iter()
@@ -619,11 +623,14 @@ fn apply_validated_nodes_to_object(
                     continue;
                 }
                 let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
-                let shown_as_read = text
-                    .get(path)
-                    .is_some_and(|read| read.decoded == trim_padding(value));
-                if is_text_editable(vr) && !shown_as_read && !element_has_value(obj, tag, vr, value)
-                {
+                // Values decoded by Taglet are compared as shown, not with dicom-rs's
+                // string, which can differ from what was shown.
+                let unchanged = match text.get(path) {
+                    Some(read) => read.decoded == trim_padding(value),
+                    None => element_has_value(obj, tag, vr, value),
+                };
+                if is_text_editable(vr) && !unchanged {
+                    edited.insert(path.clone());
                     if tag == tags::SPECIFIC_CHARACTER_SET {
                         // Keep multiple values, which dicom-rs needs to switch character sets.
                         let values = value.split('\\').map(str::to_string).collect();
@@ -638,7 +645,7 @@ fn apply_validated_nodes_to_object(
                 obj.update_value(tag, |value| {
                     if let Some(sequence_items) = value.items_mut() {
                         for (item, next_nodes) in sequence_items.iter_mut().zip(items.iter()) {
-                            let _ = apply_validated_nodes_to_object(item, next_nodes, text);
+                            let _ = apply_validated_nodes_to_object(item, next_nodes, text, edited);
                         }
                     }
                 });
@@ -658,8 +665,8 @@ pub fn save_object_with_nodes(
     destination: &str,
 ) -> Result<(), String> {
     let mut candidate = object.clone();
-    apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
-    prepare_text_for_writing(&mut candidate, text)?;
+    let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text)?;
+    prepare_text_for_writing(&mut candidate, text, &edited)?;
     sync_file_meta_from_dataset(&mut candidate);
     write_file_atomically(&candidate, destination)?;
     *object = candidate;
@@ -1166,14 +1173,16 @@ fn element_has_value(obj: &InMemDicomObject, tag: Tag, vr: VR, value: &str) -> b
 pub fn prepare_text_for_writing(
     obj: &mut InMemDicomObject,
     text: &TextValues,
+    edited: &HashSet<Vec<String>>,
 ) -> Result<(), String> {
     let mut failures = Vec::new();
     let mut codec = SpecificCharacterSet::default();
+    let context = TextWriteContext { text, edited };
     prepare_text_values(
         obj,
         &[],
         &TextCharset::default(),
-        text,
+        &context,
         &mut codec,
         &mut failures,
     );
@@ -1183,22 +1192,28 @@ pub fn prepare_text_for_writing(
     let shown = failures
         .iter()
         .take(5)
-        .map(|path| path.join(" / "))
+        .map(|(path, reason)| format!("{} ({reason})", path.join(" / ")))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join("; ");
     Err(format!(
-        "Cannot save: these text values cannot be saved as shown in this file's character set: {shown}{}",
-        if failures.len() > 5 { ", ..." } else { "" }
+        "Cannot save: these text values cannot be saved as shown: {shown}{}",
+        if failures.len() > 5 { "; ..." } else { "" }
     ))
+}
+
+struct TextWriteContext<'a> {
+    text: &'a TextValues,
+    /// Paths of values the user edited or added.
+    edited: &'a HashSet<Vec<String>>,
 }
 
 fn prepare_text_values(
     obj: &mut InMemDicomObject,
     parent_path: &[String],
     inherited_charset: &TextCharset,
-    text: &TextValues,
+    context: &TextWriteContext,
     codec: &mut SpecificCharacterSet,
-    failures: &mut Vec<Vec<String>>,
+    failures: &mut Vec<(Vec<String>, String)>,
 ) {
     // The character set that the saved file declares for this dataset or item.
     let charset = match obj.get(tags::SPECIFIC_CHARACTER_SET) {
@@ -1223,7 +1238,9 @@ fn prepare_text_values(
                         for (index, item) in items.iter_mut().enumerate() {
                             let mut item_path = path.clone();
                             item_path.push(format!("Item#{index}"));
-                            prepare_text_values(item, &item_path, &charset, text, codec, failures);
+                            prepare_text_values(
+                                item, &item_path, &charset, context, codec, failures,
+                            );
                         }
                     }
                 });
@@ -1245,9 +1262,10 @@ fn prepare_text_values(
                 // Compare joined values: dicom-rs splits values at every 0x5C byte, also
                 // inside a kanji, while values Taglet stored after encoding are split
                 // per value.
-                let original = text.get(&path).filter(|original| {
-                    dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
-                        .is_some_and(|read| read.join("\\") == stored.join("\\"))
+                let original = context.text.get(&path).filter(|original| {
+                    !context.edited.contains(&path)
+                        && dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
+                            .is_some_and(|read| read.join("\\") == stored.join("\\"))
                 });
                 match original {
                     Some(original) => {
@@ -1255,16 +1273,17 @@ fn prepare_text_values(
                             .is_some_and(|written| written == original.bytes)
                             && charset.decode(original.vr, &original.bytes) == original.decoded;
                         if !keeps_value {
-                            failures.push(path);
+                            let reason = "its bytes or meaning would change".to_string();
+                            failures.push((path, reason));
                         }
                     }
                     None => match encode_edited_text(&charset, codec, vr, &stored) {
-                        Some(Some(parts)) => {
+                        Ok(Some(parts)) => {
                             let value = PrimitiveValue::Strs(parts.into());
                             obj.put(DataElement::new(tag, vr, value));
                         }
-                        Some(None) => {}
-                        None => failures.push(path),
+                        Ok(None) => {}
+                        Err(reason) => failures.push((path, reason)),
                     },
                 }
             }
@@ -1273,20 +1292,23 @@ fn prepare_text_values(
     }
 }
 
-/// Encode edited text. Returns `Some(Some(parts))` with strings to store when dicom-rs
-/// must be handed pre-encoded bytes, `Some(None)` when the stored text can be written
-/// as it is, and `None` when the text cannot be saved as entered.
+/// Encode edited text. Returns `Ok(Some(parts))` with strings to store when dicom-rs
+/// must be handed pre-encoded bytes, `Ok(None)` when the stored text can be written as
+/// it is, and why it cannot be saved as entered otherwise.
 fn encode_edited_text(
     charset: &TextCharset,
     codec: &SpecificCharacterSet,
     vr: VR,
     stored: &[String],
-) -> Option<Option<Vec<String>>> {
+) -> Result<Option<Vec<String>>, String> {
+    let reads_back_differently = || "it would read back differently".to_string();
     let entered = stored.join("\\");
     let entered = trim_padding(&entered);
-    let expected = charset.encode(vr, entered)?;
+    let expected = charset
+        .encode(vr, entered)
+        .map_err(|error| error.to_string())?;
     if charset.decode(vr, &expected) != entered {
-        return None;
+        return Err(reads_back_differently());
     }
     if dicom_rs_codec_is_byte_transparent(codec) {
         let values = if is_single_valued_text(vr) {
@@ -1300,12 +1322,21 @@ fn encode_edited_text(
                 charset
                     .encode(vr, value)
                     .map(|bytes| byte_transparent_string(&bytes))
+                    .map_err(|error| error.to_string())
             })
-            .collect::<Option<Vec<_>>>()?;
-        (dicom_rs_write(codec, &parts)? == expected).then_some(Some(parts))
+            .collect::<Result<Vec<_>, _>>()?;
+        if dicom_rs_write(codec, &parts).as_ref() == Some(&expected) {
+            Ok(Some(parts))
+        } else {
+            Err(reads_back_differently())
+        }
     } else {
-        let written = dicom_rs_write(codec, stored)?;
-        (charset.decode(vr, &written) == entered).then_some(None)
+        match dicom_rs_write(codec, stored) {
+            Some(written) if charset.decode(vr, &written) == entered => Ok(None),
+            _ => Err(
+                "it cannot be written in this file's character set at this position".to_string(),
+            ),
+        }
     }
 }
 
@@ -3042,6 +3073,65 @@ mod tests {
         assert_eq!(
             value_and_editable(&reopened, "(3006,0026)"),
             ("ボーラス".to_string(), true)
+        );
+    }
+
+    /// Review on #9: kanji in the first (alphabetic) Person Name group is rejected with
+    /// guidance; after '=' it is saved.
+    #[test]
+    fn kanji_in_the_first_person_name_group_blocks_saving() {
+        let path = temp_path("pn-first-group.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let save_name = |name: &str| {
+            let mut nodes = opened.clone();
+            *find_element_mut(&mut nodes, &["(0010,0010)"]).unwrap() = name.to_string();
+            save_and_reopen(&path, &nodes)
+        };
+        let first_group = save_name("山田^太郎");
+        let second_group = save_name("=山田^太郎");
+        std::fs::remove_file(&path).ok();
+
+        let error = first_group.unwrap_err();
+        assert!(error.contains("(0010,0010)"), "{error}");
+        assert!(error.contains("first (alphabetic) name group"), "{error}");
+        assert_eq!(
+            value_and_editable(&second_group.unwrap().1.nodes, "(0010,0010)"),
+            ("=山田^太郎".to_string(), true)
+        );
+    }
+
+    /// Review on #9: a single-valued "ISO_IR 13" gets no escape sequences.
+    #[test]
+    fn single_valued_ir13_rejects_characters_needing_escape_sequences() {
+        let path = temp_path("ir13-tilde.dcm");
+        write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, b"PTV"));
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"]).unwrap() =
+            "PTV~".to_string();
+        let saved = save_and_reopen(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(error.contains("single-valued"), "{error}");
+    }
+
+    /// Review on #9: an edit that equals dicom-rs's string for the original bytes is
+    /// still treated as an edit (here: rejected, as ISO_IR 13 cannot hold it).
+    #[test]
+    fn edits_equal_to_dicom_rs_strings_are_not_ignored() {
+        let path = temp_path("ir13-latin1-lookalike.dcm");
+        write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, HAN_IR13));
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"]).unwrap() =
+            "\u{CA}\u{DD}".to_string();
+        let saved = save_and_reopen(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
         );
     }
 }
