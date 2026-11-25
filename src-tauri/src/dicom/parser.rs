@@ -689,6 +689,13 @@ pub fn save_file_with_nodes(
     destination: &str,
     allow_splice: bool,
 ) -> Result<bool, String> {
+    // Editing signed data would leave signatures that no longer verify.
+    if has_digital_signatures(object) && nodes_change_object(object, nodes, text) {
+        return Err(
+            "Cannot save: this file has digital signatures (Digital Signatures Sequence or MAC Parameters Sequence), which the edits would invalidate."
+                .to_string(),
+        );
+    }
     let planned = if allow_splice {
         plan_splice(source, object, nodes, text)?
     } else {
@@ -897,6 +904,75 @@ fn same_structure(nodes: &[DicomNode], index: &[splice::IndexNode]) -> bool {
     from_nodes.sort();
     from_index.sort();
     from_nodes == from_index
+}
+
+/// Whether the data set, or any item in it, has a Digital Signatures Sequence
+/// (FFFA,FFFA) or a MAC Parameters Sequence (4FFE,0001).
+fn has_digital_signatures(obj: &InMemDicomObject) -> bool {
+    const DIGITAL_SIGNATURES_SEQUENCE: Tag = Tag(0xFFFA, 0xFFFA);
+    const MAC_PARAMETERS_SEQUENCE: Tag = Tag(0x4FFE, 0x0001);
+    obj.iter().any(|element| {
+        let tag = element.tag();
+        tag == DIGITAL_SIGNATURES_SEQUENCE
+            || tag == MAC_PARAMETERS_SEQUENCE
+            || matches!(element.value(), Value::Sequence(sequence)
+                if sequence.items().iter().any(has_digital_signatures))
+    })
+}
+
+/// Whether saving `nodes` would change `obj`: an edited value, or an element or item
+/// added or removed. Nodes that cannot be read count as changes.
+fn nodes_change_object(obj: &InMemDicomObject, nodes: &[DicomNode], text: &TextValues) -> bool {
+    fn object_shape(obj: &InMemDicomObject, parent: &[String], out: &mut Vec<String>) {
+        for element in obj.iter() {
+            let tag = element.tag();
+            if parent.is_empty() && tag >= PIXEL_DATA {
+                continue;
+            }
+            let mut path = parent.to_vec();
+            path.push(format_tag(tag));
+            match element.value() {
+                Value::Sequence(sequence) => {
+                    out.push(format!("{}#{}", path.join("/"), sequence.items().len()));
+                    for (index, item) in sequence.items().iter().enumerate() {
+                        let mut item_path = path.clone();
+                        item_path.push(format!("Item#{index}"));
+                        object_shape(item, &item_path, out);
+                    }
+                }
+                _ => out.push(path.join("/")),
+            }
+        }
+    }
+    fn node_shape(nodes: &[DicomNode], root: bool, out: &mut Vec<String>) {
+        for node in nodes {
+            let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
+                node;
+            if root && parse_tag(tag).is_ok_and(|tag| tag >= PIXEL_DATA) {
+                continue;
+            }
+            match node {
+                DicomNode::Element { .. } => out.push(path.join("/")),
+                DicomNode::Sequence { items, .. } => {
+                    out.push(format!("{}#{}", path.join("/"), items.len()));
+                    for item in items {
+                        node_shape(item, false, out);
+                    }
+                }
+            }
+        }
+    }
+    let mut edited = HashSet::new();
+    if collect_edited_paths(obj, nodes, text, &mut edited).is_err() || !edited.is_empty() {
+        return true;
+    }
+    let mut from_object = Vec::new();
+    object_shape(obj, &[], &mut from_object);
+    let mut from_nodes = Vec::new();
+    node_shape(nodes, true, &mut from_nodes);
+    from_object.sort();
+    from_nodes.sort();
+    from_object != from_nodes
 }
 
 /// Whether saving through the full writer would change the file meta information,
@@ -4148,5 +4224,38 @@ mod tests {
         assert!(shown);
         assert!(obj.get(Tag(0xFFFC, 0xFFFC)).is_none());
         assert!(obj.get(Tag(0x7FE1, 0x0010)).is_some());
+    }
+
+    /// Review on #10: edits to a signed file are refused; saving it unchanged is not.
+    #[test]
+    fn signed_files_cannot_be_saved_with_edits() {
+        let path = temp_path("signed.dcm");
+        let signature = sequence(
+            0xFFFA,
+            0xFFFA,
+            &[explicit_element(0x0400, 0x0015, b"CS", b"SHA256")],
+            true,
+        );
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0010, b"PN", b"Original"),
+            signature,
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let original = std::fs::read(&path).unwrap();
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let unchanged = save_file(&path, &opened);
+        let mut edited = opened.clone();
+        *find_element_mut(&mut edited, &["(0010,0010)"]).unwrap() = "Edited".to_string();
+        let edited_result = save_file(&path, &edited);
+        let mut removed = opened.clone();
+        remove_element(&mut removed, "(0010,0010)");
+        let removed_result = save_file(&path, &removed);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(unchanged.unwrap(), original);
+        assert!(edited_result.unwrap_err().contains("digital signatures"));
+        assert!(removed_result.unwrap_err().contains("digital signatures"));
     }
 }
