@@ -7,9 +7,10 @@ use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
 use crate::dicom::parser::{
-    apply_nodes_to_object, open_full_object, open_nodes, rt_struct_data,
+    apply_nodes_to_object, ensure_text_round_trips, open_full_object, open_nodes, rt_struct_data,
     sync_file_meta_from_dataset,
 };
+use crate::dicom::text_values::TextValues;
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
@@ -65,6 +66,14 @@ impl LaunchFileStore {
 }
 
 impl DicomStore {
+    pub fn current_path(&self) -> Result<String, String> {
+        self.current_path
+            .lock()
+            .map_err(|_| "DICOM store lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "No DICOM file is currently open".to_string())
+    }
+
     pub fn with_current_full_object<R>(
         &self,
         f: impl FnOnce(&DefaultDicomObject) -> Result<R, String>,
@@ -140,7 +149,7 @@ impl DicomStore {
                 .full
                 .as_ref()
                 .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
-            stored.rt_struct = Some(rt_struct_data(object)?);
+            stored.rt_struct = Some(rt_struct_data(object, &TextValues::read(&current_path))?);
         }
 
         let data = stored
@@ -234,6 +243,10 @@ fn save_to_path(
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
 ) -> Result<(), String> {
+    // Text is written through dicom-rs, which cannot write every value back with its
+    // original bytes (e.g. text in a character set set only inside a sequence item).
+    ensure_text_round_trips(&TextValues::read(&source_path))?;
+
     let mut objects = store
         .objects
         .lock()
