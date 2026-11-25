@@ -20,7 +20,8 @@ use std::io::{BufReader, Read};
 use std::str::FromStr;
 
 use super::charset::{
-    dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, trim_padding, TextCharset,
+    dicom_rs_codec_after, dicom_rs_read, dicom_rs_write, is_charset_sensitive, trim_padding,
+    TextCharset,
 };
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
@@ -643,11 +644,32 @@ pub fn save_object_with_nodes(
     apply_nodes_to_object(&mut candidate, nodes)?;
     ensure_text_round_trips(&candidate, text)?;
     sync_file_meta_from_dataset(&mut candidate);
-    candidate
-        .write_to_file(destination)
-        .map_err(|error| error.to_string())?;
+    write_file_atomically(&candidate, destination)?;
     *object = candidate;
     Ok(())
+}
+
+/// Write to a temporary file next to `destination` and move it into place, so that a
+/// failed write never leaves `destination` truncated.
+fn write_file_atomically(object: &DefaultDicomObject, destination: &str) -> Result<(), String> {
+    let temporary = temporary_save_path(destination);
+    let result = object
+        .write_to_file(&temporary)
+        .map_err(|error| error.to_string())
+        .and_then(|()| std::fs::rename(&temporary, destination).map_err(|error| error.to_string()));
+    if result.is_err() {
+        std::fs::remove_file(&temporary).ok();
+    }
+    result
+}
+
+fn temporary_save_path(destination: &str) -> std::path::PathBuf {
+    let destination = std::path::Path::new(destination);
+    let file_name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    destination.with_file_name(format!(".{file_name}.taglet-saving"))
 }
 
 pub fn sync_file_meta_from_dataset(obj: &mut DefaultDicomObject) {
@@ -1070,7 +1092,7 @@ pub fn ensure_text_round_trips(obj: &InMemDicomObject, text: &TextValues) -> Res
         .collect::<Vec<_>>()
         .join(", ");
     Err(format!(
-        "Saving is disabled for this file: these read-only text values would change their bytes or meaning: {shown}{}",
+        "Cannot save: these text values would not be saved as shown (their characters or bytes would change): {shown}{}",
         if failures.len() > 5 { ", ..." } else { "" }
     ))
 }
@@ -1112,25 +1134,34 @@ fn collect_text_write_failures(
                 *codec = dicom_rs_codec_after(codec.clone(), name);
             }
             Value::Primitive(value) => {
-                let Some(original) = text.get(&path) else {
+                let vr = element.vr();
+                if !is_charset_sensitive(vr) {
                     continue;
-                };
+                }
                 let stored = match value {
                     PrimitiveValue::Str(text) => vec![text.to_string()],
                     PrimitiveValue::Strs(texts) => texts.to_vec(),
                     _ => continue,
                 };
-                let read = dicom_rs_read(&original.read_codec, original.vr, &original.bytes);
-                if read.as_ref().is_some_and(|read| *read != stored) {
-                    // Edited by the user: written as entered.
-                    continue;
-                }
-                // Unedited text must keep its bytes and, under the character sets the
-                // saved file declares, its meaning.
                 let written = dicom_rs_write(codec, &stored);
-                if written.as_deref() != Some(original.bytes.as_slice())
-                    || charset.decode(original.vr, &original.bytes) != original.decoded
-                {
+                let original = text.get(&path).filter(|original| {
+                    dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
+                        .is_some_and(|read| read == stored)
+                });
+                let keeps_value = match (original, written) {
+                    // Unedited text must keep its bytes and, under the character sets the
+                    // saved file declares, its meaning.
+                    (Some(original), Some(written)) => {
+                        written == original.bytes
+                            && charset.decode(original.vr, &original.bytes) == original.decoded
+                    }
+                    // Edited or added text must read back as entered.
+                    (None, Some(written)) => {
+                        charset.decode(vr, &written) == trim_padding(&stored.join("\\"))
+                    }
+                    (_, None) => false,
+                };
+                if !keeps_value {
                     failures.push(path);
                 }
             }
@@ -2550,5 +2581,61 @@ mod tests {
             get_string(&obj, tags::MODALITY).as_deref(),
             Some("RTSTRUCT")
         );
+    }
+
+    /// Review P2 (4th round): edited text must read back as entered under the declared
+    /// character set.
+    #[test]
+    fn edited_text_that_would_read_back_differently_blocks_saving() {
+        let path = temp_path("ir13-edited-text.dcm");
+        write_part10(&path, Some(b"ISO_IR 13"), &roi_sequence(None, b"PTV"));
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let roi_name = ["(3006,0020)", "Item#0", "(3006,0026)"];
+
+        let mut pound = opened.clone();
+        *find_element_mut(&mut pound, &roi_name).unwrap() = "£".to_string();
+        let pound_result = save_nodes(&path, &pound);
+
+        let mut ascii = opened.clone();
+        *find_element_mut(&mut ascii, &roi_name).unwrap() = "PTV2".to_string();
+        let ascii_result = save_nodes(&path, &ascii);
+        std::fs::remove_file(&path).ok();
+
+        let error = pound_result.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
+        );
+        assert!(contains(&ascii_result.unwrap(), b"PTV2"));
+    }
+
+    /// Review P1 (4th round): saving over a file never leaves it truncated.
+    #[test]
+    fn failed_save_keeps_the_existing_destination_file() {
+        let path = temp_path("ir13-overwrite.dcm");
+        let rest = explicit_element(0x0010, 0x0020, b"LO", b"ID001");
+        write_part10(&path, Some(b"ISO_IR 13"), &rest);
+        let path_text = path.to_str().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Text the declared character set cannot hold is rejected before writing.
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "患者".to_string();
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        assert!(save_object_with_nodes(&mut obj, &nodes, &text, path_text).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A failing write leaves the destination as it was.
+        let unchanged = open_nodes(path_text).unwrap().nodes;
+        let temporary = temporary_save_path(path_text);
+        std::fs::create_dir(&temporary).unwrap();
+        let result = save_object_with_nodes(&mut obj, &unchanged, &text, path_text);
+        std::fs::remove_dir(&temporary).ok();
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.is_err());
+        assert_eq!(after, before);
     }
 }
