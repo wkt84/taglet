@@ -246,7 +246,7 @@ npm run test:e2e -- --headed
 
 リリースとは別に、テスト用の Windows ビルドを GitHub Actions で作れます（`.github/workflows/test-build.yml`）。タグやリリースは作らず、自動アップデート用のファイルも作りません。
 
-テスト版は `Taglet Test`（識別子 `dev.taglet.app.test`）という別のアプリとしてインストールされるので、リリース版と共存できます。インストール先や設定の保存先も別です。テスト版はファイルの関連付けをせず（`.dcm` をダブルクリックするとリリース版で開きます）、自動アップデートの確認もしません。設定は `src-tauri/tauri.test-build.conf.json` にあります。
+テスト版は `Taglet Test`（識別子 `dev.taglet.app.test`、実行ファイル `taglet-test.exe`）という別のアプリとしてインストールされるので、リリース版と共存できます。インストール先や設定の保存先も別で、リリース版を開いたままテスト版をインストールしても、リリース版は終了されません。テスト版はファイルの関連付けをせず（`.dcm` をダブルクリックするとリリース版で開きます）、自動アップデートの確認もしません。設定は `src-tauri/tauri.test-build.conf.json` にあります。
 
 - Actions タブの「Test Build (Windows)」で「Run workflow」を押し、ブランチを選んで実行する
 - または、Pull Request に `build:windows` ラベルを付ける（付けている間は、push のたびにビルドし直す）
