@@ -10,7 +10,7 @@
 //! Supported for now: Part 10 files whose data set is Explicit VR Little Endian
 //! (including encapsulated pixel data), and edits that only replace existing values.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
@@ -348,16 +348,24 @@ fn read_node(reader: &mut Reader) -> Result<IndexNode, String> {
     })
 }
 
-/// New values for elements, keyed by node path (as in `DicomNode::path`), already
-/// encoded and padded to an even length.
-pub type Replacements = HashMap<Vec<String>, Vec<u8>>;
+/// Changes to splice into a file. Paths are node paths (as in `DicomNode::path`).
+#[derive(Debug, Default)]
+pub struct Edits {
+    /// New values of existing elements, encoded and padded to an even length.
+    pub replacements: HashMap<Vec<String>, Vec<u8>>,
+    /// New elements (tag and encoded element, header included) by the path of the data
+    /// set or item they go into (empty for the top level).
+    pub insertions: HashMap<Vec<String>, Vec<(Tag, Vec<u8>)>>,
+    /// Existing plain elements to leave out.
+    pub removals: HashSet<Vec<String>>,
+}
 
-/// Write `source` to `out`, replacing the values in `replacements` and updating the
-/// lengths of enclosing defined-length items and sequences.
+/// Write `source` to `out` with `edits` applied, updating the lengths of enclosing
+/// defined-length items and sequences.
 pub fn write_spliced(
     source: &str,
     index: &FileIndex,
-    replacements: &Replacements,
+    edits: &Edits,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut file = File::open(source).map_err(|error| error.to_string())?;
@@ -368,11 +376,18 @@ pub fn write_spliced(
     let mut writer = SpliceWriter {
         source: &mut file,
         out,
-        replacements,
+        edits,
     };
     writer.copy(0, index.dataset_start)?;
     writer.nodes(&index.nodes, &[])?;
     writer.copy(index.dataset_end(), index.file_length)
+}
+
+/// An element with an Explicit VR Little Endian header, its value padded by the caller.
+pub fn encode_element(tag: Tag, vr: VR, value: &[u8]) -> Result<Vec<u8>, String> {
+    let mut element = element_header(tag, vr.to_bytes(), value.len())?;
+    element.extend_from_slice(value);
+    Ok(element)
 }
 
 impl FileIndex {
@@ -420,10 +435,21 @@ fn child_path(parent: &[String], segment: String) -> Vec<String> {
     path
 }
 
+/// New elements for the data set or item at `parent`, in tag order.
+fn sorted_insertions<'e>(edits: &'e Edits, parent: &[String]) -> Vec<&'e (Tag, Vec<u8>)> {
+    let mut insertions = edits
+        .insertions
+        .get(parent)
+        .map(|insertions| insertions.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    insertions.sort_by_key(|(tag, _)| *tag);
+    insertions
+}
+
 struct SpliceWriter<'a> {
     source: &'a mut File,
     out: &'a mut dyn Write,
-    replacements: &'a Replacements,
+    edits: &'a Edits,
 }
 
 impl SpliceWriter<'_> {
@@ -443,8 +469,24 @@ impl SpliceWriter<'_> {
     }
 
     fn nodes(&mut self, nodes: &[IndexNode], parent: &[String]) -> Result<(), String> {
+        let edits = self.edits;
+        let insertions = sorted_insertions(edits, parent);
+        let mut pending = insertions.into_iter().peekable();
         for node in nodes {
+            while let Some((_, element)) = pending.next_if(|(tag, _)| *tag < node.tag()) {
+                self.write(element)?;
+            }
+            if self
+                .edits
+                .removals
+                .contains(&child_path(parent, format_tag(node.tag())))
+            {
+                continue;
+            }
             self.node(node, parent)?;
+        }
+        for (_, element) in pending {
+            self.write(element)?;
         }
         Ok(())
     }
@@ -456,7 +498,7 @@ impl SpliceWriter<'_> {
         }
         match node {
             IndexNode::Element { tag, vr_bytes, .. } => {
-                let value = &self.replacements[&path];
+                let value = &self.edits.replacements[&path];
                 self.write(&element_header(*tag, *vr_bytes, value.len())?)?;
                 self.write(value)
             }
@@ -506,17 +548,25 @@ impl SpliceWriter<'_> {
         Ok(())
     }
 
-    /// Whether `path` or anything below it is replaced.
+    /// Whether anything at or below `path` is replaced, inserted or removed.
     fn touches(&self, path: &[String]) -> bool {
-        self.replacements
-            .keys()
-            .any(|key| key.len() >= path.len() && key[..path.len()] == *path)
+        let below = |key: &Vec<String>| key.len() >= path.len() && key[..path.len()] == *path;
+        self.edits.replacements.keys().any(below)
+            || self.edits.removals.iter().any(below)
+            || self.edits.insertions.keys().any(below)
     }
 
     fn nodes_length(&self, nodes: &[IndexNode], parent: &[String]) -> Result<u32, String> {
         let mut total: u64 = 0;
         for node in nodes {
+            let path = child_path(parent, format_tag(node.tag()));
+            if self.edits.removals.contains(&path) {
+                continue;
+            }
             total += u64::from(self.node_length(node, parent)?);
+        }
+        for (_, element) in sorted_insertions(self.edits, parent) {
+            total += element.len() as u64;
         }
         checked_length(total, "An item")
     }
@@ -532,7 +582,7 @@ impl SpliceWriter<'_> {
         }
         match node {
             IndexNode::Element { tag, vr_bytes, .. } => {
-                let value = &self.replacements[&path];
+                let value = &self.edits.replacements[&path];
                 let header = element_header(*tag, *vr_bytes, value.len())?;
                 u32::try_from(header.len() + value.len())
                     .map_err(|_| "An element is too long".to_string())

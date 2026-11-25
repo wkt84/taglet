@@ -725,7 +725,7 @@ pub fn save_file_with_nodes(
         Some(stamp) => plan_splice(source, object, nodes, text, stamp)?,
         None => None,
     };
-    let Some((index, replacements)) = planned else {
+    let Some((index, edits)) = planned else {
         save_object_with_nodes_guarded(
             object,
             nodes,
@@ -737,12 +737,12 @@ pub fn save_file_with_nodes(
         return Ok(true);
     };
     write_file_atomically_with(destination, splice_guard, |out| {
-        splice::write_spliced(source, &index, &replacements, out)
+        splice::write_spliced(source, &index, &edits, out)
     })?;
     Ok(false)
 }
 
-/// Work out the replacements for saving by splicing, or `None` when the edits need the
+/// Work out the edits for saving by splicing, or `None` when the changes need the
 /// full writer.
 fn plan_splice(
     source: &str,
@@ -750,7 +750,7 @@ fn plan_splice(
     nodes: &[DicomNode],
     text: &TextValues,
     opened: splice::FileStamp,
-) -> Result<Option<(splice::FileIndex, splice::Replacements)>, String> {
+) -> Result<Option<(splice::FileIndex, splice::Edits)>, String> {
     if !splice::supports_transfer_syntax(object.meta().transfer_syntax()) {
         return Ok(None);
     }
@@ -764,9 +764,9 @@ fn plan_splice(
     if index.stamp() != Some(opened) {
         return Err(FILE_CHANGED_ON_DISK.to_string());
     }
-    if !same_structure(nodes, index.nodes()) {
+    let Some(diff) = structure_diff(nodes, index.nodes()) else {
         return Ok(None);
-    }
+    };
     // Validate the nodes and find the edited values, as the full writer does, without
     // copying the object.
     validate_private_nodes(object, nodes)?;
@@ -775,39 +775,75 @@ fn plan_splice(
     if collect_edited_paths(object, nodes, text, &mut edited).is_err() {
         return Ok(None);
     }
-    if !edited.is_empty() && has_group_length(index.nodes()) {
+    if (!edited.is_empty() || !diff.removed.is_empty()) && has_group_length(index.nodes()) {
         return Ok(None);
     }
+    // Changing or removing a declaration changes how other text reads; changing the SOP
+    // UIDs changes the file meta information; group lengths would have to be updated.
+    // All of these go through the full writer.
+    let needs_full_writer = |path: &Vec<String>| {
+        let Some(Ok(tag)) = path.last().map(|tag| parse_tag(tag)) else {
+            return true;
+        };
+        tag == tags::SPECIFIC_CHARACTER_SET
+            || tag.element() == 0x0000
+            || (path.len() == 1 && (tag == tags::SOP_CLASS_UID || tag == tags::SOP_INSTANCE_UID))
+    };
+    if edited
+        .iter()
+        .chain(diff.removed.iter())
+        .any(needs_full_writer)
+    {
+        return Ok(None);
+    }
+
     let shown = shown_values(nodes);
-    let mut replacements = splice::Replacements::new();
+    let mut edits = splice::Edits::default();
     let mut failures = Vec::new();
     for path in &edited {
-        let tag = path.last().map(|tag| parse_tag(tag)).transpose()?;
-        // Changing a declaration changes how other text reads; changing the SOP UIDs
-        // changes the file meta information. Both go through the full writer.
-        if tag == Some(tags::SPECIFIC_CHARACTER_SET)
-            || (path.len() == 1
-                && matches!(
-                    tag,
-                    Some(tags::SOP_CLASS_UID) | Some(tags::SOP_INSTANCE_UID)
-                ))
-        {
+        let Some((node_vr, value)) = shown.get(path) else {
             return Ok(None);
+        };
+        if diff.added.contains(path) {
+            // A new element, encoded with the character set of the data set or item it
+            // goes into.
+            let Ok(vr) = VR::from_str(node_vr) else {
+                return Ok(None);
+            };
+            let (parent, tag) = path.split_at(path.len() - 1);
+            let tag = parse_tag(&tag[0])?;
+            if !is_text_editable(vr) || (parent.is_empty() && tag >= PIXEL_DATA) {
+                return Ok(None);
+            }
+            let Some(charset) = container_charset(object, parent) else {
+                return Ok(None);
+            };
+            match encode_spliced_value(vr, value, Some(&charset)) {
+                Ok(Some(bytes)) => {
+                    let element = splice::encode_element(tag, vr, &bytes)
+                        .map_err(|error| format!("Cannot save: {} ({error})", path.join(" / ")))?;
+                    edits
+                        .insertions
+                        .entry(parent.to_vec())
+                        .or_default()
+                        .push((tag, element));
+                }
+                Ok(None) => return Ok(None),
+                Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
+            }
+            continue;
         }
         let Some(vr) = indexed_element_vr(index.nodes(), path) else {
             return Ok(None);
         };
         // A changed VR (e.g. an element removed and added again) is written by the
         // full writer.
-        let Some((node_vr, value)) = shown.get(path) else {
-            return Ok(None);
-        };
         if *node_vr != vr.to_string() {
             return Ok(None);
         }
         match encode_spliced_value(vr, value, text.get(path).map(|read| &read.charset)) {
             Ok(Some(bytes)) => {
-                replacements.insert(path.clone(), bytes);
+                edits.replacements.insert(path.clone(), bytes);
             }
             Ok(None) => return Ok(None),
             Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
@@ -820,7 +856,129 @@ fn plan_splice(
             failures.join("; ")
         ));
     }
-    Ok(Some((index, replacements)))
+    edits.removals = diff.removed;
+    Ok(Some((index, edits)))
+}
+
+/// Plain elements added to or removed from the file by the nodes.
+struct StructureDiff {
+    added: HashSet<Vec<String>>,
+    removed: HashSet<Vec<String>>,
+}
+
+/// Compare the nodes with the file. Sequences and their items must be the same;
+/// plain elements may be added or removed. `None` otherwise. Top-level elements from
+/// Pixel Data (7FE0,0010) on are never shown as nodes (the file is opened up to Pixel
+/// Data), so the file's are left out; nodes there other than Pixel Data's placeholder
+/// were added by the user and count as added.
+fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<StructureDiff> {
+    #[derive(Default)]
+    struct Shape {
+        elements: HashSet<Vec<String>>,
+        sequences: HashMap<Vec<String>, usize>,
+    }
+
+    fn node_shape(nodes: &[DicomNode], root: bool, shape: &mut Shape) {
+        for node in nodes {
+            let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
+                node;
+            if root && parse_tag(tag).is_ok_and(|tag| tag == PIXEL_DATA) {
+                continue;
+            }
+            match node {
+                DicomNode::Element { .. } => {
+                    shape.elements.insert(path.clone());
+                }
+                DicomNode::Sequence { items, .. } => {
+                    shape.sequences.insert(path.clone(), items.len());
+                    for item in items {
+                        node_shape(item, false, shape);
+                    }
+                }
+            }
+        }
+    }
+
+    fn index_shape(nodes: &[splice::IndexNode], parent: &[String], shape: &mut Shape) {
+        for node in nodes {
+            let tag = node.tag();
+            if parent.is_empty() && tag >= PIXEL_DATA {
+                continue;
+            }
+            let mut path = parent.to_vec();
+            path.push(format_tag(tag));
+            match node {
+                splice::IndexNode::Sequence { items, .. } => {
+                    shape.sequences.insert(path.clone(), items.len());
+                    for (index, item) in items.iter().enumerate() {
+                        let mut item_path = path.clone();
+                        item_path.push(format!("Item#{index}"));
+                        index_shape(item.nodes(), &item_path, shape);
+                    }
+                }
+                splice::IndexNode::Element { .. } => {
+                    shape.elements.insert(path);
+                }
+                // Encapsulated or other opaque values cannot be removed here; keep them
+                // as sequences with no items so that removing them is a mismatch.
+                splice::IndexNode::Opaque { .. } => {
+                    shape.sequences.insert(path, usize::MAX);
+                }
+            }
+        }
+    }
+
+    let mut from_nodes = Shape::default();
+    node_shape(nodes, true, &mut from_nodes);
+    let mut from_index = Shape::default();
+    index_shape(index, &[], &mut from_index);
+    // Opaque values show up as plain element nodes.
+    for (path, count) in &from_index.sequences {
+        if *count == usize::MAX && from_nodes.elements.remove(path) {
+            from_nodes.sequences.insert(path.clone(), usize::MAX);
+        }
+    }
+    if from_nodes.sequences != from_index.sequences {
+        return None;
+    }
+    Some(StructureDiff {
+        added: from_nodes
+            .elements
+            .difference(&from_index.elements)
+            .cloned()
+            .collect(),
+        removed: from_index
+            .elements
+            .difference(&from_nodes.elements)
+            .cloned()
+            .collect(),
+    })
+}
+
+/// The character set in effect for the data set or item at `parent` (a node path to an
+/// item, or empty for the top level). `None` if the path does not lead to an item.
+fn container_charset(obj: &InMemDicomObject, parent: &[String]) -> Option<TextCharset> {
+    let own = |obj: &InMemDicomObject| {
+        obj.get(tags::SPECIFIC_CHARACTER_SET).map(|element| {
+            element
+                .to_str()
+                .map(|value| TextCharset::from_specific_character_set(&value))
+                .unwrap_or_default()
+        })
+    };
+    let mut charset = own(obj).unwrap_or_default();
+    let mut current = obj;
+    for pair in parent.chunks(2) {
+        let [sequence, item] = pair else {
+            return None;
+        };
+        let index = item.strip_prefix("Item#")?.parse::<usize>().ok()?;
+        current = sequence_items(current, parse_tag(sequence).ok()?)?.get(index)?;
+        if let Some(item_charset) = own(current) {
+            charset = item_charset;
+        }
+    }
+    Some(charset)
 }
 
 /// Encode an edited value as it is written in the file, padded to an even length.
@@ -872,76 +1030,6 @@ fn shown_values(nodes: &[DicomNode]) -> HashMap<Vec<String>, (String, String)> {
         }
     }
     values
-}
-
-/// Whether the nodes have exactly the elements, sequences and items of the file, i.e.
-/// nothing was added or removed. Top-level elements from Pixel Data (7FE0,0010) on are
-/// never shown as nodes (the file is opened up to Pixel Data), so they cannot be
-/// edited or removed and are copied as they are.
-fn same_structure(nodes: &[DicomNode], index: &[splice::IndexNode]) -> bool {
-    let skipped = |root: bool, tag: Tag| root && tag >= PIXEL_DATA;
-
-    fn node_shape(
-        nodes: &[DicomNode],
-        root: bool,
-        skipped: &dyn Fn(bool, Tag) -> bool,
-        out: &mut Vec<String>,
-    ) {
-        for node in nodes {
-            let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
-                node;
-            if parse_tag(tag).is_ok_and(|tag| skipped(root, tag)) {
-                continue;
-            }
-            match node {
-                DicomNode::Element { .. } => out.push(path.join("/")),
-                DicomNode::Sequence { items, .. } => {
-                    out.push(format!("{}#{}", path.join("/"), items.len()));
-                    for item in items {
-                        node_shape(item, false, skipped, out);
-                    }
-                }
-            }
-        }
-    }
-
-    fn index_shape(
-        nodes: &[splice::IndexNode],
-        parent: &[String],
-        skipped: &dyn Fn(bool, Tag) -> bool,
-        out: &mut Vec<String>,
-    ) {
-        for node in nodes {
-            let tag = node.tag();
-            if skipped(parent.is_empty(), tag) {
-                continue;
-            }
-            let mut path = parent.to_vec();
-            path.push(format_tag(tag));
-            match node {
-                splice::IndexNode::Sequence { items, .. } => {
-                    out.push(format!("{}#{}", path.join("/"), items.len()));
-                    for (index, item) in items.iter().enumerate() {
-                        let mut item_path = path.clone();
-                        item_path.push(format!("Item#{index}"));
-                        index_shape(item.nodes(), &item_path, skipped, out);
-                    }
-                }
-                _ => out.push(path.join("/")),
-            }
-        }
-    }
-
-    // Nodes after Pixel Data's tag (other than its placeholder) were added by the
-    // user, as the file's own are never shown; count them so that they are saved.
-    let skipped_node = |root: bool, tag: Tag| root && tag == PIXEL_DATA;
-    let mut from_nodes = Vec::new();
-    node_shape(nodes, true, &skipped_node, &mut from_nodes);
-    let mut from_index = Vec::new();
-    index_shape(index, &[], &skipped, &mut from_index);
-    from_nodes.sort();
-    from_index.sort();
-    from_nodes == from_index
 }
 
 /// Whether the data set, or any item in it, has a Digital Signatures Sequence
@@ -4043,7 +4131,7 @@ mod tests {
     }
 
     #[test]
-    fn edits_outside_splice_support_use_the_full_writer() {
+    fn added_elements_are_spliced_and_declaration_changes_are_not() {
         let path = temp_path("splice-fallback.dcm");
         write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
         let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
@@ -4066,7 +4154,7 @@ mod tests {
         let stamp = splice::file_stamp(path_text).unwrap();
         assert!(plan_splice(path_text, &object, &added, &text, stamp)
             .unwrap()
-            .is_none());
+            .is_some());
         let added_result = save_file(&path, &added);
         // Changing the declaration (the full writer then refuses, as the meaning of
         // the existing Japanese text would change).
@@ -4258,24 +4346,22 @@ mod tests {
         .concat();
         write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
         let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
-        // Adding an element needs the full writer.
-        nodes.push(DicomNode::Element {
-            tag: "(0008,1030)".to_string(),
-            vr: "LO".to_string(),
-            inferred_vr: None,
+        // Adding a sequence needs the full writer.
+        nodes.push(DicomNode::Sequence {
+            tag: "(0040,0275)".to_string(),
             description: String::new(),
-            value: "HEAD".to_string(),
             length: 0,
-            path: vec!["(0008,1030)".to_string()],
-            editable: true,
+            path: vec!["(0040,0275)".to_string()],
+            items: Vec::new(),
         });
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "ID002".to_string();
         let planned = plan_for(&path, &nodes);
         let saved = save_file(&path, &nodes);
         std::fs::remove_file(&path).ok();
 
         assert!(!planned);
         let saved = saved.unwrap();
-        assert!(contains(&saved, b"HEAD"));
+        assert!(contains(&saved, b"ID002"));
         assert!(contains(&saved, &[0xFC, 0xFF, 0xFC, 0xFF]));
     }
 
@@ -4584,5 +4670,113 @@ mod tests {
         );
         assert!(has_warning(&content, TEXT_READ_ONLY_WARNING));
         assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+    }
+
+    fn element_node(tag: &str, vr: &str, value: &str, parent: &[&str]) -> DicomNode {
+        let mut path = parent
+            .iter()
+            .map(|segment| segment.to_string())
+            .collect::<Vec<_>>();
+        path.push(tag.to_string());
+        DicomNode::Element {
+            tag: tag.to_string(),
+            vr: vr.to_string(),
+            inferred_vr: None,
+            description: String::new(),
+            value: value.to_string(),
+            length: 0,
+            path,
+            editable: true,
+        }
+    }
+
+    fn item_nodes_mut<'a>(
+        nodes: &'a mut [DicomNode],
+        sequence: &str,
+        index: usize,
+    ) -> &'a mut Vec<DicomNode> {
+        nodes
+            .iter_mut()
+            .find_map(|node| match node {
+                DicomNode::Sequence { tag, items, .. } if tag == sequence => items.get_mut(index),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// #8: adding and removing plain elements is spliced, also inside defined-length
+    /// items, and keeps the bytes of everything else.
+    #[test]
+    fn splice_adds_and_removes_elements() {
+        let path = temp_path("splice-add-remove.dcm");
+        let original = write_mixed_charset_file(&path);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        // Top level: add a study description (UTF-8), remove the patient ID.
+        nodes.push(element_node("(0008,1030)", "LO", "頭部CT", &[]));
+        remove_element(&mut nodes, "(0010,0020)");
+        // In the ISO_IR 13 item: add an ROI description in half-width katakana.
+        item_nodes_mut(&mut nodes, "(3006,0020)", 0).push(element_node(
+            "(3006,0028)",
+            "ST",
+            "ｶﾝｿﾞｳ",
+            &["(3006,0020)", "Item#0"],
+        ));
+        let planned = plan_for(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned, "saving should splice");
+        let saved = saved.unwrap();
+        let reopened_path = temp_path("splice-add-remove-reopened.dcm");
+        std::fs::write(&reopened_path, &saved).unwrap();
+        let reopened = open_nodes(reopened_path.to_str().unwrap()).unwrap().nodes;
+        std::fs::remove_file(&reopened_path).ok();
+
+        assert_eq!(
+            value_and_editable(&reopened, "(0008,1030)"),
+            ("頭部CT".to_string(), true)
+        );
+        assert!(find_element(&reopened, "(0010,0020)").is_none());
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0028)"),
+            ("ｶﾝｿﾞｳ".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), true)
+        );
+        assert!(contains(&saved, b"\xb6\xdd\xbf\xde\xb3 "));
+        // The pixel data and the undefined-length sequence are kept byte for byte.
+        let tail_start = original
+            .windows(4)
+            .position(|window| window == [0x06, 0x30, 0x39, 0x00])
+            .unwrap();
+        assert!(saved.ends_with(&original[tail_start..]));
+    }
+
+    /// Adding a sequence or removing one still needs the full writer.
+    #[test]
+    fn sequence_changes_are_not_spliced() {
+        let path = temp_path("splice-sequence-change.dcm");
+        write_mixed_charset_file(&path);
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let mut removed = opened.clone();
+        removed.retain(
+            |node| !matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0039)"),
+        );
+        let mut emptied = opened.clone();
+        if let Some(DicomNode::Sequence { items, .. }) = emptied
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0039)"))
+        {
+            items.clear();
+        }
+        let removed_planned = plan_for(&path, &removed);
+        let emptied_planned = plan_for(&path, &emptied);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!removed_planned);
+        assert!(!emptied_planned);
     }
 }
