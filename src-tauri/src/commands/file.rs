@@ -6,12 +6,21 @@ use dicom_object::DefaultDicomObject;
 use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
-use crate::dicom::parser::{open_full_object, open_nodes, rt_struct_data, save_object_with_nodes};
+use crate::dicom::parser::{
+    open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, FILE_CHANGED_ON_DISK,
+};
+use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
     rt_struct: Option<RtStructData>,
+    /// The file's length and modification time when it was opened or last saved, to
+    /// tell whether another program changed it since.
+    stamp: Option<(u64, std::time::SystemTime)>,
+    /// Whether the shown nodes include top-level elements after Pixel Data's tag, as
+    /// they do for raw data sets read without file meta information.
+    nodes_show_trailing: bool,
 }
 
 #[derive(Default)]
@@ -195,7 +204,10 @@ pub async fn open_dicom_file(
     path: String,
     store: State<'_, DicomStore>,
 ) -> Result<DicomFileContent, String> {
+    // Taken before reading, so that a change made while reading is noticed on save.
+    let stamp = file_stamp(&path);
     let content = open_nodes(&path)?;
+    let nodes_show_trailing = content.file_meta.is_empty();
     store
         .objects
         .lock()
@@ -205,6 +217,8 @@ pub async fn open_dicom_file(
             StoredDicomObject {
                 full: None,
                 rt_struct: None,
+                stamp,
+                nodes_show_trailing,
             },
         );
     *store
@@ -244,8 +258,20 @@ fn save_to_path(
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
 ) -> Result<(), String> {
-    // Text is written through dicom-rs, which cannot write every value back with its
-    // original bytes (e.g. text in a character set set only inside a sequence item).
+    // The shown nodes come from the file as it was opened (or last saved). If another
+    // program changed it since, saving them would silently undo those changes.
+    let (opened_stamp, nodes_show_trailing) = store
+        .objects
+        .lock()
+        .map_err(|_| "DICOM store lock poisoned".to_string())?
+        .get(&source_path)
+        .map(|stored| (stored.stamp, stored.nodes_show_trailing))
+        .unwrap_or((None, false));
+    ensure_unchanged_since_opened(opened_stamp, &source_path)?;
+
+    // Text values read from the original bytes: their character sets are used to
+    // encode edits, and the full dicom-rs writer (used when the edits cannot be spliced
+    // into the original file) is checked against them.
     let text = TextValues::try_read(&source_path)
         .map_err(|error| format!("Could not check text values before saving: {error}"))?;
 
@@ -265,7 +291,24 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    save_object_with_nodes(object, &nodes, &text, &destination_path)?;
+    let object_matches_file = save_file_with_nodes(
+        &source_path,
+        object,
+        &nodes,
+        &text,
+        &destination_path,
+        opened_stamp,
+        nodes_show_trailing,
+    )?;
+    if !object_matches_file || source_path != destination_path {
+        // After a spliced save the object is read again from the file when needed.
+        // After Save As, the source file is unchanged, so its object must not keep
+        // the edits.
+        stored.full = None;
+    }
+    if source_path == destination_path {
+        stored.stamp = file_stamp(&destination_path);
+    }
     stored.rt_struct = None;
 
     if source_path != destination_path {
@@ -274,6 +317,8 @@ fn save_to_path(
             StoredDicomObject {
                 full: None,
                 rt_struct: None,
+                stamp: file_stamp(&destination_path),
+                nodes_show_trailing,
             },
         );
     }
@@ -283,4 +328,39 @@ fn save_to_path(
         .map_err(|_| "DICOM store lock poisoned".to_string())? = Some(destination_path);
 
     Ok(())
+}
+
+/// Fail when the file at `path` no longer has the length and modification time it had
+/// when it was opened (or last saved).
+fn ensure_unchanged_since_opened(
+    opened: Option<(u64, std::time::SystemTime)>,
+    path: &str,
+) -> Result<(), String> {
+    if opened.is_some() && opened != file_stamp(path) {
+        return Err(FILE_CHANGED_ON_DISK.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_files_changed_after_opening() {
+        let path = std::env::temp_dir().join(format!("taglet-{}-stamp.dcm", std::process::id()));
+        std::fs::write(&path, b"original").unwrap();
+        let path_text = path.to_str().unwrap();
+        let opened = file_stamp(path_text);
+        let unchanged = ensure_unchanged_since_opened(opened, path_text);
+        std::fs::write(&path, b"changed by another program").unwrap();
+        let changed = ensure_unchanged_since_opened(opened, path_text);
+        std::fs::remove_file(&path).ok();
+
+        assert!(opened.is_some());
+        assert!(unchanged.is_ok());
+        assert!(changed.unwrap_err().contains("changed by another program"));
+        // Without a recorded stamp, saving is not blocked.
+        assert!(ensure_unchanged_since_opened(None, path_text).is_ok());
+    }
 }
