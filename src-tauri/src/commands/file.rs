@@ -7,11 +7,15 @@ use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
 use crate::dicom::parser::{open_full_object, open_nodes, rt_struct_data, save_file_with_nodes};
+use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
     rt_struct: Option<RtStructData>,
+    /// The file's length and modification time when it was opened or last saved, to
+    /// tell whether another program changed it since.
+    stamp: Option<(u64, std::time::SystemTime)>,
 }
 
 #[derive(Default)]
@@ -205,6 +209,7 @@ pub async fn open_dicom_file(
             StoredDicomObject {
                 full: None,
                 rt_struct: None,
+                stamp: file_stamp(&path),
             },
         );
     *store
@@ -266,12 +271,24 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    let object_matches_file =
-        save_file_with_nodes(&source_path, object, &nodes, &text, &destination_path)?;
-    if !object_matches_file {
-        // Saved by copying the original file with only the edited values rewritten;
-        // the object is read again from the file when needed.
+    // Splicing copies the file on disk, so it must be the file the nodes came from.
+    let unchanged_on_disk = stored.stamp.is_some() && stored.stamp == file_stamp(&source_path);
+    let object_matches_file = save_file_with_nodes(
+        &source_path,
+        object,
+        &nodes,
+        &text,
+        &destination_path,
+        unchanged_on_disk,
+    )?;
+    if !object_matches_file || source_path != destination_path {
+        // After a spliced save the object is read again from the file when needed.
+        // After Save As, the source file is unchanged, so its object must not keep
+        // the edits.
         stored.full = None;
+    }
+    if source_path == destination_path {
+        stored.stamp = file_stamp(&destination_path);
     }
     stored.rt_struct = None;
 
@@ -281,6 +298,7 @@ fn save_to_path(
             StoredDicomObject {
                 full: None,
                 rt_struct: None,
+                stamp: file_stamp(&destination_path),
             },
         );
     }

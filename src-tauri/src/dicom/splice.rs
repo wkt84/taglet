@@ -511,7 +511,7 @@ impl SpliceWriter<'_> {
         for node in nodes {
             total += u64::from(self.node_length(node, parent)?);
         }
-        u32::try_from(total).map_err(|_| "An item became too long".to_string())
+        checked_length(total, "An item")
     }
 
     fn node_length(&self, node: &IndexNode, parent: &[String]) -> Result<u32, String> {
@@ -541,7 +541,7 @@ impl SpliceWriter<'_> {
                     let content = u64::from(self.nodes_length(&item.nodes, &item_path)?);
                     total += 8 + content + if item.defined_length { 0 } else { 8 };
                 }
-                u32::try_from(total).map_err(|_| "A sequence became too long".to_string())
+                checked_length(total, "A sequence")
             }
             IndexNode::Opaque { .. } => original(),
         }
@@ -554,12 +554,26 @@ impl SpliceWriter<'_> {
             let content = u64::from(self.nodes_length(&item.nodes, &item_path)?);
             total += 8 + content + if item.defined_length { 0 } else { 8 };
         }
-        u32::try_from(total).map_err(|_| "A sequence became too long".to_string())
+        checked_length(total, "A sequence")
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.out.write_all(bytes).map_err(|error| error.to_string())
     }
+}
+
+/// A defined length, which cannot be 0xFFFFFFFF (reserved for undefined length).
+fn checked_length(total: u64, what: &str) -> Result<u32, String> {
+    u32::try_from(total)
+        .ok()
+        .filter(|length| *length != UNDEFINED)
+        .ok_or_else(|| format!("{what} became too long"))
+}
+
+/// The length and modification time of a file, to tell whether it changed.
+pub fn file_stamp(path: &str) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 fn element_header(tag: Tag, vr_bytes: [u8; 2], length: usize) -> Result<Vec<u8>, String> {

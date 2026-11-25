@@ -664,6 +664,9 @@ fn apply_validated_nodes_to_object(
 /// that change with them) are rewritten, so every other byte is kept (#8). Otherwise
 /// the object is written through dicom-rs by `save_object_with_nodes`.
 ///
+/// `allow_splice` must be false when `source` may have changed since `object` and
+/// `nodes` were read from it; the full writer is used then.
+///
 /// Returns whether `object` now matches the saved file. After a spliced save it is
 /// left as it was, and callers should read the file again when they need it.
 pub fn save_file_with_nodes(
@@ -672,8 +675,14 @@ pub fn save_file_with_nodes(
     nodes: &[DicomNode],
     text: &TextValues,
     destination: &str,
+    allow_splice: bool,
 ) -> Result<bool, String> {
-    let Some((index, replacements)) = plan_splice(source, object, nodes, text)? else {
+    let planned = if allow_splice {
+        plan_splice(source, object, nodes, text)?
+    } else {
+        None
+    };
+    let Some((index, replacements)) = planned else {
         save_object_with_nodes(object, nodes, text, destination)?;
         return Ok(true);
     };
@@ -708,7 +717,10 @@ fn plan_splice(
     // copying the object.
     validate_private_nodes(object, nodes)?;
     let mut edited = HashSet::new();
-    collect_edited_paths(object, nodes, text, &mut edited)?;
+    // Leave nodes that cannot be read here to the full writer, which skips them.
+    if collect_edited_paths(object, nodes, text, &mut edited).is_err() {
+        return Ok(None);
+    }
     if !edited.is_empty() && has_group_length(index.nodes()) {
         return Ok(None);
     }
@@ -731,9 +743,14 @@ fn plan_splice(
         let Some(vr) = indexed_element_vr(index.nodes(), path) else {
             return Ok(None);
         };
-        let Some(value) = shown.get(path) else {
+        // A changed VR (e.g. an element removed and added again) is written by the
+        // full writer.
+        let Some((node_vr, value)) = shown.get(path) else {
             return Ok(None);
         };
+        if *node_vr != vr.to_string() {
+            return Ok(None);
+        }
         match encode_spliced_value(vr, value, text.get(path).map(|read| &read.charset)) {
             Ok(Some(bytes)) => {
                 replacements.insert(path.clone(), bytes);
@@ -783,13 +800,15 @@ fn encode_spliced_value(
     Ok(Some(bytes))
 }
 
-/// Values shown for each element node, by path.
-fn shown_values(nodes: &[DicomNode]) -> HashMap<Vec<String>, String> {
+/// The VR and value shown for each element node, by path.
+fn shown_values(nodes: &[DicomNode]) -> HashMap<Vec<String>, (String, String)> {
     let mut values = HashMap::new();
     for node in nodes {
         match node {
-            DicomNode::Element { path, value, .. } => {
-                values.insert(path.clone(), value.clone());
+            DicomNode::Element {
+                path, value, vr, ..
+            } => {
+                values.insert(path.clone(), (vr.clone(), value.clone()));
             }
             DicomNode::Sequence { items, .. } => {
                 for item in items {
@@ -3719,6 +3738,7 @@ mod tests {
             nodes,
             &text,
             destination.to_str().unwrap(),
+            true,
         )
         .and_then(|_| std::fs::read(&destination).map_err(|error| error.to_string()));
         std::fs::remove_file(&destination).ok();
@@ -4029,5 +4049,30 @@ mod tests {
             indexed_element_vr(index.nodes(), &["(0010,0030)".to_string()]),
             None
         );
+    }
+
+    /// An element whose VR changed (removed and added again) is written by the full
+    /// writer with its new VR.
+    #[test]
+    fn changed_vrs_are_not_spliced() {
+        let path = temp_path("splice-vr-change.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        if let Some(DicomNode::Element { vr, value, .. }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0020)"))
+        {
+            *vr = "SH".to_string();
+            *value = "ID002".to_string();
+        }
+        let planned = plan_for(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!planned);
     }
 }
