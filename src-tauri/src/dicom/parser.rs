@@ -1018,16 +1018,21 @@ fn plan_splice(
     node_declarations(nodes, &[], "", &mut new_declarations)?;
     let mut converted = HashMap::new();
     for (container, declaration) in &new_declarations {
+        let old = old_declarations.get(container);
+        // Declarations Taglet cannot write text in are left to the full writer, as
+        // before, also when they read like the old one (e.g. an unknown spelling, read
+        // as the default repertoire like no declaration).
+        if old.map(|old: &String| trim_padding(old)) != Some(trim_padding(declaration))
+            && !is_writable_declaration(declaration)
+        {
+            return Ok(None);
+        }
         let charset = TextCharset::from_specific_character_set(declaration);
-        let old = old_declarations
-            .get(container)
-            .map(|old: &String| TextCharset::from_specific_character_set(old));
-        if old.as_ref() != Some(&charset) {
-            // Declarations Taglet cannot write text in are left to the full writer, which
-            // saves them when no text changes meaning, as before.
-            if !is_writable_declaration(declaration) {
-                return Ok(None);
-            }
+        if old
+            .map(|old| TextCharset::from_specific_character_set(old))
+            .as_ref()
+            != Some(&charset)
+        {
             converted.insert(container.clone(), charset);
         }
     }
@@ -4770,6 +4775,22 @@ mod tests {
             "{error}"
         );
         assert_eq!(after, original);
+    }
+
+    #[test]
+    fn unknown_declarations_are_left_to_the_full_writer_even_when_read_alike() {
+        let path = temp_path("convert-unknown-alike.dcm");
+        write_part10(
+            &path,
+            None,
+            &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        );
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes.insert(0, element_node("(0008,0005)", "CS", "ISO IR 192", &[]));
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
     }
 
     #[test]
