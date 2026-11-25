@@ -649,13 +649,12 @@ pub fn save_object_with_nodes(
     Ok(())
 }
 
-/// Write to a temporary file next to `destination` and move it into place, so that a
-/// failed write never leaves `destination` truncated.
+/// Write to a new temporary file next to `destination` and move it into place, so that
+/// a failed write never leaves `destination` truncated or replaced by a partial file.
 fn write_file_atomically(object: &DefaultDicomObject, destination: &str) -> Result<(), String> {
-    let temporary = temporary_save_path(destination);
-    let result = object
-        .write_to_file(&temporary)
-        .map_err(|error| error.to_string())
+    let (temporary, file) = create_temporary_save_file(destination)?;
+    let result = write_object_to(object, file)
+        .and_then(|()| copy_existing_permissions(destination, &temporary))
         .and_then(|()| std::fs::rename(&temporary, destination).map_err(|error| error.to_string()));
     if result.is_err() {
         std::fs::remove_file(&temporary).ok();
@@ -663,13 +662,83 @@ fn write_file_atomically(object: &DefaultDicomObject, destination: &str) -> Resu
     result
 }
 
-fn temporary_save_path(destination: &str) -> std::path::PathBuf {
+/// Create a temporary file that only this save uses, readable by the owner only.
+fn create_temporary_save_file(destination: &str) -> Result<(std::path::PathBuf, File), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let destination = std::path::Path::new(destination);
     let file_name = destination
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    destination.with_file_name(format!(".{file_name}.taglet-saving"))
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    loop {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let temporary = destination.with_file_name(format!(".{file_name}.{unique}.taglet-saving"));
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+/// Write a Part 10 file and make sure every byte reached the disk. dicom-rs drops its
+/// internal buffer without flushing it explicitly, so errors from the final write are
+/// caught by `ErrorRecordingWriter` instead.
+fn write_object_to(object: &DefaultDicomObject, file: File) -> Result<(), String> {
+    let mut writer = ErrorRecordingWriter {
+        inner: file,
+        error: None,
+    };
+    let result = object
+        .write_all(&mut writer)
+        .map_err(|error| error.to_string());
+    if let Some(error) = writer.error.take() {
+        return Err(error);
+    }
+    result?;
+    writer.inner.sync_all().map_err(|error| error.to_string())
+}
+
+struct ErrorRecordingWriter<W> {
+    inner: W,
+    error: Option<String>,
+}
+
+impl<W: std::io::Write> std::io::Write for ErrorRecordingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf).inspect_err(|error| {
+            self.error.get_or_insert_with(|| error.to_string());
+        })
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush().inspect_err(|error| {
+            self.error.get_or_insert_with(|| error.to_string());
+        })
+    }
+}
+
+/// Keep the access permissions of a file that is being replaced.
+fn copy_existing_permissions(destination: &str, temporary: &std::path::Path) -> Result<(), String> {
+    match std::fs::metadata(destination) {
+        Ok(metadata) => std::fs::set_permissions(temporary, metadata.permissions())
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 pub fn sync_file_meta_from_dataset(obj: &mut DefaultDicomObject) {
@@ -2626,16 +2695,80 @@ mod tests {
         assert!(save_object_with_nodes(&mut obj, &nodes, &text, path_text).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // A failing write leaves the destination as it was.
-        let unchanged = open_nodes(path_text).unwrap().nodes;
-        let temporary = temporary_save_path(path_text);
-        std::fs::create_dir(&temporary).unwrap();
-        let result = save_object_with_nodes(&mut obj, &unchanged, &text, path_text);
-        std::fs::remove_dir(&temporary).ok();
-        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(no_temporary_files_left(&path));
+    }
+
+    fn no_temporary_files_left(path: &std::path::Path) -> bool {
+        let prefix = format!(".{}.", path.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                !(name.starts_with(&prefix) && name.ends_with(".taglet-saving"))
+            })
+    }
+
+    /// Review P1 (5th round): errors from the final buffered write are not lost.
+    #[test]
+    fn write_errors_from_dropped_buffers_are_reported() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ErrorRecordingWriter {
+            inner: FailingWriter,
+            error: None,
+        };
+        // Like dicom-rs: buffer the output and drop the buffer without flushing it.
+        {
+            let mut buffered = std::io::BufWriter::new(&mut writer);
+            std::io::Write::write_all(&mut buffered, b"DICM").unwrap();
+        }
+        assert_eq!(writer.error.as_deref(), Some("disk full"));
+    }
+
+    /// Review P1 (5th round): saving over a file keeps its access permissions.
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_permissions_of_the_replaced_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("permissions.dcm");
+        write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path_text = path.to_str().unwrap();
+        let nodes = open_nodes(path_text).unwrap().nodes;
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        save_object_with_nodes(&mut obj, &nodes, &text, path_text).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         std::fs::remove_file(&path).ok();
 
-        assert!(result.is_err());
-        assert_eq!(after, before);
+        assert_eq!(mode, 0o600);
+        assert!(no_temporary_files_left(&path));
+    }
+
+    /// Review P2 (5th round): an unrelated file with a temporary-looking name is kept.
+    #[test]
+    fn saving_does_not_touch_other_files() {
+        let path = temp_path("unrelated.dcm");
+        write_part10(&path, Some(b"ISO_IR 100"), &roi_sequence(None, b"PTV"));
+        let unrelated = path.with_file_name(format!(
+            ".{}.taglet-saving",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&unrelated, b"keep me").unwrap();
+        let saved = save_unchanged(&path);
+        let kept = std::fs::read(&unrelated);
+        std::fs::remove_file(&unrelated).ok();
+        std::fs::remove_file(&path).ok();
+
+        saved.unwrap();
+        assert_eq!(kept.unwrap(), b"keep me");
     }
 }
