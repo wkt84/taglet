@@ -790,16 +790,69 @@ fn is_implicit_vr(object: &DefaultDicomObject) -> bool {
 /// VR they were read with, and tags not in the dictionary (read back as UN with their
 /// bytes kept), are left alone.
 fn ensure_vrs_match_dictionary(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<(), String> {
-    ensure_vrs_match_dictionary_in(obj, nodes, &mut None)
+    let recheck_unchanged = pixel_representation_changes(obj, nodes)?;
+    ensure_vrs_match_dictionary_in(obj, nodes, &mut None, recheck_unchanged)
+}
+
+/// Whether the nodes add, remove or change a Pixel Representation (0028,0103) anywhere.
+fn pixel_representation_changes(
+    obj: &InMemDicomObject,
+    nodes: &[DicomNode],
+) -> Result<bool, String> {
+    let mut shown = false;
+    for node in nodes {
+        match node {
+            DicomNode::Element { tag, vr, value, .. } => {
+                if parse_tag(tag)? != tags::PIXEL_REPRESENTATION {
+                    continue;
+                }
+                shown = true;
+                let vr = VR::from_str(vr).map_err(|_| format!("Unsupported VR {vr}"))?;
+                let unchanged = obj.get(tags::PIXEL_REPRESENTATION).is_some_and(|element| {
+                    element.vr() == vr
+                        && element
+                            .to_str()
+                            .is_ok_and(|current| trim_padding(&current) == trim_padding(value))
+                });
+                if !unchanged {
+                    return Ok(true);
+                }
+            }
+            DicomNode::Sequence { tag, items, .. } => {
+                let empty = InMemDicomObject::new_empty();
+                let obj_items = sequence_items(obj, parse_tag(tag)?).unwrap_or_default();
+                if items.len() != obj_items.len() {
+                    // Items added or removed may carry a Pixel Representation.
+                    let has_representation =
+                        |item: &InMemDicomObject| item.get(tags::PIXEL_REPRESENTATION).is_some();
+                    if obj_items.iter().any(has_representation) {
+                        return Ok(true);
+                    }
+                }
+                for (index, item_nodes) in items.iter().enumerate() {
+                    let item = obj_items.get(index).unwrap_or(&empty);
+                    if pixel_representation_changes(item, item_nodes)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(!shown && obj.get(tags::PIXEL_REPRESENTATION).is_some())
 }
 
 /// `signed_pixel_data` follows the last Pixel Representation (0028,0103) in file order,
 /// across items, the way dicom-rs reads US or SS elements (such as Smallest Image Pixel
 /// Value) from Implicit VR files: SS after a non-zero value, US otherwise.
+///
+/// Unchanged US or SS elements are checked only when `recheck_unchanged` (a Pixel
+/// Representation changes): otherwise they read back as they were read, also from
+/// files whose tags are not in order, which splicing keeps as they are.
 fn ensure_vrs_match_dictionary_in(
     obj: &InMemDicomObject,
     nodes: &[DicomNode],
     signed_pixel_data: &mut Option<bool>,
+    recheck_unchanged: bool,
 ) -> Result<(), String> {
     // The saved data set is in tag order.
     let mut ordered = nodes
@@ -831,9 +884,9 @@ fn ensure_vrs_match_dictionary_in(
                 let Some(entry) = StandardDataDictionary.by_tag(parsed) else {
                     continue;
                 };
-                // US or SS elements are checked even when unchanged: a changed Pixel
-                // Representation changes how they read back.
-                if unchanged_vr && !matches!(entry.vr(), VirtualVr::Xs) {
+                // A changed Pixel Representation changes how unchanged US or SS
+                // elements read back.
+                if unchanged_vr && !(recheck_unchanged && matches!(entry.vr(), VirtualVr::Xs)) {
                     continue;
                 }
                 let signed = [VR::SS];
@@ -883,6 +936,7 @@ fn ensure_vrs_match_dictionary_in(
                         obj_items.get(index).unwrap_or(&empty),
                         item_nodes,
                         signed_pixel_data,
+                        recheck_unchanged,
                     )?;
                 }
             }
@@ -4702,9 +4756,49 @@ mod tests {
             added.contains("(0008,103E) is a sequence") && added.contains("as LO"),
             "{added}"
         );
+        // Unchanged, US after Pixel Representation 1 (as read from a file whose tags
+        // are out of order) is left alone.
+        let mut out_of_order = obj.clone();
+        out_of_order.put(DataElement::new(
+            Tag(0x0028, 0x0106),
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+        let mut unchanged = nodes_with("1", "(0008,1030)");
+        unchanged[1] = element_node("(0028,0106)", "US", "1", &[]);
+        assert!(ensure_vrs_match_dictionary(&out_of_order, &unchanged).is_ok());
+        // Removing Pixel Representation also rechecks them.
+        let removed = ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0008,1030)")[1..]);
+        assert!(removed.unwrap_err().contains("(0028,0106) has VR SS"));
         // Sequences at SQ tags and private tags can be added.
         assert!(ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0008,1115)")).is_ok());
         assert!(ensure_vrs_match_dictionary(&obj, &nodes_with("1", "(0009,1001)")).is_ok());
+    }
+
+    /// A US or SS element stored before Pixel Representation reads as US, and an
+    /// unchanged copy of such a file must still save.
+    #[test]
+    fn implicit_vr_files_with_us_or_ss_before_pixel_representation_save() {
+        let path = temp_path("implicit-xs-order.dcm");
+        let dataset = [
+            implicit_uid(0x0008, 0x0016, RTSTRUCT_SOP_CLASS),
+            implicit_uid(0x0008, 0x0018, "1.2.3.4"),
+            implicit_element(0x0010, 0x0010, b"Yamada^Tarou"),
+            implicit_element(0x0028, 0x0106, &1_u16.to_le_bytes()),
+            implicit_element(0x0028, 0x0103, &1_u16.to_le_bytes()),
+        ]
+        .concat();
+        write_part10_with(&path, uids::IMPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let original = std::fs::read(&path).unwrap();
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let unchanged = save_file(&path, &opened);
+        let mut edited = opened.clone();
+        *find_element_mut(&mut edited, &["(0010,0010)"]).unwrap() = "Suzuki^Hanako".to_string();
+        let edited = save_file(&path, &edited);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(unchanged.unwrap(), original);
+        assert!(contains(&edited.unwrap(), b"Suzuki^Hanako"));
     }
 
     /// Files that dicom-rs writes as Implicit VR, with private elements and nested
