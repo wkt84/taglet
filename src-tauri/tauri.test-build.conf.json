@@ -1,0 +1,13 @@
+{
+  "productName": "Taglet Test",
+  "identifier": "dev.taglet.app.test",
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "fileAssociations": []
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": []
+    }
+  }
+}
