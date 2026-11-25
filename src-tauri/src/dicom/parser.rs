@@ -1242,9 +1242,12 @@ fn prepare_text_values(
                     PrimitiveValue::Strs(texts) => texts.to_vec(),
                     _ => continue,
                 };
+                // Compare joined values: dicom-rs splits values at every 0x5C byte, also
+                // inside a kanji, while values Taglet stored after encoding are split
+                // per value.
                 let original = text.get(&path).filter(|original| {
                     dicom_rs_read(&original.read_codec, original.vr, &original.bytes)
-                        .is_some_and(|read| read == stored)
+                        .is_some_and(|read| read.join("\\") == stored.join("\\"))
                 });
                 match original {
                     Some(original) => {
@@ -3004,5 +3007,41 @@ mod tests {
         assert!(saved
             .unwrap_err()
             .contains("(3006,0020) / Item#0 / (3006,0026)"));
+    }
+
+    /// Review on #9: saving again right after a save works, also with kanji whose JIS
+    /// second byte is 0x5C (e.g. 本, 宮, ボ).
+    #[test]
+    fn saving_twice_keeps_kanji_with_a_backslash_byte() {
+        let dir = temp_test_dir("save-twice");
+        let path = dir.join("save-twice.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "宮本\\ABC".to_string();
+        *find_element_mut(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"]).unwrap() =
+            "ボーラス".to_string();
+        let mut obj = open_full_object(path_text).unwrap();
+
+        let first = TextValues::try_read(path_text).unwrap();
+        save_object_with_nodes(&mut obj, &nodes, &first, path_text).unwrap();
+        let after_first = std::fs::read(&path).unwrap();
+        let second = TextValues::try_read(path_text).unwrap();
+        let result = save_object_with_nodes(&mut obj, &nodes, &second, path_text);
+        let after_second = std::fs::read(&path).unwrap();
+        let reopened = open_nodes(path_text).unwrap().nodes;
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        result.unwrap();
+        assert_eq!(after_second, after_first);
+        assert_eq!(
+            value_and_editable(&reopened, "(0010,0020)"),
+            ("宮本\\ABC".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&reopened, "(3006,0026)"),
+            ("ボーラス".to_string(), true)
+        );
     }
 }
