@@ -233,6 +233,7 @@ fn read_nodes(
     stop: impl Fn(Tag) -> bool + Copy,
 ) -> Result<Vec<IndexNode>, String> {
     let mut nodes: Vec<IndexNode> = Vec::new();
+    let mut seen = HashSet::new();
     while reader.position < end {
         let Some(tag) = reader.peek_tag()? else {
             break;
@@ -240,10 +241,9 @@ fn read_nodes(
         if stop(tag) || tag == ITEM_DELIMITER {
             break;
         }
-        // Splicing inserts elements in tag order and addresses them by tag, so tags
-        // must be unique and ascending.
-        if nodes.last().is_some_and(|last| last.tag() >= tag) {
-            return Err(format!("Element {tag} is out of order or repeated"));
+        // Splicing addresses elements by tag, so tags must be unique.
+        if !seen.insert(tag) {
+            return Err(format!("Element {tag} is repeated"));
         }
         nodes.push(read_node(reader)?);
     }
@@ -405,6 +405,23 @@ impl FileIndex {
 impl IndexItem {
     pub fn nodes(&self) -> &[IndexNode] {
         &self.nodes
+    }
+}
+
+impl FileIndex {
+    /// Whether the elements of the data set and of every item are in ascending tag
+    /// order, as needed to insert new elements in the right place.
+    pub fn is_ordered(&self) -> bool {
+        fn ordered(nodes: &[IndexNode]) -> bool {
+            nodes.windows(2).all(|pair| pair[0].tag() < pair[1].tag())
+                && nodes.iter().all(|node| match node {
+                    IndexNode::Sequence { items, .. } => {
+                        items.iter().all(|item| ordered(&item.nodes))
+                    }
+                    _ => true,
+                })
+        }
+        ordered(&self.nodes)
     }
 }
 

@@ -814,8 +814,12 @@ fn plan_splice(
     }
 
     // Added elements are spliced only as edited text values; anything else (e.g. a
-    // non-text VR) is left to the full writer rather than dropped.
-    if diff.added.iter().any(|path| !edited.contains(path)) {
+    // non-text VR) is left to the full writer rather than dropped. New elements are
+    // inserted in tag order, so files whose tags are not in order go to the full
+    // writer when elements are added.
+    if diff.added.iter().any(|path| !edited.contains(path))
+        || (!diff.added.is_empty() && !index.is_ordered())
+    {
         return Ok(None);
     }
     let shown = shown_values(nodes);
@@ -4859,7 +4863,7 @@ mod tests {
         let index = splice::FileIndex::read(path.to_str().unwrap());
         std::fs::remove_file(&path).ok();
 
-        assert!(index.unwrap_err().contains("out of order or repeated"));
+        assert!(index.unwrap_err().contains("repeated"));
     }
 
     /// Review on #12: adding an element to a file with group lengths goes through the
@@ -4880,5 +4884,41 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!planned);
+    }
+
+    /// Review on #12: files whose tags are out of order can still have values edited
+    /// and elements removed by splicing; adding elements uses the full writer.
+    #[test]
+    fn unordered_tags_allow_value_edits_but_not_insertions() {
+        let path = temp_path("unordered-tags.dcm");
+        let item = [
+            explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+            explicit_element(0x3006, 0x0026, b"LO", HAN_IR13),
+        ]
+        .concat();
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            // (0010,0020) before (0010,0010): out of order.
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            explicit_element(0x0010, 0x0010, b"PN", b"Yamada^Taro"),
+            defined_sequence(0x3006, 0x0020, &[item]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let mut edited = opened.clone();
+        *find_element_mut(&mut edited, &["(0010,0020)"]).unwrap() = "ID002".to_string();
+        let edited_planned = plan_for(&path, &edited);
+        let edited_saved = save_file(&path, &edited);
+        let mut added = opened.clone();
+        added.push(element_node("(0008,1030)", "LO", "HEAD", &[]));
+        let added_planned = plan_for(&path, &added);
+        std::fs::remove_file(&path).ok();
+
+        assert!(edited_planned);
+        let saved = edited_saved.unwrap();
+        assert!(contains(&saved, b"ID002"));
+        assert!(contains(&saved, HAN_IR13));
+        assert!(!added_planned);
     }
 }
