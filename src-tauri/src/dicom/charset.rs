@@ -238,7 +238,9 @@ impl Iso2022Charset {
                 let mut buffer = [0_u8; 4];
                 let (euc, _, had_errors) = EUC_JP.encode(c.encode_utf8(&mut buffer));
                 match euc.as_ref() {
-                    [first, second] if !had_errors && *first >= 0xA1 && *second >= 0xA1 => {
+                    [first, second]
+                        if !had_errors && *second >= 0xA1 && is_jis0208_row(first & 0x7F) =>
+                    {
                         switch_g0(&mut out, &mut g0, G0::Jis0208, c, first_name_group)?;
                         out.extend_from_slice(&[first & 0x7F, second & 0x7F]);
                     }
@@ -357,6 +359,13 @@ fn parse_escape(rest: &[u8]) -> Option<(usize, Designation)> {
         let sequence = rest.get(..len)?;
         designation(sequence).map(|designation| (len, designation))
     })
+}
+
+/// Whether a row byte (0x21-0x7E) is assigned in JIS X 0208: rows 1-8 and 16-84.
+/// The WHATWG table used by encoding_rs also maps vendor extensions, such as the NEC
+/// special characters in row 13 (e.g. ①, Ⅰ, ㈱), which are not ISO-IR 87 characters.
+fn is_jis0208_row(row: u8) -> bool {
+    (0x21..=0x28).contains(&row) || (0x30..=0x74).contains(&row)
 }
 
 fn normalize_term(term: &str) -> String {
@@ -676,5 +685,18 @@ mod tests {
             .encode(VR::LO, "PTV~")
             .unwrap();
         assert_eq!(bytes, b"PTV\x1b(B~\x1b(J");
+    }
+
+    #[test]
+    fn rejects_vendor_extensions_outside_jis_x_0208() {
+        let ir87 = charset("\\ISO 2022 IR 87");
+        for c in ["①", "Ⅰ", "㈱", "髙"] {
+            assert!(ir87.encode(VR::LO, c).is_err(), "{c}");
+        }
+        for c in ["本", "―", "ヴ", "ω", "凜"] {
+            assert!(ir87.encode(VR::LO, c).is_ok(), "{c}");
+        }
+        // Vendor extensions in existing files are still shown.
+        assert_eq!(ir87.decode(VR::LO, b"\x1b$B-!\x1b(B"), "①");
     }
 }
