@@ -32,6 +32,7 @@ use super::model::{
     RtStructPoint, RtStructRoi, RtStructSlice, RtStructSliceContours,
 };
 use super::private::validate_private_nodes;
+use super::replace;
 use super::splice;
 use super::text_values::TextValues;
 
@@ -2258,33 +2259,83 @@ fn write_file_atomically(
 }
 
 /// Like `write_file_atomically`, with the file content written by `write`.
+///
+/// `guard` is the source file and its stamp when it was opened: saving fails if the
+/// source changed since. Saving over the source itself (`guard`'s path is
+/// `destination`) through a symbolic link replaces the file the link points to,
+/// keeping the link and that file's access settings; otherwise (Save As) a link at
+/// `destination` is replaced by the new file, as the files it may point to are not
+/// the ones being saved.
 fn write_file_atomically_with(
     destination: &str,
     guard: Option<(&str, splice::FileStamp)>,
     write: impl FnOnce(&mut dyn std::io::Write) -> Result<(), String>,
 ) -> Result<(), String> {
-    let (temporary, file) = create_temporary_save_file(destination)?;
-    let result = write_checked(file, write)
-        .and_then(|()| match guard {
-            Some((path, stamp)) if splice::file_stamp(path) != Some(stamp) => {
+    let overwriting = guard.is_some_and(|(path, _)| path == destination);
+    let destination = if overwriting {
+        resolve_symbolic_link(destination)
+    } else {
+        std::path::PathBuf::from(destination)
+    };
+    let existed = destination.exists();
+    let (temporary, file) = create_temporary_save_file(&destination)?;
+    let written = write_checked(file, write).and_then(|()| match guard {
+        // When overwriting, the file checked is the one replaced.
+        Some((path, stamp)) => {
+            let current = if overwriting {
+                splice::file_stamp_of(&destination)
+            } else {
+                splice::file_stamp(path)
+            };
+            if current != Some(stamp) {
                 Err(FILE_CHANGED_ON_DISK.to_string())
+            } else {
+                Ok(())
             }
-            _ => Ok(()),
-        })
-        .and_then(|()| copy_existing_permissions(destination, &temporary))
-        .and_then(|()| std::fs::rename(&temporary, destination).map_err(|error| error.to_string()));
-    if result.is_err() {
+        }
+        None => Ok(()),
+    });
+    if let Err(error) = written {
         std::fs::remove_file(&temporary).ok();
+        return Err(error);
     }
-    result
+    // Keeps the replaced file's owner and access control list (#7).
+    match replace::replace_file(&temporary, &destination) {
+        // A replacement that failed half way (which `replace_file` undoes where it
+        // can) must not lose the new content too.
+        Err(error) if existed && !destination.exists() => Err(format!(
+            "{error} The saved content was kept in {}.",
+            temporary.display()
+        )),
+        Err(error) => {
+            std::fs::remove_file(&temporary).ok();
+            Err(error)
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// The file a symbolic link at `path` points to, or `path` itself.
+fn resolve_symbolic_link(path: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(path);
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        if let Ok(target) = std::fs::canonicalize(path) {
+            return target;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Create a temporary file that only this save uses, readable by the owner only.
-fn create_temporary_save_file(destination: &str) -> Result<(std::path::PathBuf, File), String> {
+fn create_temporary_save_file(
+    destination: &std::path::Path,
+) -> Result<(std::path::PathBuf, File), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let destination = std::path::Path::new(destination);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -2349,16 +2400,6 @@ impl<W: std::io::Write> std::io::Write for ErrorRecordingWriter<W> {
         self.inner.flush().inspect_err(|error| {
             self.error.get_or_insert_with(|| error.to_string());
         })
-    }
-}
-
-/// Keep the access permissions of a file that is being replaced.
-fn copy_existing_permissions(destination: &str, temporary: &std::path::Path) -> Result<(), String> {
-    match std::fs::metadata(destination) {
-        Ok(metadata) => std::fs::set_permissions(temporary, metadata.permissions())
-            .map_err(|error| error.to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -8398,5 +8439,70 @@ mod tests {
             assert!(saved.is_err(), "edit: {edit}");
             assert_eq!(after, original);
         }
+    }
+
+    /// Review on #31: saving over a symbolic link replaces the file it points to, so
+    /// that the link stays and that file's access settings are kept.
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_symbolic_link_replaces_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let target = temp_path("link-target.dcm");
+        let link = temp_path("link.dcm");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.to_str().unwrap();
+        let stamp = splice::file_stamp(link_text).unwrap();
+        // Overwriting the file opened through the link.
+        let saved = write_file_atomically_with(link_text, Some((link_text, stamp)), |out| {
+            out.write_all(b"new").map_err(|error| error.to_string())
+        });
+        let still_link = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let content = std::fs::read(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+
+        saved.unwrap();
+        assert!(still_link);
+        assert_eq!(content, b"new");
+        assert_eq!(mode & 0o777, 0o640);
+    }
+
+    /// Review on #31: Save As to a symbolic link replaces the link with the new file,
+    /// keeping the file it pointed to.
+    #[cfg(unix)]
+    #[test]
+    fn save_as_to_a_symbolic_link_keeps_its_target() {
+        let source = temp_path("save-as-source.dcm");
+        let target = temp_path("save-as-link-target.dcm");
+        let link = temp_path("save-as-link.dcm");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&target, b"other").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let source_text = source.to_str().unwrap();
+        let stamp = splice::file_stamp(source_text).unwrap();
+        let saved =
+            write_file_atomically_with(link.to_str().unwrap(), Some((source_text, stamp)), |out| {
+                out.write_all(b"new").map_err(|error| error.to_string())
+            });
+        let is_link = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let saved_content = std::fs::read(&link).unwrap();
+        let target_content = std::fs::read(&target).unwrap();
+        for path in [&source, &target, &link] {
+            std::fs::remove_file(path).ok();
+        }
+
+        saved.unwrap();
+        assert!(!is_link);
+        assert_eq!(saved_content, b"new");
+        assert_eq!(target_content, b"other");
     }
 }
