@@ -7,6 +7,8 @@ import { isPrivateTag } from '../data/privateTags'
 type Props = {
   existingTags: string[]
   targetLabel: string
+  /** Whether tags are added to the data set itself (not to a sequence item). */
+  rootTarget: boolean
   onAdd: (node: DicomNode) => void
   onClose: () => void
 }
@@ -37,7 +39,7 @@ function normalizeTag(input: string) {
   return match ? `(${match[1]},${match[2]})` : undefined
 }
 
-export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose }: Props) {
+export default function AddTagDialog({ existingTags, targetLabel, rootTarget, onAdd, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<DicomTagOption>(DICOM_TAG_OPTIONS[0])
   const [customTag, setCustomTag] = useState('')
@@ -55,7 +57,10 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
 
   const isDuplicate = existingTags.includes(selected.tag)
   const isSequence = selected.vr === 'SQ'
-  const isSupported = isSequence || EDITABLE_TEXT_VRS.has(selected.vr)
+  // Files are read up to Pixel Data, so sequences cannot be added from its tag on in the
+  // data set itself.
+  const afterPixelData = rootTarget && selected.tag >= '(7FE0,0010)'
+  const isSupported = isSequence ? !afterPixelData : EDITABLE_TEXT_VRS.has(selected.vr)
 
   async function lookupCustomTag() {
     setError(undefined)
@@ -83,6 +88,10 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
 
     if (isDuplicate) {
       setError(`${selected.tag} already exists at the root level.`)
+      return
+    }
+    if (isSequence && afterPixelData) {
+      setError('Sequences cannot be added at or after Pixel Data (7FE0,0010) in the data set.')
       return
     }
     if (!isSupported) {
@@ -203,7 +212,11 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
             {error ? <div className="rounded bg-red-50 p-2 text-sm text-red-700">{error}</div> : null}
             {isDuplicate ? <div className="rounded bg-amber-50 p-2 text-sm text-amber-800">Already exists.</div> : null}
             {!isSupported ? (
-              <div className="rounded bg-slate-100 p-2 text-sm text-slate-600">This VR is not addable yet.</div>
+              <div className="rounded bg-slate-100 p-2 text-sm text-slate-600">
+                {isSequence
+                  ? 'Sequences cannot be added at or after Pixel Data (7FE0,0010) in the data set.'
+                  : 'This VR is not addable yet.'}
+              </div>
             ) : null}
 
             <button

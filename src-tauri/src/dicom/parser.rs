@@ -915,7 +915,7 @@ fn ensure_vrs_match_dictionary_in(
                 if !allowed.contains(&vr) {
                     return Err(format!(
                         "Cannot save: {} has VR {vr}, but Implicit VR files do not store VRs and readers take it as {}{reason}.",
-                        path.join(" / "),
+                        shown_path(path),
                         allowed
                             .iter()
                             .map(|vr| vr.to_string())
@@ -941,7 +941,7 @@ fn ensure_vrs_match_dictionary_in(
                 {
                     return Err(format!(
                         "Cannot save: {} is a sequence, but Implicit VR files do not store VRs and readers take it as {}.",
-                        path.join(" / "),
+                        shown_path(path),
                         dictionary_vr.relaxed()
                     ));
                 }
@@ -999,7 +999,11 @@ fn plan_splice(
     // (Changed SOP UIDs are written to the file meta information too, and a changed
     // Specific Character Set is handled below, by converting the text it applies to.)
     // Group lengths that are not plain 4-byte UL values cannot be updated in place.
-    let changes_anything = !edited.is_empty() || !diff.added.is_empty() || !diff.removed.is_empty();
+    let changes_anything = !edited.is_empty()
+        || !diff.added.is_empty()
+        || !diff.removed.is_empty()
+        || !diff.added_sequences.is_empty()
+        || !diff.added_items.is_empty();
     if changes_anything && has_irregular_group_length(index.nodes()) {
         return Ok(None);
     }
@@ -1251,6 +1255,18 @@ fn plan_splice(
     Ok(Some((index, edits)))
 }
 
+/// A node path as shown in messages: added items (`Item#new3`, see `item_segment`)
+/// are numbered by their position, like the others.
+fn shown_path(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| match segment.strip_prefix("Item#new") {
+            Some(position) => format!("Item#{position} (new)"),
+            None => segment.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 /// The node at `path`.
 fn node_at<'a>(nodes: &'a [DicomNode], path: &[String]) -> Option<&'a DicomNode> {
     nodes.iter().find_map(|node| {
@@ -1337,13 +1353,16 @@ fn encode_new_item(
                 if !is_text_editable(vr) {
                     return Ok(None);
                 }
-                let shown = path.join(" / ");
+                let shown = shown_path(path);
                 match encode_spliced_value(vr, value, Some(&charset)) {
                     Ok(Some(bytes)) => match splice::encode_element(tag, vr, &bytes, explicit) {
                         Ok(element) => out.extend(element),
                         Err(error) => failures.push(format!("{shown} ({error})")),
                     },
-                    Ok(None) => return Ok(None),
+                    // Values of VRs not affected by Specific Character Set must be ASCII.
+                    Ok(None) => failures.push(format!(
+                        "{shown} (a {vr} value must be ASCII, e.g. half-width digits)"
+                    )),
                     Err(reason) => failures.push(format!("{shown} ({reason})")),
                 }
             }
@@ -6211,9 +6230,11 @@ mod tests {
         assert!(contains(&saved, &expected));
     }
 
-    /// Review on #10: an empty sequence added after Pixel Data's tag is saved.
+    /// Review on #10: an empty sequence added after Pixel Data's tag is not spliced
+    /// (Part 10 files are read up to Pixel Data), and the full writer refuses it
+    /// rather than dropping it. The editor does not offer such tags for sequences.
     #[test]
-    fn added_sequences_after_pixel_data_are_saved() {
+    fn added_sequences_after_pixel_data_are_not_saved() {
         let path = temp_path("splice-add-trailing-sequence.dcm");
         write_mixed_charset_file(&path);
         let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
@@ -6226,9 +6247,11 @@ mod tests {
             item_sources: None,
         });
         let planned = plan_for(&path, &nodes);
+        let saved = save_file(&path, &nodes);
         std::fs::remove_file(&path).ok();
 
         assert!(!planned);
+        assert!(saved.unwrap_err().contains("adding sequences or items"));
     }
 
     /// Review on #10: after adding an element after Pixel Data's tag and saving, saving
@@ -6600,6 +6623,25 @@ mod tests {
         assert_eq!(sequence_items_of(&reopened, "(3006,0020)").len(), 2);
     }
 
+    /// Values that cannot be written in added items are named, as items are shown.
+    #[test]
+    fn values_that_cannot_be_written_in_added_items_are_reported() {
+        let path = temp_path("add-item-bad-value.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        append_item(&mut nodes, &["(3006,0020)"], &|parent| {
+            vec![element_node("(3006,0022)", "IS", "１", parent)]
+        });
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#3 (new) / (3006,0022) (a IS value must be ASCII"),
+            "{error}"
+        );
+    }
+
     /// Added items holding elements splicing cannot write (not text) are not spliced,
     /// and the full writer refuses them rather than dropping them.
     #[test]
@@ -6674,7 +6716,10 @@ mod tests {
                 }
             }
         }
-        let path = temp_path("group-length-check.dcm");
+        // Tests run in parallel: a file of its own for each check.
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let check_number = CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = temp_path(&format!("group-length-check-{check_number}.dcm"));
         std::fs::write(&path, saved).unwrap();
         let index = splice::FileIndex::read(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();

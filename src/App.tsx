@@ -278,6 +278,7 @@ export default function App() {
         <AddTagDialog
           existingTags={existingTagsForTarget}
           targetLabel={targetLabel(addTargetPath)}
+          rootTarget={addTargetPath.length === 0}
           onClose={() => setAddingTag(false)}
           onAdd={(node) => {
             if (dicom.addTag(addTargetPath, node)) {
