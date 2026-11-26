@@ -211,6 +211,8 @@ export function useDicomFile() {
       const started = performance.now()
       const loaded = await invoke<DicomFileContent>('open_dicom_file', { path })
       const received = performance.now()
+      // Before the state changes, which ends the timing once the nodes are shown.
+      recordOpen(path, started, received, loaded.open_ms)
       const id = crypto.randomUUID()
       setDocuments((current) => {
         const next = [
@@ -224,7 +226,6 @@ export function useDicomFile() {
       if (loaded.warnings.length > 0) {
         setWarnings((current) => [...current, ...loaded.warnings])
       }
-      recordOpen(path.split(/[\\/]/).pop() ?? path, started, received, loaded.open_ms)
       return true
     } catch (error) {
       setError(String(error))

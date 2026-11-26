@@ -192,7 +192,7 @@ export default function App() {
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">
       <UpdateChecker />
-      <TimingBadge />
+      <TimingBadge filePath={dicom.filePath} nodes={dicom.nodes} />
       <Toolbar
         title={title}
         {...dicom}

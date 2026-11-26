@@ -5,17 +5,29 @@ import {
   currentTimings,
   formatOpenTiming,
   formatStartupTiming,
+  openShown,
   recordStartup,
   subscribeTimings,
 } from '../data/timings'
 
+type Props = {
+  /** The file whose nodes are shown, and the nodes, to end timing its opening. */
+  filePath?: string
+  nodes: unknown
+}
+
 /** The latest timings, in test builds only (see `data/timings`). */
-export default function TimingBadge() {
+export default function TimingBadge({ filePath, nodes }: Props) {
   const timings = useSyncExternalStore(subscribeTimings, currentTimings)
 
   useEffect(() => {
     recordStartup(() => invoke<number>('startup_epoch_ms'))
   }, [])
+
+  // After React has committed a newly opened file's nodes.
+  useEffect(() => {
+    openShown(filePath)
+  }, [filePath, nodes])
 
   if (!TIMINGS_ENABLED || (!timings.open && !timings.startup)) return null
   return (

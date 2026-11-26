@@ -49,22 +49,37 @@ function afterNextPaint(callback: () => void) {
   requestAnimationFrame(() => setTimeout(callback, 0))
 }
 
+type PendingOpen = { path: string; started: number; received: number; readMs?: number }
+let pendingOpen: PendingOpen | undefined
+
 /**
- * Record opening `file`: asked for at `started`, received at `received` (both
- * `performance.now()`), `readMs` the backend's own time. Call after the result has been
- * put in state; the table is painted in the next frame.
+ * Record that the file at `path` was asked for at `started` and received at
+ * `received` (both `performance.now()`), `readMs` being the backend's own time. The
+ * timing ends once its nodes are shown (see `openShown`).
  */
-export function recordOpen(file: string, started: number, received: number, readMs?: number) {
+export function recordOpen(path: string, started: number, received: number, readMs?: number) {
   if (!TIMINGS_ENABLED) return
+  pendingOpen = { path, started, received, readMs }
+}
+
+/**
+ * Call after React has committed the nodes of the file at `path` (from an effect): the
+ * timing of opening it ends when the next frame has been painted. Files whose nodes
+ * were never shown (others opened at the same time) are not timed.
+ */
+export function openShown(path: string | undefined) {
+  const pending = pendingOpen
+  if (!pending || pending.path !== path) return
+  pendingOpen = undefined
   afterNextPaint(() => {
     const painted = performance.now()
-    const callMs = received - started
+    const callMs = pending.received - pending.started
     const open: OpenTiming = {
-      file,
-      totalMs: painted - started,
-      readMs,
-      transferMs: readMs === undefined ? callMs : Math.max(0, callMs - readMs),
-      renderMs: painted - received,
+      file: pending.path.split(/[\\/]/).pop() ?? pending.path,
+      totalMs: painted - pending.started,
+      readMs: pending.readMs,
+      transferMs: pending.readMs === undefined ? callMs : Math.max(0, callMs - pending.readMs),
+      renderMs: painted - pending.received,
     }
     console.info('[taglet] open', open)
     update({ open })
@@ -79,7 +94,12 @@ export function recordOpen(file: string, started: number, received: number, read
 export function recordStartup(backendStartedAt: () => Promise<number>) {
   if (!TIMINGS_ENABLED) return
   afterNextPaint(() => {
-    const pageMs = performance.now()
+    // When the first content was painted, as the browser records it; otherwise now
+    // (just after the first paint).
+    const firstPaint = performance
+      .getEntriesByType('paint')
+      .find((entry) => entry.name === 'first-contentful-paint')
+    const pageMs = firstPaint?.startTime ?? performance.now()
     const paintedAt = performance.timeOrigin + pageMs
     void backendStartedAt().then((startedAt) => {
       const startup: StartupTiming = { totalMs: paintedAt - startedAt, pageMs }
