@@ -32,6 +32,7 @@ use super::model::{
     RtStructPoint, RtStructRoi, RtStructSlice, RtStructSliceContours,
 };
 use super::private::validate_private_nodes;
+use super::replace;
 use super::splice;
 use super::text_values::TextValues;
 
@@ -2271,8 +2272,8 @@ fn write_file_atomically_with(
             }
             _ => Ok(()),
         })
-        .and_then(|()| copy_existing_permissions(destination, &temporary))
-        .and_then(|()| std::fs::rename(&temporary, destination).map_err(|error| error.to_string()));
+        // Keeps the replaced file's owner and access control list (#7).
+        .and_then(|()| replace::replace_file(&temporary, std::path::Path::new(destination)));
     if result.is_err() {
         std::fs::remove_file(&temporary).ok();
     }
@@ -2349,16 +2350,6 @@ impl<W: std::io::Write> std::io::Write for ErrorRecordingWriter<W> {
         self.inner.flush().inspect_err(|error| {
             self.error.get_or_insert_with(|| error.to_string());
         })
-    }
-}
-
-/// Keep the access permissions of a file that is being replaced.
-fn copy_existing_permissions(destination: &str, temporary: &std::path::Path) -> Result<(), String> {
-    match std::fs::metadata(destination) {
-        Ok(metadata) => std::fs::set_permissions(temporary, metadata.permissions())
-            .map_err(|error| error.to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
     }
 }
 
