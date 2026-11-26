@@ -80,12 +80,14 @@ fn replace_existing(temporary: &Path, destination: &Path) -> Result<Option<Strin
                 ));
             }
         }
-        // ReplaceFileW opens the replaced file to read it (to keep its access settings
-        // and streams), which a file that may be deleted but not read refuses (#32).
-        // Its access settings cannot be kept then, so it is not replaced (#7).
+        // E.g. ReplaceFileW opens the replaced file to read it (to keep its access
+        // settings and streams), which a file that may be deleted but not read refuses
+        // (#32); its access settings cannot be kept then, so it is not replaced (#7).
+        // Access can also be denied to the new file, so deleting the existing one
+        // first would not help (and would lose it): only another name is suggested.
         if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
             return Err(format!(
-                "Cannot save over {}: Windows did not allow replacing it while keeping who may access it ({error}). Save it under another name, or delete the existing file first.",
+                "Cannot save over {}: Windows did not allow replacing it while keeping who may access it ({error}). Save it under another name instead.",
                 destination.display()
             ));
         }

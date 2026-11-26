@@ -2638,8 +2638,13 @@ fn write_file_atomically_with(
                 && destination.as_path() != std::path::Path::new(given)
                 && resolve_symbolic_link(given) != destination
             {
+                let now = if std::fs::symlink_metadata(given).is_ok() {
+                    "it now points elsewhere"
+                } else {
+                    "it no longer exists"
+                };
                 warnings.push(format!(
-                    "{} was saved to {}, which it pointed to when saving started, but it now points elsewhere.",
+                    "{} was saved to {}, which it pointed to when saving started, but {now}.",
                     given,
                     destination.display()
                 ));
@@ -8816,6 +8821,31 @@ mod tests {
         assert!(still_link);
         assert_eq!(content, b"new");
         assert_eq!(mode & 0o777, 0o640);
+    }
+
+    /// #32: a symbolic link removed while saving through it. The file it pointed to is
+    /// saved, with a warning that the link no longer exists.
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_link_removed_meanwhile_warns() {
+        let target = temp_path("removed-link-target.dcm");
+        let link = temp_path("removed-link.dcm");
+        std::fs::write(&target, b"old").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.to_str().unwrap();
+        let stamp = splice::file_stamp(link_text).unwrap();
+        let saved = write_file_atomically_with(link_text, Some((link_text, stamp)), |out| {
+            std::fs::remove_file(&link).unwrap();
+            out.write_all(b"new").map_err(|error| error.to_string())
+        });
+        let target_content = std::fs::read(&target).unwrap();
+        std::fs::remove_file(&target).ok();
+        std::fs::remove_file(&link).ok();
+
+        let warnings = saved.unwrap();
+        assert_eq!(target_content, b"new");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("no longer exists"), "{warnings:?}");
     }
 
     /// #32: a symbolic link changed to point elsewhere while saving through it. The
