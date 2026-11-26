@@ -74,6 +74,8 @@ const TEXT_ADD_BLOCKED_WARNING: &str =
     "Some text in this file cannot be written back by the full writer, and the file's tags are not in order, so saving fails if elements are added. Values can still be edited and elements removed.";
 const DEFLATED_NEEDS_SPLICING: &str =
     "Cannot save: this file's data set is deflated (Deflated Explicit VR Little Endian), and Taglet can save such files only by editing them in place, which these changes do not allow (e.g. adding a non-text element, or removing a group length or a SOP UID).";
+const SIGNED_NEEDS_SPLICING: &str =
+    "Cannot save: this file has digital signatures (Digital Signatures Sequence or MAC Parameters Sequence). Taglet saves such files only by editing them in place, since rewriting the whole file could leave signatures that no longer verify, and this file cannot be saved that way (e.g. a raw data set without file meta information).";
 const RAW_DATASET_START_GROUPS: &[u16] = &[
     0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x3006, 0x300A, 0x300C,
 ];
@@ -793,6 +795,11 @@ pub fn save_file_with_nodes(
         // dicom-rs cannot write deflated data sets.
         if deflate::is_deflated(object.meta().transfer_syntax()) {
             return Err(DEFLATED_NEEDS_SPLICING.to_string());
+        }
+        // The full writer rewrites the whole data set (e.g. elements in tag order), so
+        // signatures could no longer be verified, even without edits.
+        if has_digital_signatures(object) {
+            return Err(SIGNED_NEEDS_SPLICING.to_string());
         }
         // The full writer writes elements in tag order, so in Implicit VR files whose
         // US or SS elements come before Pixel Representation, unchanged ones would
@@ -8222,9 +8229,10 @@ mod tests {
 
     /// #11: raw data sets are shown whole, so a Digital Signatures Sequence after Pixel
     /// Data's tag is shown, and saving them unchanged is no edit that would invalidate
-    /// it.
+    /// it. They cannot be spliced, though, and rewriting them whole could break the
+    /// signatures (review on #30), so saving fails, saying why, and keeps the file.
     #[test]
-    fn raw_data_sets_with_signatures_save_unchanged() {
+    fn raw_data_sets_with_signatures_are_not_rewritten() {
         let path = temp_path("raw-signatures.dcm");
         let signature = implicit_element(0x0400, 0x0100, b"1.2.3");
         let dataset = [
@@ -8233,7 +8241,7 @@ mod tests {
             sequence(0xFFFA, 0xFFFA, &[signature], false),
         ]
         .concat();
-        std::fs::write(&path, dataset).unwrap();
+        std::fs::write(&path, &dataset).unwrap();
         let path_text = path.to_str().unwrap();
         let content = open_nodes(path_text).unwrap();
         assert!(content.file_meta.is_empty());
@@ -8242,10 +8250,17 @@ mod tests {
         let mut edited = content.nodes.clone();
         set_value(&mut edited, &["(0010,0010)"], "Suzuki^Hanako");
         let edit = save_over(&path, &mut obj, &edited, &HashSet::new());
+        let after = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        unchanged.unwrap();
-        assert!(edit.unwrap_err().contains("digital signatures"));
+        let unchanged = unchanged.unwrap_err();
+        assert!(
+            unchanged.contains("only by editing them in place"),
+            "{unchanged}"
+        );
+        let edit = edit.unwrap_err();
+        assert!(edit.contains("which the edits would invalidate"), "{edit}");
+        assert_eq!(after, dataset);
     }
 
     /// #15: the full writer writes elements in tag order, so an unchanged US element
