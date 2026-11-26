@@ -777,6 +777,14 @@ pub fn save_file_with_nodes(
         if deflate::is_deflated(object.meta().transfer_syntax()) {
             return Err(DEFLATED_NEEDS_SPLICING.to_string());
         }
+        // The full writer writes elements in tag order, so in Implicit VR files whose
+        // US or SS elements come before Pixel Representation, unchanged ones would
+        // read back differently (#15).
+        if is_implicit_vr(object) {
+            ensure_vrs_match_dictionary_in(object, nodes, &mut None, true).map_err(|error| {
+                format!("{error} These changes rewrite the file with its elements in tag order, which changes how this element is read.")
+            })?;
+        }
         save_object_with_nodes_guarded(
             object,
             nodes,
@@ -8098,6 +8106,143 @@ mod tests {
             let nodes = opened.unwrap().nodes;
             assert_eq!(values_in(&nodes, "(0010,0010)"), "山田^太郎", "{name}");
             assert!(find_element(&nodes, "(0010,0030)").is_none(), "{name}");
+        }
+    }
+
+    /// #15: the full writer writes elements in tag order, so an unchanged US element
+    /// stored before Pixel Representation 1 would read back as SS. Saves that need it
+    /// fail instead; spliced saves keep the order and still work.
+    #[test]
+    fn implicit_vr_full_writer_keeps_us_or_ss_readings() {
+        let path = temp_path("implicit-xs-reorder.dcm");
+        let dataset = [
+            implicit_uid(0x0008, 0x0016, RTSTRUCT_SOP_CLASS),
+            implicit_uid(0x0008, 0x0018, "1.2.3.4"),
+            implicit_element(0x0010, 0x0010, b"Yamada^Tarou"),
+            implicit_element(0x0028, 0x0106, &u16::MAX.to_le_bytes()),
+            implicit_element(0x0028, 0x0103, &1_u16.to_le_bytes()),
+        ]
+        .concat();
+        write_part10_with(&path, uids::IMPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let original = std::fs::read(&path).unwrap();
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        assert_eq!(values_in(&opened, "(0028,0106)"), "65535");
+        // Adding an element to a file with tags out of order needs the full writer.
+        let mut added = opened.clone();
+        added.insert(0, element_node("(0008,1030)", "LO", "Head", &[]));
+        let reordered = save_file(&path, &added);
+        let after = std::fs::read(&path).unwrap();
+        let mut edited = opened.clone();
+        set_value(&mut edited, &["(0010,0010)"], "Suzuki^Hanako");
+        let spliced = save_file(&path, &edited);
+        std::fs::remove_file(&path).ok();
+
+        let error = reordered.unwrap_err();
+        assert!(error.contains("(0028,0106)"), "{error}");
+        assert!(error.contains("tag order"), "{error}");
+        assert_eq!(after, original);
+        let reopened = reopen("implicit-xs-reorder-reopened.dcm", &spliced.unwrap());
+        assert_eq!(values_in(&reopened, "(0028,0106)"), "65535");
+        assert_eq!(values_in(&reopened, "(0010,0010)"), "Suzuki^Hanako");
+    }
+
+    /// #23: with tags out of order, a group split by an element of another group is one
+    /// group once that element is removed, and its length counts both parts.
+    #[test]
+    fn group_lengths_join_parts_when_the_elements_between_are_removed() {
+        let path = temp_path("group-length-join.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            with_group_length(
+                0x0010,
+                &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+                true,
+            ),
+            explicit_element(0x0018, 0x0015, b"CS", b"HEAD"),
+            explicit_element(0x0010, 0x0030, b"DA", b"19700101"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        remove_element(&mut nodes, "(0018,0015)");
+        let planned = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned);
+        let saved = saved.unwrap();
+        assert!(!contains(&saved, b"HEAD"));
+        assert_eq!(wrong_group_lengths(&saved), Vec::<String>::new());
+    }
+
+    /// #23: editing only the part of a split group after another group's element does
+    /// not rewrite the group length of the first part.
+    #[test]
+    fn group_lengths_of_other_parts_are_kept() {
+        let path = temp_path("group-length-other-part.dcm");
+        // A group length that does not match its group, to see whether it is rewritten.
+        let mut wrong = vec![0x10, 0x00, 0x00, 0x00, b'U', b'L', 4, 0];
+        wrong.extend_from_slice(&999_u32.to_le_bytes());
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            wrong.clone(),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            explicit_element(0x0018, 0x0015, b"CS", b"HEAD"),
+            explicit_element(0x0010, 0x0030, b"DA", b"19700101"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0030)"], "19800101");
+        let planned = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned);
+        let saved = saved.unwrap();
+        assert!(contains(&saved, &wrong));
+        assert!(contains(&saved, b"19800101"));
+    }
+
+    /// #13: items moved to other positions, as `item_sources` records them, are not
+    /// spliced or written by position (which would mix their values with other items'),
+    /// with or without other edits; the save fails and the file is kept.
+    #[test]
+    fn moved_items_are_refused() {
+        for edit in [false, true] {
+            let path = temp_path(&format!("move-item-{edit}.dcm"));
+            let original = write_three_rois(&path, true);
+            let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+            for node in nodes.iter_mut() {
+                if let DicomNode::Sequence {
+                    tag,
+                    items,
+                    item_sources,
+                    ..
+                } = node
+                {
+                    if tag == "(3006,0020)" {
+                        items.swap(0, 1);
+                        *item_sources = Some(vec![Some(1), Some(0), Some(2)]);
+                        for (position, item) in items.iter_mut().enumerate() {
+                            for node in item.iter_mut() {
+                                let (DicomNode::Element { path, .. }
+                                | DicomNode::Sequence { path, .. }) = node;
+                                path[1] = format!("Item#{position}");
+                            }
+                        }
+                    }
+                }
+            }
+            if edit {
+                set_value(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"], "PTV");
+            }
+            let saved = save_file(&path, &nodes);
+            let after = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+
+            assert!(saved.is_err(), "edit: {edit}");
+            assert_eq!(after, original);
         }
     }
 }
