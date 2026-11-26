@@ -21,8 +21,8 @@ use std::str::FromStr;
 
 use super::charset::{
     byte_transparent_string, dicom_rs_codec_after, dicom_rs_codec_is_byte_transparent,
-    dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_single_valued_text,
-    is_writable_declaration, trim_padding, TextCharset,
+    dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_readable_declaration,
+    is_single_valued_text, is_writable_declaration, trim_padding, TextCharset,
 };
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
@@ -1022,8 +1022,11 @@ fn plan_splice(
         // Declarations Taglet cannot write text in are left to the full writer, as
         // before, also when they read like the old one (e.g. an unknown spelling, read
         // as the default repertoire like no declaration).
+        // The same for declarations Taglet does not read as declared (e.g. with a term
+        // it does not know), as their text could not be converted.
         if old.map(|old: &String| trim_padding(old)) != Some(trim_padding(declaration))
-            && !is_writable_declaration(declaration)
+            && !(is_writable_declaration(declaration)
+                && old.is_some_and(|old| is_readable_declaration(old)))
         {
             return Ok(None);
         }
@@ -4791,6 +4794,25 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!spliced);
+    }
+
+    /// Declarations with terms Taglet does not know are not converted from, while
+    /// known spellings it does not write (a lone "ISO 2022 IR 87") are.
+    #[test]
+    fn declarations_taglet_cannot_read_are_not_converted_from() {
+        let path = temp_path("convert-from-unknown.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87\\ISO 2022 IR 149");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "\\ISO 2022 IR 87");
+        let unknown = plans_splice(&path, &nodes);
+        write_iso2022_rtstruct(&path, "ISO 2022 IR 87");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let lone = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!unknown);
+        assert!(contains(&lone.unwrap(), "前立腺".as_bytes()));
     }
 
     #[test]

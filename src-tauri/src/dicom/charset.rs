@@ -309,7 +309,7 @@ impl Iso2022Charset {
         let mut g1 = self.initial_g1;
         let mut index = 0;
         // Whether a Person Name value is in its first (alphabetic) component group,
-        // which must not switch to other G0 sets (PS3.5 6.2.1.2).
+        // which must not switch to other character sets (PS3.5 6.2.1.2).
         let mut first_name_group = person_name;
 
         while index < bytes.len() {
@@ -324,7 +324,10 @@ impl Iso2022Charset {
                 }
                 if strict
                     && first_name_group
-                    && matches!(designation, Designation::G0(set) if set != self.initial_g0)
+                    && match designation {
+                        Designation::G0(set) => set != self.initial_g0,
+                        Designation::G1(set) => set != self.initial_g1,
+                    }
                 {
                     return None;
                 }
@@ -469,6 +472,28 @@ pub fn is_writable_declaration(value: &str) -> bool {
         }
         [] => true,
     }
+}
+
+/// Whether Taglet reads text under this Specific Character Set value as declared:
+/// every term is one it knows, including spellings seen in the field that it does not
+/// write (e.g. a lone "ISO 2022 IR 87").
+pub fn is_readable_declaration(value: &str) -> bool {
+    if is_writable_declaration(value) {
+        return true;
+    }
+    let terms = value
+        .split('\\')
+        .map(|term| term.trim_matches(|c: char| c == ' ' || c == '\0'))
+        .collect::<Vec<_>>();
+    terms.iter().any(|term| is_japanese_term(term))
+        && terms.iter().all(|term| {
+            term.is_empty()
+                || is_japanese_term(term)
+                || matches!(
+                    normalize_term(term).as_str(),
+                    "ISO_IR 6" | "ISO 2022 IR 6" | "ISO_IR 100" | "ISO 2022 IR 100"
+                )
+        })
 }
 
 fn normalize_term(term: &str) -> String {
@@ -618,6 +643,10 @@ mod tests {
                 .unwrap(),
             "Yamada^Tarou=山田^太郎"
         );
+        // Half-width katakana in the first group (a G1 switch).
+        assert!(charset("\\ISO 2022 IR 13")
+            .decode_strict(VR::PN, b"\x1b)I\xca\xdd^Tarou")
+            .is_none());
         // Escape sequences under a single-valued declaration (no code extensions).
         assert!(charset("ISO_IR 13")
             .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
@@ -634,6 +663,25 @@ mod tests {
                 .unwrap(),
             "ﾊﾝ"
         );
+    }
+
+    #[test]
+    fn readable_declarations() {
+        for value in [
+            "\\ISO 2022 IR 87",
+            "ISO 2022 IR 87",
+            "ISO_IR 13\\ISO 2022 IR 87",
+            "",
+        ] {
+            assert!(is_readable_declaration(value), "{value}");
+        }
+        for value in [
+            "\\ISO 2022 IR 87\\ISO 2022 IR 149",
+            "\\ISO 2022 IR 149",
+            "UTF-8",
+        ] {
+            assert!(!is_readable_declaration(value), "{value}");
+        }
     }
 
     #[test]
