@@ -45,3 +45,16 @@ test('a missing moment merges its step into the next', () => {
     ['page', 100],
   ])
 })
+
+test('when the page starts loading before the webview is reported created, load comes first', () => {
+  assert.deepEqual(startupSteps(marks, 1300, 1550), {
+    totalMs: 550,
+    steps: [
+      { name: 'process', ms: 100 },
+      { name: 'init', ms: 30 },
+      { name: 'load', ms: 170 },
+      { name: 'window', ms: 100 },
+      { name: 'page', ms: 150 },
+    ],
+  })
+})

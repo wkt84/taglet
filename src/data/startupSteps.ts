@@ -8,36 +8,39 @@ export type StartupMark = { name: string; at_ms: number }
 export type StartupStep = { name: string; ms: number }
 
 /**
- * The steps, each named after what it takes, ending at the moment of the next:
- * - `process`: loading the program and its libraries (from the process being created,
- *   where the backend knows it, until `run` starts),
- * - `init`: plugins and state (until `built`),
- * - `window`: creating the window and its webview (until `window`),
- * - `load`: until the page starts loading (`navigation`, the page's time origin),
- * - `page`: loading the page and painting it (until `paint`).
- * Moments the backend did not record are left out, with their steps.
+ * The steps between consecutive moments, in the order they happened, each named after
+ * the moment it ends at:
+ * - `process`: until `run` (from the process being created, where the backend knows it:
+ *   loading the program and its libraries),
+ * - `init`: until `built` (plugins and state),
+ * - `window`: until `window` (the window and its webview created),
+ * - `load`: until `navigation` (the page starting to load: its time origin),
+ * - `page`: until `paint` (the first screen painted).
+ * The webview can start loading the page before it is reported created: the steps
+ * then come in that order (`load` before `window`), so that none is negative and they
+ * add up to the total. Moments the backend did not record are left out, their time
+ * counting in the next step.
  */
-const STEPS: [step: string, endsAt: string][] = [
-  ['process', 'run'],
-  ['init', 'built'],
-  ['window', 'window'],
-  ['load', 'navigation'],
-  ['page', 'paint'],
-]
+const STEP_ENDING_AT: Record<string, string> = {
+  run: 'process',
+  built: 'init',
+  window: 'window',
+  navigation: 'load',
+  paint: 'page',
+}
 
 export function startupSteps(marks: StartupMark[], navigationAt: number, paintedAt: number) {
-  const at = new Map(marks.map((mark) => [mark.name, mark.at_ms]))
-  at.set('navigation', navigationAt)
-  at.set('paint', paintedAt)
-  const moments: [step: string | undefined, at: number][] = []
-  if (at.has('process')) moments.push([undefined, at.get('process')!])
-  for (const [step, endsAt] of STEPS) {
-    const time = at.get(endsAt)
-    if (time !== undefined) moments.push([moments.length === 0 ? undefined : step, time])
-  }
+  const moments = [
+    ...marks.filter((mark) => mark.name === 'process' || mark.name in STEP_ENDING_AT),
+    { name: 'navigation', at_ms: navigationAt },
+    { name: 'paint', at_ms: paintedAt },
+  ]
+    .map((mark, index) => ({ ...mark, index }))
+    // In time order; at the same time, in the order above.
+    .sort((a, b) => a.at_ms - b.at_ms || a.index - b.index)
   const steps: StartupStep[] = []
   for (let index = 1; index < moments.length; index++) {
-    steps.push({ name: moments[index][0]!, ms: moments[index][1] - moments[index - 1][1] })
+    steps.push({ name: STEP_ENDING_AT[moments[index].name], ms: moments[index].at_ms - moments[index - 1].at_ms })
   }
-  return { totalMs: paintedAt - moments[0][1], steps }
+  return { totalMs: paintedAt - moments[0].at_ms, steps }
 }
