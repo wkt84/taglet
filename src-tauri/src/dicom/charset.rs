@@ -314,7 +314,9 @@ impl Iso2022Charset {
 
             if byte == ESC {
                 let (consumed, designation) = parse_escape(&bytes[index + 1..])?;
-                if strict && !self.declares(designation) {
+                // Escape sequences need code extensions, which a single-valued
+                // declaration does not allow, and a character set that is declared.
+                if strict && !(self.code_extensions && self.declares(designation)) {
                     return None;
                 }
                 match designation {
@@ -593,6 +595,10 @@ mod tests {
         // Designating a character set the declaration does not include.
         assert!(jis.decode_strict(VR::LO, b"\x1b)I\xca\xdd").is_none());
         assert_eq!(jis.decode(VR::LO, b"\x1b)I\xca\xdd"), "ﾊﾝ");
+        // Escape sequences under a single-valued declaration (no code extensions).
+        assert!(charset("ISO_IR 13")
+            .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
+            .is_none());
         assert_eq!(
             charset("\\ISO 2022 IR 13")
                 .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
