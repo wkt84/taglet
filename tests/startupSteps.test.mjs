@@ -58,3 +58,10 @@ test('when the page starts loading before the webview is reported created, load 
     ],
   })
 })
+
+test('moments after the first paint are left out', () => {
+  const late = marks.map((mark) => mark.name === 'window' ? { ...mark, at_ms: 1600 } : mark)
+  const startup = startupSteps(late, 1300, 1550)
+  assert.deepEqual(startup.steps.map((step) => step.name), ['process', 'init', 'load', 'page'])
+  assert.equal(startup.steps.reduce((sum, step) => sum + step.ms, 0), startup.totalMs)
+})

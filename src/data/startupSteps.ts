@@ -18,8 +18,8 @@ export type StartupStep = { name: string; ms: number }
  * - `page`: until `paint` (the first screen painted).
  * The webview can start loading the page before it is reported created: the steps
  * then come in that order (`load` before `window`), so that none is negative and they
- * add up to the total. Moments the backend did not record are left out, their time
- * counting in the next step.
+ * add up to the total. Moments the backend did not record, or recorded after the
+ * first paint, are left out, their time counting in the next step.
  */
 const STEP_ENDING_AT: Record<string, string> = {
   run: 'process',
@@ -36,6 +36,9 @@ export function startupSteps(marks: StartupMark[], navigationAt: number, painted
     { name: 'paint', at_ms: paintedAt },
   ]
     .map((mark, index) => ({ ...mark, index }))
+    // What the backend records after the first paint (it can report the webview
+    // created after the page has painted) is not part of starting.
+    .filter((mark) => mark.at_ms <= paintedAt)
     // In time order; at the same time, in the order above.
     .sort((a, b) => a.at_ms - b.at_ms || a.index - b.index)
   const steps: StartupStep[] = []
