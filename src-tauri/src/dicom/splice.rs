@@ -898,14 +898,17 @@ impl SpliceWriter<'_> {
                 tag, start, end, ..
             } = node
             {
-                if tag.element() == 0x0000 && self.group_touched(nodes, parent, tag.group()) {
+                let group = (tag.element() == 0x0000)
+                    .then(|| self.changed_group(nodes, parent, position))
+                    .flatten();
+                if let Some(group) = group {
                     // Group length (gggg,0000), a UL value after an 8-byte header in
                     // either VR encoding. Others are left to the full writer by the
                     // caller (see `is_plain_group_length`).
                     if !is_plain_group_length(node) {
                         return Err(format!("Unexpected group length element {tag}"));
                     }
-                    let length = self.group_length(&nodes[position + 1..], parent, tag.group())?;
+                    let length = self.group_length(&group, parent, tag.group())?;
                     self.copy(*start, end - 4)?;
                     self.write(&self.encoding.u32_bytes(length))?;
                     continue;
@@ -987,40 +990,52 @@ impl SpliceWriter<'_> {
         Ok(())
     }
 
-    /// Whether an element of `group` (other than its group length) in the data set or
-    /// item at `parent` changes, is inserted or is removed.
-    fn group_touched(&self, nodes: &[IndexNode], parent: &[String], group: u16) -> bool {
-        nodes.iter().any(|node| {
-            let tag = node.tag();
-            tag.group() == group
-                && tag.element() != 0x0000
-                && self.touches(&child_path(parent, format_tag(tag)))
-        }) || sorted_insertions(self.edits, parent)
+    /// The existing elements of the group whose group length is at `position` in the
+    /// data set or item at `parent`, as written: those that follow the group length up
+    /// to the first element of another group that is written. (Files with tags out of
+    /// order can have more of the group later; they are not part of it, unless every
+    /// element in between is removed.) `None` when the group's length does not change:
+    /// the same elements as in the file, none of them changed, and none inserted.
+    fn changed_group<'n>(
+        &self,
+        nodes: &'n [IndexNode],
+        parent: &[String],
+        position: usize,
+    ) -> Option<Vec<&'n IndexNode>> {
+        let group = nodes[position].tag().group();
+        let path = |node: &IndexNode| child_path(parent, format_tag(node.tag()));
+        let following = &nodes[position + 1..];
+        let original = following
             .iter()
-            .any(|(tag, _)| tag.group() == group)
+            .take_while(|node| node.tag().group() == group)
+            .collect::<Vec<_>>();
+        let written = following
+            .iter()
+            .filter(|node| !self.edits.removals.contains(&path(node)))
+            .take_while(|node| node.tag().group() == group)
+            .collect::<Vec<_>>();
+        let changed = written.len() != original.len()
+            || written
+                .iter()
+                .zip(&original)
+                .any(|(written, original)| !std::ptr::eq(*written, *original))
+            || written.iter().any(|node| self.touches(&path(node)))
+            || sorted_insertions(self.edits, parent)
+                .iter()
+                .any(|(tag, _)| tag.group() == group);
+        changed.then_some(written)
     }
 
-    /// The length of the elements of `group` that follow its group length in `nodes`,
-    /// up to the first element of another group, and of the ones inserted, as written.
+    /// The length of a group as written: its existing elements (see `changed_group`)
+    /// and the ones inserted.
     fn group_length(
         &self,
-        nodes: &[IndexNode],
+        elements: &[&IndexNode],
         parent: &[String],
         group: u16,
     ) -> Result<u32, String> {
         let mut total = 0_u64;
-        // The group runs until an element of another group (files with tags out of
-        // order can have more of the group later; they are not part of it).
-        for node in nodes.iter().take_while(|node| node.tag().group() == group) {
-            let tag = node.tag();
-            if tag.element() == 0x0000
-                || self
-                    .edits
-                    .removals
-                    .contains(&child_path(parent, format_tag(tag)))
-            {
-                continue;
-            }
+        for node in elements {
             total += u64::from(self.node_length(node, parent)?);
         }
         for (tag, element) in sorted_insertions(self.edits, parent) {
