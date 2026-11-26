@@ -9,7 +9,7 @@ use commands::image::{get_dicom_frame_image, get_dicom_frame_pixels, get_dicom_i
 use commands::plan::get_rt_plan_bev_info;
 use commands::structure::{get_rt_struct_info, get_rt_struct_slice_contours};
 use commands::tags::lookup_dicom_tag;
-use commands::timing::startup_epoch_ms;
+use commands::timing::startup_marks;
 use commands::validate::validate_value;
 
 #[cfg(target_os = "macos")]
@@ -17,13 +17,23 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    commands::timing::record_start();
+    commands::timing::mark("run");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(DicomStore::default())
         .manage(LaunchFileStore::default())
+        // After the window and its webview are created (when the event loop starts).
+        .setup(|_app| {
+            commands::timing::mark("window");
+            Ok(())
+        })
+        .on_page_load(|_webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                commands::timing::mark("page_load");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             open_dicom_file,
             get_full_value,
@@ -38,13 +48,19 @@ pub fn run() {
             get_rt_struct_info,
             get_rt_struct_slice_contours,
             lookup_dicom_tag,
-            startup_epoch_ms,
+            startup_marks,
             validate_value
         ])
         .build(tauri::generate_context!())
         .expect("error while building Taglet");
+    commands::timing::mark("built");
 
-    app.run(handle_run_event);
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Ready = event {
+            commands::timing::mark("ready");
+        }
+        handle_run_event(app_handle, event);
+    });
 }
 
 #[cfg(target_os = "macos")]

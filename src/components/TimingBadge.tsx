@@ -9,6 +9,7 @@ import {
   recordStartup,
   subscribeTimings,
 } from '../data/timings'
+import type { StartupMark } from '../data/startupSteps'
 
 type Props = {
   /** The file whose nodes are shown, and the nodes, to end timing its opening. */
@@ -21,7 +22,7 @@ export default function TimingBadge({ filePath, nodes }: Props) {
   const timings = useSyncExternalStore(subscribeTimings, currentTimings)
 
   useEffect(() => {
-    recordStartup(() => invoke<number>('startup_epoch_ms'))
+    recordStartup(() => invoke<StartupMark[]>('startup_marks'))
   }, [])
 
   // After React has committed a newly opened file's nodes.
