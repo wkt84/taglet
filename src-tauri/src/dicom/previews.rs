@@ -18,12 +18,14 @@ use super::model::DicomNode;
 /// Whether long values are sent as previews.
 pub const SEND_PREVIEWS: bool = true;
 
-/// Values longer than this many characters are sent as previews.
-pub const PREVIEW_ABOVE_CHARS: usize = 1000;
+/// Values longer than this many characters are sent as previews: also the Contour Data
+/// of short contours (a few hundred characters), which RT Structure Sets can have by
+/// the thousand.
+pub const PREVIEW_ABOVE_CHARS: usize = 256;
 
 /// How many characters a preview has: more than the page shows in the table (120), so
 /// that previews look the same there.
-pub const PREVIEW_CHARS: usize = 200;
+pub const PREVIEW_CHARS: usize = 128;
 
 /// The whole values of long elements of an open file, by key.
 pub type FullValues = HashMap<String, String>;
@@ -277,5 +279,22 @@ mod tests {
         take_previews(&mut nodes, &mut full_values);
         let error = restore_full_values(&mut nodes, &FullValues::new()).unwrap_err();
         assert!(error.contains("no longer available"), "{error}");
+    }
+
+    /// Values become previews only when longer than `PREVIEW_ABOVE_CHARS` characters
+    /// (counted as characters, not bytes).
+    #[test]
+    fn previews_start_above_the_threshold() {
+        let at = "山".repeat(PREVIEW_ABOVE_CHARS);
+        let above = "山".repeat(PREVIEW_ABOVE_CHARS + 1);
+        let mut nodes = vec![
+            element(&["(0008,1030)"], &at),
+            element(&["(0008,103E)"], &above),
+        ];
+        let mut full_values = FullValues::new();
+        take_previews(&mut nodes, &mut full_values);
+        assert_eq!(value_of(&nodes[0]), (at.as_str(), None));
+        assert_eq!(value_of(&nodes[1]).0.chars().count(), PREVIEW_CHARS);
+        assert_eq!(value_of(&nodes[1]).1, Some("(0008,103E)"));
     }
 }
