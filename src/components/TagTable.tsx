@@ -166,6 +166,7 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
           row.original.kind === 'Element' ? (
             <ValueCell
               element={row.original as DicomElement}
+              filePath={filePath}
               onCommit={(value) => onChange(row.original.path, value)}
             />
           ) : row.original.kind === 'Item' ? (

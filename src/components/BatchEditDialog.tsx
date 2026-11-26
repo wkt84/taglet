@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { holdsValue, isPreview, withValue } from '../data/fullValues'
 import type { DicomDocument } from '../hooks/useDicomFile'
 import type { DicomElement } from '../types/dicom'
 import { ancestorScopes, findTagOccurrences, occurrenceKey, type BatchValueChange } from '../data/batchEdit'
@@ -32,8 +33,8 @@ export default function BatchEditDialog({ element, documents, activeDocumentId, 
     matches: findTagOccurrences(document.nodes, element.tag, JSON.parse(scopeKey) as string[]),
   }))
   const changes = preview.flatMap(({ document, matches }) => matches
-    .filter(({ element: match }) => canBatchEdit(match) && match.value !== value && !excluded.has(occurrenceKey(document.id, match.path)))
-    .map(({ element: match }): BatchValueChange => ({ documentId: document.id, path: match.path, previousValue: match.value, value })))
+    .filter(({ element: match }) => canBatchEdit(match) && !holdsValue(match, value) && !excluded.has(occurrenceKey(document.id, match.path)))
+    .map(({ element: match }): BatchValueChange => ({ documentId: document.id, path: match.path, previousValue: match.value, previousIsPreview: isPreview(match), value })))
   const fileCount = new Set(changes.map((change) => change.documentId)).size
 
   useEffect(() => {
@@ -131,7 +132,7 @@ export default function BatchEditDialog({ element, documents, activeDocumentId, 
                       <tr key={document.id}><td colSpan={5} className="border-t p-3 text-slate-500">{document.filePath} — No matching tags in this scope.</td></tr>
                     ) : matches.map(({ element: match, location }) => {
                       const key = occurrenceKey(document.id, match.path)
-                      const unchanged = match.value === value
+                      const unchanged = holdsValue(match, value)
                       return (
                         <tr key={key} className={`border-t border-slate-100 ${!match.editable || unchanged || excluded.has(key) ? 'bg-slate-50 text-slate-500' : ''}`}>
                           <td className="p-2 align-top">
@@ -144,8 +145,8 @@ export default function BatchEditDialog({ element, documents, activeDocumentId, 
                           </td>
                           <td className="max-w-sm break-words p-2"><div title={document.filePath} className="font-medium">{document.filePath.split(/[\\/]/).pop()}</div><div className="mt-1 text-xs">{location}</div></td>
                           <td className="p-2 align-top font-mono text-xs">{match.vr}</td>
-                          <td className="max-w-xs p-2 align-top"><ValueCell element={{ ...match, editable: false }} onCommit={() => {}} /></td>
-                          <td className="max-w-xs p-2 align-top">{!match.editable ? 'Read-only · skipped' : unchanged ? 'Unchanged' : <ValueCell element={{ ...match, value, editable: false }} onCommit={() => {}} />}</td>
+                          <td className="max-w-xs p-2 align-top"><ValueCell element={{ ...match, editable: false }} filePath={document.filePath} onCommit={() => {}} /></td>
+                          <td className="max-w-xs p-2 align-top">{!match.editable ? 'Read-only · skipped' : unchanged ? 'Unchanged' : <ValueCell element={{ ...withValue(match, value), editable: false }} onCommit={() => {}} />}</td>
                         </tr>
                       )
                     }))}

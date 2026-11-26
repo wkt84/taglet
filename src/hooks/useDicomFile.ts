@@ -5,6 +5,7 @@ import type { DicomElement, DicomFileContent, DicomNode, ValidationResult } from
 import { applyBatchValueChanges, validateBatchValueChanges, type BatchValueChange } from '../data/batchEdit'
 import { appendItem, deleteNodeAtPath, withoutItemSources } from '../data/nodeTree'
 import { recordOpen } from '../data/timings'
+import { withValue } from '../data/fullValues'
 
 export type DicomDocument = {
   id: string
@@ -25,7 +26,7 @@ const LONG_VR_HEADER_BYTES = new Set(['OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'SQ', 
 function updateNode(nodes: DicomNode[], path: string[], nextValue: string): DicomNode[] {
   return nodes.map((node) => {
     if (node.kind === 'Element') {
-      return samePath(node.path, path) ? { ...node, value: nextValue } : node
+      return samePath(node.path, path) ? withValue(node, nextValue) : node
     }
 
     return {
@@ -417,7 +418,8 @@ export function useDicomFile() {
         throw new Error('The open files changed during validation. Review the preview and try again.')
       }
       const next = snapshot.map((document) => {
-        const edits = changes.filter((change) => change.documentId === document.id && change.value !== change.previousValue)
+        const edits = changes.filter((change) => change.documentId === document.id
+          && (change.previousIsPreview === true || change.value !== change.previousValue))
         if (edits.length === 0) return document
         const nodes = applyBatchValueChanges(document.nodes, edits)
         return { ...document, nodes, fileMeta: syncFileMetaFromNodes(document.fileMeta, nodes), dirty: true }
