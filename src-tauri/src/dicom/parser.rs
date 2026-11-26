@@ -127,6 +127,7 @@ fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
     }
     splice::FileIndex::read(path)
         .ok()
+        .filter(|index| !has_irregular_group_length(index.nodes()))
         .map(|index| index.is_ordered())
 }
 
@@ -6410,6 +6411,72 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!spliced);
+    }
+
+    /// A group runs until an element of another group: elements of the group found
+    /// later (tags out of order) do not count.
+    #[test]
+    fn group_lengths_stop_at_the_next_group() {
+        let path = temp_path("group-length-gap.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            with_group_length(
+                0x0010,
+                &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+                true,
+            ),
+            explicit_element(0x0018, 0x0015, b"CS", b"HEAD"),
+            explicit_element(0x0010, 0x0030, b"DA", b"19700101"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let expected = explicit_element(0x0010, 0x0020, b"LO", b"ID-00002").len() as u32;
+        let group_length = [0x10, 0x00, 0x00, 0x00, b'U', b'L', 4, 0];
+        let at = saved
+            .windows(8)
+            .position(|window| window == group_length)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(saved[at + 8..at + 12].try_into().unwrap()),
+            expected
+        );
+    }
+
+    /// Files with irregular group lengths are not treated as spliceable when opened,
+    /// so text the full writer cannot write back stays read-only.
+    #[test]
+    fn irregular_group_lengths_keep_unwritable_text_read_only() {
+        let path = temp_path("group-length-irregular-open.dcm");
+        let mut ob = Vec::new();
+        ob.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+        ob.extend_from_slice(b"OB\0\0");
+        ob.extend_from_slice(&0_u32.to_le_bytes());
+        let item = [
+            explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+            explicit_element(0x3006, 0x0026, b"LO", HAN_IR13),
+        ]
+        .concat();
+        let dataset = [
+            ob,
+            base_elements(b"ISO_IR 192"),
+            defined_sequence(0x3006, 0x0020, &[item]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
     }
 
     /// In a file with tags out of order, a group length only counts the elements of

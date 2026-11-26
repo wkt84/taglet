@@ -773,8 +773,8 @@ impl SpliceWriter<'_> {
             .any(|(tag, _)| tag.group() == group)
     }
 
-    /// The length of the elements of `group` among `nodes` (those after its group
-    /// length, in file order) and the ones inserted, as written.
+    /// The length of the elements of `group` that follow its group length in `nodes`,
+    /// up to the first element of another group, and of the ones inserted, as written.
     fn group_length(
         &self,
         nodes: &[IndexNode],
@@ -782,10 +782,11 @@ impl SpliceWriter<'_> {
         group: u16,
     ) -> Result<u32, String> {
         let mut total = 0_u64;
-        for node in nodes {
+        // The group runs until an element of another group (files with tags out of
+        // order can have more of the group later; they are not part of it).
+        for node in nodes.iter().take_while(|node| node.tag().group() == group) {
             let tag = node.tag();
-            if tag.group() != group
-                || tag.element() == 0x0000
+            if tag.element() == 0x0000
                 || self
                     .edits
                     .removals
