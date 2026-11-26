@@ -671,6 +671,22 @@ impl SpliceWriter<'_> {
             {
                 continue;
             }
+            if let IndexNode::Element {
+                tag, start, end, ..
+            } = node
+            {
+                if tag.element() == 0x0000 && self.group_touched(nodes, parent, tag.group()) {
+                    // Group length (gggg,0000), a UL value after an 8-byte header in
+                    // either VR encoding.
+                    if end - start != 12 {
+                        return Err(format!("Unexpected group length element {tag}"));
+                    }
+                    let length = self.group_length(nodes, parent, tag.group())?;
+                    self.copy(*start, end - 4)?;
+                    self.write(&length.to_le_bytes())?;
+                    continue;
+                }
+            }
             self.node(node, parent)?;
         }
         for (_, element) in pending {
@@ -741,6 +757,48 @@ impl SpliceWriter<'_> {
             self.copy(item.end - 8, item.end)?;
         }
         Ok(())
+    }
+
+    /// Whether an element of `group` (other than its group length) in the data set or
+    /// item at `parent` changes, is inserted or is removed.
+    fn group_touched(&self, nodes: &[IndexNode], parent: &[String], group: u16) -> bool {
+        nodes.iter().any(|node| {
+            let tag = node.tag();
+            tag.group() == group
+                && tag.element() != 0x0000
+                && self.touches(&child_path(parent, format_tag(tag)))
+        }) || sorted_insertions(self.edits, parent)
+            .iter()
+            .any(|(tag, _)| tag.group() == group)
+    }
+
+    /// The length of the elements of `group` after its group length, as written.
+    fn group_length(
+        &self,
+        nodes: &[IndexNode],
+        parent: &[String],
+        group: u16,
+    ) -> Result<u32, String> {
+        let mut total = 0_u64;
+        for node in nodes {
+            let tag = node.tag();
+            if tag.group() != group
+                || tag.element() == 0x0000
+                || self
+                    .edits
+                    .removals
+                    .contains(&child_path(parent, format_tag(tag)))
+            {
+                continue;
+            }
+            total += u64::from(self.node_length(node, parent)?);
+        }
+        for (tag, element) in sorted_insertions(self.edits, parent) {
+            if tag.group() == group {
+                total += element.len() as u64;
+            }
+        }
+        checked_length(total, "A group")
     }
 
     /// Whether anything at or below `path` is replaced, inserted or removed.
