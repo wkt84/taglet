@@ -55,7 +55,15 @@ export default function ValueCell({ element, filePath, onCommit }: Props) {
         >
           View full value
         </button>
-        {dialogOpen ? <ValueDialog element={element} filePath={filePath} onCommit={onCommit} onClose={() => setDialogOpen(false)} /> : null}
+        {dialogOpen ? (
+          <ValueDialog
+            key={element.full_value_key ?? element.path.join('/')}
+            element={element}
+            filePath={filePath}
+            onCommit={onCommit}
+            onClose={() => setDialogOpen(false)}
+          />
+        ) : null}
       </div>
     )
   }
