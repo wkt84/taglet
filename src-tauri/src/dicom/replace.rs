@@ -21,8 +21,14 @@ use std::path::Path;
 /// Move `temporary` to `destination`, replacing it if it exists (see the module
 /// documentation). On failure, `destination` is unchanged and `temporary` is left for
 /// the caller to remove.
+///
+/// A symbolic link at `destination` is replaced by the file, as a new file in its
+/// place (callers that mean to replace the file a link points to pass that file).
 pub fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
-    match std::fs::metadata(destination) {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::rename(temporary, destination).map_err(|error| error.to_string())
+        }
         Ok(_) => replace_existing(temporary, destination),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::rename(temporary, destination).map_err(|error| error.to_string())

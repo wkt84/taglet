@@ -1169,6 +1169,11 @@ pub type FileStamp = (u64, std::time::SystemTime);
 
 /// The length and modification time of a file, to tell whether it changed.
 pub fn file_stamp(path: &str) -> Option<FileStamp> {
+    file_stamp_of(std::path::Path::new(path))
+}
+
+/// `file_stamp` for a path that may not be UTF-8.
+pub fn file_stamp_of(path: &std::path::Path) -> Option<FileStamp> {
     let metadata = std::fs::metadata(path).ok()?;
     Some((metadata.len(), metadata.modified().ok()?))
 }
