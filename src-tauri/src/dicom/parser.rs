@@ -1068,7 +1068,7 @@ pub fn save_file_with_nodes(
     destination: &str,
     opened: Option<splice::FileStamp>,
     hidden: HiddenTrailing,
-) -> Result<bool, String> {
+) -> Result<Saved, String> {
     let nodes = &with_file_item_paths(nodes, &[]);
     // Implicit VR files do not store VRs, so readers take them from the dictionary.
     if is_implicit_vr(object) {
@@ -1109,13 +1109,30 @@ pub fn save_file_with_nodes(
                 format!("{error} These changes rewrite the file with its elements in tag order, which changes how this element is read.")
             })?;
         }
-        save_object_with_nodes_guarded(object, nodes, text, destination, guard, hidden)?;
-        return Ok(true);
+        let warnings =
+            save_object_with_nodes_guarded(object, nodes, text, destination, guard, hidden)?;
+        return Ok(Saved {
+            object_matches_file: true,
+            warnings,
+        });
     };
-    write_file_atomically_with(destination, splice_guard, |out| {
+    let warnings = write_file_atomically_with(destination, splice_guard, |out| {
         splice::write_spliced(source, &index, &edits, out)
     })?;
-    Ok(false)
+    Ok(Saved {
+        object_matches_file: false,
+        warnings,
+    })
+}
+
+/// A file saved by `save_file_with_nodes`.
+#[derive(Debug)]
+pub struct Saved {
+    /// Whether the object now holds what was written (after a full write; a spliced
+    /// one leaves it as it was, to be read again from the file).
+    pub object_matches_file: bool,
+    /// What the user should know although the file was saved.
+    pub warnings: Vec<String>,
 }
 
 fn is_implicit_vr(object: &DefaultDicomObject) -> bool {
@@ -2518,7 +2535,7 @@ pub fn save_object_with_nodes(
     text: &TextValues,
     destination: &str,
 ) -> Result<(), String> {
-    save_object_with_nodes_guarded(object, nodes, text, destination, None, None)
+    save_object_with_nodes_guarded(object, nodes, text, destination, None, None).map(|_| ())
 }
 
 /// The message for a file changed by another program since it was opened.
@@ -2533,25 +2550,26 @@ fn save_object_with_nodes_guarded(
     destination: &str,
     guard: Option<(&str, splice::FileStamp)>,
     hidden: HiddenTrailing,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let mut candidate = object.clone();
     let edited = apply_nodes_to_object_with_text(&mut candidate, nodes, text, hidden)?;
     prepare_text_for_writing(&mut candidate, text, &edited)?;
     sync_file_meta_from_dataset(&mut candidate);
     let explicit_vr = candidate.meta().transfer_syntax() != uids::IMPLICIT_VR_LITTLE_ENDIAN;
     ensure_value_lengths_fit(&candidate, explicit_vr)?;
-    write_file_atomically(&candidate, destination, guard)?;
+    let warnings = write_file_atomically(&candidate, destination, guard)?;
     *object = candidate;
-    Ok(())
+    Ok(warnings)
 }
 
 /// Write to a new temporary file next to `destination` and move it into place, so that
 /// a failed write never leaves `destination` truncated or replaced by a partial file.
+/// On success, warnings for the user (see `replace::replace_file`).
 fn write_file_atomically(
     object: &DefaultDicomObject,
     destination: &str,
     guard: Option<(&str, splice::FileStamp)>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     write_file_atomically_with(destination, guard, |out| {
         object.write_all(out).map_err(|error| error.to_string())
     })
@@ -2569,8 +2587,9 @@ fn write_file_atomically_with(
     destination: &str,
     guard: Option<(&str, splice::FileStamp)>,
     write: impl FnOnce(&mut dyn std::io::Write) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let overwriting = guard.is_some_and(|(path, _)| path == destination);
+    let given = destination;
     let destination = if overwriting {
         resolve_symbolic_link(destination)
     } else {
@@ -2610,7 +2629,23 @@ fn write_file_atomically_with(
             std::fs::remove_file(&temporary).ok();
             Err(error)
         }
-        Ok(()) => Ok(()),
+        Ok(warning) => {
+            let mut warnings = Vec::from_iter(warning);
+            // A symbolic link changed to point elsewhere while saving through it: the
+            // file saved is the one it pointed to, which was checked unchanged, but
+            // opening the link no longer shows it (#32).
+            if overwriting
+                && destination.as_path() != std::path::Path::new(given)
+                && resolve_symbolic_link(given) != destination
+            {
+                warnings.push(format!(
+                    "{} was saved to {}, which it pointed to when saving started, but it now points elsewhere.",
+                    given,
+                    destination.display()
+                ));
+            }
+            Ok(warnings)
+        }
     }
 }
 
@@ -8526,7 +8561,8 @@ mod tests {
             path_text,
             splice::file_stamp(path_text),
             Some(hidden),
-        )?;
+        )?
+        .object_matches_file;
         if !matches {
             *obj = open_full_object(path_text)?;
         }
@@ -8776,10 +8812,43 @@ mod tests {
         std::fs::remove_file(&link).ok();
         std::fs::remove_file(&target).ok();
 
-        saved.unwrap();
+        assert_eq!(saved.unwrap(), Vec::<String>::new());
         assert!(still_link);
         assert_eq!(content, b"new");
         assert_eq!(mode & 0o777, 0o640);
+    }
+
+    /// #32: a symbolic link changed to point elsewhere while saving through it. The
+    /// file it pointed to (checked unchanged) is saved, with a warning that the link
+    /// no longer shows it.
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_link_changed_meanwhile_warns() {
+        let target = temp_path("retarget-target.dcm");
+        let other = temp_path("retarget-other.dcm");
+        let link = temp_path("retarget-link.dcm");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.to_str().unwrap();
+        let stamp = splice::file_stamp(link_text).unwrap();
+        let saved = write_file_atomically_with(link_text, Some((link_text, stamp)), |out| {
+            // Another program points the link elsewhere while the file is written.
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            out.write_all(b"new").map_err(|error| error.to_string())
+        });
+        let target_content = std::fs::read(&target).unwrap();
+        let other_content = std::fs::read(&other).unwrap();
+        for path in [&target, &other, &link] {
+            std::fs::remove_file(path).ok();
+        }
+
+        let warnings = saved.unwrap();
+        assert_eq!(target_content, b"new");
+        assert_eq!(other_content, b"other");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("now points elsewhere"), "{warnings:?}");
     }
 
     /// Review on #31: Save As to a symbolic link replaces the link with the new file,
@@ -8809,7 +8878,7 @@ mod tests {
             std::fs::remove_file(path).ok();
         }
 
-        saved.unwrap();
+        assert_eq!(saved.unwrap(), Vec::<String>::new());
         assert!(!is_link);
         assert_eq!(saved_content, b"new");
         assert_eq!(target_content, b"other");

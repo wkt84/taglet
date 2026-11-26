@@ -151,6 +151,11 @@ export function useDicomFile() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string>()
   const [warnings, setWarnings] = useState<string[]>([])
+  // What saving reports although the file was saved (e.g. a previous version that
+  // could not be removed), shown as the warnings of opening are.
+  const showSaveWarnings = useCallback((saveWarnings: string[] | null) => {
+    if (saveWarnings && saveWarnings.length > 0) setWarnings((current) => [...current, ...saveWarnings])
+  }, [])
   const activeDocument = useMemo(
     () => documents.find((document) => document.id === activeDocumentId),
     [activeDocumentId, documents],
@@ -281,10 +286,11 @@ export function useDicomFile() {
     savingRef.current.add(activeDocument.id)
     try {
       await setBackendCurrentPath(activeDocument.filePath)
-      await invoke('save_dicom_file', {
+      const saveWarnings = await invoke<string[] | null>('save_dicom_file', {
         path: activeDocument.filePath,
         nodes: savedNodes,
       })
+      showSaveWarnings(saveWarnings)
       // The saved file's items are the shown ones, in order.
       updateDocument(activeDocument.id, (document) => (
         document.nodes === savedNodes
@@ -297,7 +303,7 @@ export function useDicomFile() {
       savingRef.current.delete(activeDocument.id)
       setLoading(false)
     }
-  }, [activeDocument, setBackendCurrentPath, updateDocument])
+  }, [activeDocument, setBackendCurrentPath, showSaveWarnings, updateDocument])
 
   const saveFileAs = useCallback(async () => {
     if (!activeDocument) return
@@ -323,7 +329,8 @@ export function useDicomFile() {
       savingRef.current.add(activeDocument.id)
       locked = true
       await setBackendCurrentPath(activeDocument.filePath)
-      await invoke('save_dicom_file_as', { path: destination, nodes: savedNodes })
+      const saveWarnings = await invoke<string[] | null>('save_dicom_file_as', { path: destination, nodes: savedNodes })
+      showSaveWarnings(saveWarnings)
       updateDocument(activeDocument.id, (document) => ({
         ...document,
         filePath: destination,
@@ -337,7 +344,7 @@ export function useDicomFile() {
       if (locked) savingRef.current.delete(activeDocument.id)
       setLoading(false)
     }
-  }, [activeDocument, setBackendCurrentPath, updateDocument])
+  }, [activeDocument, setBackendCurrentPath, showSaveWarnings, updateDocument])
 
   const closeDocument = useCallback((id = activeDocumentId) => {
     if (!id) return false

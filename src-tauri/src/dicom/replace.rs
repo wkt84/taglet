@@ -20,25 +20,27 @@ use std::path::Path;
 
 /// Move `temporary` to `destination`, replacing it if it exists (see the module
 /// documentation). On failure, `destination` is unchanged and `temporary` is left for
-/// the caller to remove.
+/// the caller to remove. On success, a warning for the user when something besides
+/// the saving went wrong (the previous version of the file could not be removed).
 ///
 /// A symbolic link at `destination` is replaced by the file, as a new file in its
 /// place (callers that mean to replace the file a link points to pass that file).
-pub fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+pub fn replace_file(temporary: &Path, destination: &Path) -> Result<Option<String>, String> {
+    let rename = || {
+        std::fs::rename(temporary, destination)
+            .map(|()| None)
+            .map_err(|error| error.to_string())
+    };
     match std::fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            std::fs::rename(temporary, destination).map_err(|error| error.to_string())
-        }
+        Ok(metadata) if metadata.file_type().is_symlink() => rename(),
         Ok(_) => replace_existing(temporary, destination),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::rename(temporary, destination).map_err(|error| error.to_string())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rename(),
         Err(error) => Err(error.to_string()),
     }
 }
 
 #[cfg(windows)]
-fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> {
+fn replace_existing(temporary: &Path, destination: &Path) -> Result<Option<String>, String> {
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     // A backup name, so that a failed replacement never leaves the replaced file
@@ -78,6 +80,15 @@ fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> 
                 ));
             }
         }
+        // ReplaceFileW opens the replaced file to read it (to keep its access settings
+        // and streams), which a file that may be deleted but not read refuses (#32).
+        // Its access settings cannot be kept then, so it is not replaced (#7).
+        if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            return Err(format!(
+                "Cannot save over {}: Windows did not allow replacing it while keeping who may access it ({error}). Save it under another name, or delete the existing file first.",
+                destination.display()
+            ));
+        }
         return Err(format!(
             "Could not replace {}: {error}",
             destination.display()
@@ -85,24 +96,28 @@ fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> 
     }
     // The replaced file, kept only until the replacement succeeded. It must not stay
     // behind (saving may be meant to remove patient data), so removing it is retried
-    // (e.g. while a virus scanner has it open) and a failure is reported.
+    // (e.g. while a virus scanner has it open) and a failure is reported: as a warning,
+    // the file having been saved (#32).
     let mut removed = std::fs::remove_file(&backup);
     for _ in 0..10 {
         if removed.is_ok() || !backup.exists() {
-            return Ok(());
+            return Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         removed = std::fs::remove_file(&backup);
     }
     match removed {
-        Ok(()) => Ok(()),
-        Err(error) => Err(format!(
+        Ok(()) => Ok(None),
+        Err(error) => Ok(Some(format!(
             "{} was saved, but the previous version could not be removed ({error}) and is still in {}. Delete it if it should not be kept.",
             destination.display(),
             backup.display()
-        )),
+        ))),
     }
 }
+
+#[cfg(windows)]
+const ERROR_ACCESS_DENIED: i32 = windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32;
 
 /// A path next to `path` that does not exist yet, ending in `extension`.
 #[cfg(windows)]
@@ -146,7 +161,7 @@ fn verbatim(path: &Path) -> Result<Vec<u16>, String> {
 }
 
 #[cfg(unix)]
-fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> {
+fn replace_existing(temporary: &Path, destination: &Path) -> Result<Option<String>, String> {
     use std::os::unix::fs::MetadataExt;
 
     let existing = std::fs::metadata(destination).map_err(|error| error.to_string())?;
@@ -170,7 +185,9 @@ fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> 
             destination.display()
         )
     })?;
-    std::fs::rename(temporary, destination).map_err(|error| error.to_string())
+    std::fs::rename(temporary, destination)
+        .map(|()| None)
+        .map_err(|error| error.to_string())
 }
 
 /// Copy the access control list and extended attributes of `from` to `to`.

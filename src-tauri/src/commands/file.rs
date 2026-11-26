@@ -253,7 +253,7 @@ pub async fn save_dicom_file(
     path: String,
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     save_to_path(path.clone(), path, nodes, store)
 }
 
@@ -262,7 +262,7 @@ pub async fn save_dicom_file_as(
     path: String,
     nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let source_path = store
         .current_path
         .lock()
@@ -272,12 +272,15 @@ pub async fn save_dicom_file_as(
     save_to_path(source_path, path, nodes, store)
 }
 
+/// Save the nodes of the file opened from `source_path` to `destination_path`.
+/// Returns what the user should know although the file was saved (see
+/// `replace::replace_file`).
 fn save_to_path(
     source_path: String,
     destination_path: String,
     mut nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     // The shown nodes come from the file as it was opened (or last saved). If another
     // program changed it since, saving them would silently undo those changes.
     let opened_stamp = store
@@ -318,7 +321,7 @@ fn save_to_path(
         .as_mut()
         .ok_or_else(|| "Full DICOM object is not loaded in this session".to_string())?;
 
-    let object_matches_file = save_file_with_nodes(
+    let saved = save_file_with_nodes(
         &source_path,
         object,
         &nodes,
@@ -327,7 +330,7 @@ fn save_to_path(
         opened_stamp,
         hidden_trailing.as_ref(),
     )?;
-    if !object_matches_file || source_path != destination_path {
+    if !saved.object_matches_file || source_path != destination_path {
         // After a spliced save the object is read again from the file when needed.
         // After Save As, the source file is unchanged, so its object must not keep
         // the edits.
@@ -357,7 +360,7 @@ fn save_to_path(
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())? = Some(destination_path);
 
-    Ok(())
+    Ok(saved.warnings)
 }
 
 /// The whole value of an element of the open file at `path` sent as a preview, by its
