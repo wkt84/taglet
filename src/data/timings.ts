@@ -10,7 +10,7 @@ export type OpenTiming = {
   totalMs: number
   /** Reading the file in the backend. */
   readMs?: number
-  /** The rest of the call: sending the result and parsing it. */
+  /** The rest of the call: sending the result, parsing it and rebuilding the nodes (see `openedFile`). */
   transferMs: number
   /** From receiving the result until the table is painted. */
   renderMs: number

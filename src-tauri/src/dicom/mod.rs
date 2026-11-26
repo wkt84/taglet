@@ -8,3 +8,4 @@ pub mod replace;
 pub mod splice;
 pub mod text_values;
 pub mod vr;
+pub mod wire;

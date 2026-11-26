@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import type { DicomElement, DicomFileContent, DicomNode, ValidationResult } from '../types/dicom'
+import type { DicomElement, DicomNode, ValidationResult } from '../types/dicom'
+import { decodeOpenedFile, type WireFileContent } from '../data/openedFile'
 import { applyBatchValueChanges, validateBatchValueChanges, type BatchValueChange } from '../data/batchEdit'
 import { appendItem, deleteNodeAtPath, withoutItemSources } from '../data/nodeTree'
 import { recordOpen } from '../data/timings'
@@ -210,7 +211,7 @@ export function useDicomFile() {
       }
 
       const started = performance.now()
-      const loaded = await invoke<DicomFileContent>('open_dicom_file', { path })
+      const loaded = decodeOpenedFile(await invoke<WireFileContent>('open_dicom_file', { path }))
       const received = performance.now()
       // Before the state changes, which ends the timing once the nodes are shown.
       recordOpen(path, started, received, loaded.open_ms)

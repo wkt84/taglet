@@ -14,6 +14,7 @@ export async function openMockFiles(
     const response = await route.fetch()
     const setup = `
       import { mockIPC, mockWindows } from '/node_modules/@tauri-apps/api/mocks.js';
+      import { encodeOpenedFile } from '/tests/e2e/wire.ts';
       mockWindows('main');
       const fixtureFiles = ${JSON.stringify(fixtureFiles)};
       const viewerResponses = ${JSON.stringify(viewerResponses)};
@@ -32,7 +33,8 @@ export async function openMockFiles(
           case 'open_dicom_file': {
             const file = fixtureFiles[args.path];
             if (!file) throw new Error('Unknown fixture: ' + args.path);
-            return structuredClone(file);
+            // As the backend sends it (see src-tauri/src/dicom/wire.rs).
+            return encodeOpenedFile(structuredClone(file));
           }
           case 'get_full_value': {
             const value = fullValues[args.path]?.[args.key];
