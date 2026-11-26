@@ -39,18 +39,22 @@ export default function ValueDialog({ element, filePath, onCommit, onClose }: Pr
     if (mode === 'xml' && xml === null) setMode('raw')
   }, [mode, xml])
 
-  // Fetched once: not again when the element object is rebuilt or Save As changes the
-  // file path while the dialog is open, which would replace the draft being edited.
+  // Fetched once per key: not again when the element object is rebuilt or Save As
+  // changes the file path while the dialog is open, which would replace the draft
+  // being edited; but again for another element's key.
   const fullValueKey = element.full_value_key
   const elementRef = useRef(element)
-  const loadedRef = useRef(false)
+  elementRef.current = element
+  const loadedKeyRef = useRef<string>()
   useEffect(() => {
-    if (fullValueKey === undefined || loadedRef.current) return
+    if (fullValueKey === undefined || loadedKeyRef.current === fullValueKey) return
+    setOriginal(undefined)
+    setLoadError(undefined)
     let canceled = false
     fullValue(filePath, elementRef.current)
       .then((value) => {
-        if (canceled || loadedRef.current) return
-        loadedRef.current = true
+        if (canceled) return
+        loadedKeyRef.current = fullValueKey
         setOriginal(value)
         setDraft(value)
       })
