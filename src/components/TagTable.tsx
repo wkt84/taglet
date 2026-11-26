@@ -24,13 +24,15 @@ type Props = {
   fileMeta: DicomNode[]
   nodes: DicomNode[]
   filePath?: string
+  /** The open document the nodes are from: it stays the same when Save As changes the path. */
+  documentId?: string
   selectedPath?: string[]
   onChange: (path: string[], value: string) => void
   onSelect: (path: string[]) => void
   onBatchEdit: (element: DicomElement) => void
 }
 
-export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onChange, onSelect, onBatchEdit }: Props) {
+export default function TagTable({ fileMeta, nodes, filePath, documentId, selectedPath, onChange, onSelect, onBatchEdit }: Props) {
   const tableScrollRef = useRef<HTMLDivElement>(null)
   const [expanded, setExpanded] = useState<ExpandedState>({})
   const [query, setQuery] = useState('')
@@ -84,6 +86,12 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
     setPendingScrollPath(undefined)
     setContextMenu(undefined)
   }, [filePath])
+
+  // Read by the cells when they render, not built into the columns: new columns remount
+  // every cell (closing an open value dialog), which Save As, changing the path, must
+  // not do.
+  const openFile = useRef({ filePath, documentId })
+  openFile.current = { filePath, documentId }
 
   const columns = useMemo<ColumnDef<TableDicomRow>[]>(
     () => [
@@ -166,7 +174,8 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
           row.original.kind === 'Element' ? (
             <ValueCell
               element={row.original as DicomElement}
-              filePath={filePath}
+              filePath={openFile.current.filePath}
+              documentId={openFile.current.documentId}
               onCommit={(value) => onChange(row.original.path, value)}
             />
           ) : row.original.kind === 'Item' ? (

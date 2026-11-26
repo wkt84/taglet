@@ -260,6 +260,7 @@ export default function App() {
           fileMeta={dicom.fileMeta}
           nodes={dicom.nodes}
           filePath={dicom.filePath}
+          documentId={dicom.activeDocumentId}
           selectedPath={selectedPath}
           onChange={dicom.updateNodeValue}
           onSelect={dicom.setSelectedPath}

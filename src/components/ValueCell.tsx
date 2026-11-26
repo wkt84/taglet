@@ -9,10 +9,12 @@ type Props = {
   element: DicomElement
   /** The open file the element is from, to fetch its whole value if it is a preview. */
   filePath?: string
+  /** The open document the element is from (see `TagTable`). */
+  documentId?: string
   onCommit: (value: string) => void
 }
 
-export default function ValueCell({ element, filePath, onCommit }: Props) {
+export default function ValueCell({ element, filePath, documentId, onCommit }: Props) {
   const [editing, setEditing] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const preview = useMemo(() => valuePreview(element.value), [element.value])
@@ -55,7 +57,19 @@ export default function ValueCell({ element, filePath, onCommit }: Props) {
         >
           View full value
         </button>
-        {dialogOpen ? <ValueDialog element={element} filePath={filePath} onCommit={onCommit} onClose={() => setDialogOpen(false)} /> : null}
+        {dialogOpen ? (
+          <ValueDialog
+            // A dialog shows one element of one document: the same cell can show another
+            // document's element at the same path (when a file is opened or dropped while
+            // the dialog is open), which must not keep this one's whole value or draft.
+            // The document, not the path, so Save As keeps the dialog.
+            key={`${documentId ?? ''}\n${element.full_value_key ?? element.path.join('/')}`}
+            element={element}
+            filePath={filePath}
+            onCommit={onCommit}
+            onClose={() => setDialogOpen(false)}
+          />
+        ) : null}
       </div>
     )
   }

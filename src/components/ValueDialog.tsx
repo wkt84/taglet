@@ -39,14 +39,17 @@ export default function ValueDialog({ element, filePath, onCommit, onClose }: Pr
     if (mode === 'xml' && xml === null) setMode('raw')
   }, [mode, xml])
 
-  // Fetched once per preview, not again when the element object is rebuilt (which would
-  // replace the draft being edited).
-  const fullValueKey = element.full_value_key
-  const elementRef = useRef(element)
+  // A preview's whole value is fetched once, when the dialog opens: not again when the
+  // element object is rebuilt or Save As changes the file path while the dialog is
+  // open, which would replace the draft being edited. A dialog shows one element: its
+  // callers key it by the element (see `ValueCell`), so another element gets a dialog
+  // of its own.
+  const openedWith = useRef({ element, filePath })
   useEffect(() => {
-    if (fullValueKey === undefined) return
+    const { element: opened, filePath: openedPath } = openedWith.current
+    if (!isPreview(opened)) return
     let canceled = false
-    fullValue(filePath, elementRef.current)
+    fullValue(openedPath, opened)
       .then((value) => {
         if (canceled) return
         setOriginal(value)
@@ -58,7 +61,7 @@ export default function ValueDialog({ element, filePath, onCommit, onClose }: Pr
     return () => {
       canceled = true
     }
-  }, [fullValueKey, filePath])
+  }, [])
 
   useEffect(() => {
     activeRef.current = true
