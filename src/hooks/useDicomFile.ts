@@ -267,7 +267,8 @@ export function useDicomFile() {
     if (!activeDocument) return
     setError(undefined)
     setLoading(true)
-    const savedNodes = activeDocument.nodes
+    const savedNodes = documentsRef.current.find((document) => document.id === activeDocument.id)?.nodes
+      ?? activeDocument.nodes
     savingRef.current.add(activeDocument.id)
     try {
       await setBackendCurrentPath(activeDocument.filePath)
@@ -300,7 +301,10 @@ export function useDicomFile() {
       })
       if (!destination) return
 
-      const savedNodes = activeDocument.nodes
+      // The document as it is now: it may have been edited while the dialog was open.
+      const current = documentsRef.current.find((document) => document.id === activeDocument.id)
+      if (!current) return
+      const savedNodes = current.nodes
       savingRef.current.add(activeDocument.id)
       await setBackendCurrentPath(activeDocument.filePath)
       await invoke('save_dicom_file_as', { path: destination, nodes: savedNodes })
