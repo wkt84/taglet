@@ -308,6 +308,9 @@ impl Iso2022Charset {
         let mut g0 = self.initial_g0;
         let mut g1 = self.initial_g1;
         let mut index = 0;
+        // Whether a Person Name value is in its first (alphabetic) component group,
+        // which must not switch to other G0 sets (PS3.5 6.2.1.2).
+        let mut first_name_group = person_name;
 
         while index < bytes.len() {
             let byte = bytes[index];
@@ -317,6 +320,12 @@ impl Iso2022Charset {
                 // Escape sequences need code extensions, which a single-valued
                 // declaration does not allow, and a character set that is declared.
                 if strict && !(self.code_extensions && self.declares(designation)) {
+                    return None;
+                }
+                if strict
+                    && first_name_group
+                    && matches!(designation, Designation::G0(set) if set != self.initial_g0)
+                {
                     return None;
                 }
                 match designation {
@@ -377,6 +386,11 @@ impl Iso2022Charset {
                         _ => char::from(byte),
                     };
                     out.push(c);
+                    if person_name && byte == b'=' {
+                        first_name_group = false;
+                    } else if is_value_delimiter {
+                        first_name_group = person_name;
+                    }
                     if resets {
                         g0 = self.initial_g0;
                         g1 = self.initial_g1;
@@ -595,6 +609,15 @@ mod tests {
         // Designating a character set the declaration does not include.
         assert!(jis.decode_strict(VR::LO, b"\x1b)I\xca\xdd").is_none());
         assert_eq!(jis.decode(VR::LO, b"\x1b)I\xca\xdd"), "ﾊﾝ");
+        // Kanji in the first (alphabetic) group of a Person Name.
+        assert!(jis
+            .decode_strict(VR::PN, b"\x1b$B;3ED\x1b(B^Tarou")
+            .is_none());
+        assert_eq!(
+            jis.decode_strict(VR::PN, b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B")
+                .unwrap(),
+            "Yamada^Tarou=山田^太郎"
+        );
         // Escape sequences under a single-valued declaration (no code extensions).
         assert!(charset("ISO_IR 13")
             .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
