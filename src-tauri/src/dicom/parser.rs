@@ -999,9 +999,17 @@ fn plan_splice(
     if changes_anything && has_group_length(index.nodes()) {
         return Ok(None);
     }
-    // Changing the SOP UIDs changes the file meta information, and group lengths would
-    // have to be updated: these go through the full writer. (A changed Specific
-    // Character Set is handled below, by converting the text it applies to.)
+    // Group lengths would have to be updated, and removing a SOP UID leaves the file
+    // meta information to the full writer, as before. (Changed SOP UIDs are written to
+    // the file meta information too, and a changed Specific Character Set is handled
+    // below, by converting the text it applies to.)
+    let sop_uid_paths = [
+        vec![format_tag(tags::SOP_CLASS_UID)],
+        vec![format_tag(tags::SOP_INSTANCE_UID)],
+    ];
+    if sop_uid_paths.iter().any(|path| diff.removed.contains(path)) {
+        return Ok(None);
+    }
     let needs_full_writer = |path: &Vec<String>| {
         if path.last().is_some_and(|last| last.starts_with("Item#")) {
             return false;
@@ -1010,7 +1018,6 @@ fn plan_splice(
             return true;
         };
         tag.element() == 0x0000
-            || (path.len() == 1 && (tag == tags::SOP_CLASS_UID || tag == tags::SOP_INSTANCE_UID))
     };
     if edited
         .iter()
@@ -1117,6 +1124,29 @@ fn plan_splice(
             }
             Ok(None) => return Ok(None),
             Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
+        }
+    }
+    // The file meta information follows the data set's SOP UIDs (as the full writer
+    // does with `sync_file_meta_from_dataset`).
+    for (dataset_tag, meta_tag) in [
+        (tags::SOP_CLASS_UID, tags::MEDIA_STORAGE_SOP_CLASS_UID),
+        (tags::SOP_INSTANCE_UID, tags::MEDIA_STORAGE_SOP_INSTANCE_UID),
+    ] {
+        let path = vec![format_tag(dataset_tag)];
+        if !edited.contains(&path) {
+            continue;
+        }
+        let Some((_, value)) = shown.get(&path) else {
+            return Ok(None);
+        };
+        if !index.has_meta_element(meta_tag) {
+            return Ok(None);
+        }
+        match encode_spliced_value(VR::UI, value, None) {
+            Ok(Some(bytes)) => {
+                edits.meta_replacements.insert(meta_tag, bytes);
+            }
+            _ => return Ok(None),
         }
     }
     let mut conversion_failures = Vec::new();
@@ -6158,6 +6188,103 @@ mod tests {
             .position(|window| window == [0x06, 0x30, 0x39, 0x00])
             .unwrap();
         assert!(saved.ends_with(&original[tail_start..]));
+    }
+
+    // ---- Changing SOP UIDs by splicing (#8) ----
+
+    /// The saved file's file meta information, and whether its group length matches
+    /// the elements that follow it.
+    fn saved_meta(name: &str, saved: &[u8]) -> (FileMetaTable, bool) {
+        let path = temp_path(name);
+        std::fs::write(&path, saved).unwrap();
+        let meta = open_full_object(path.to_str().unwrap())
+            .unwrap()
+            .meta()
+            .clone();
+        std::fs::remove_file(&path).ok();
+        // Group length: from after (0002,0000) to the first element of another group.
+        let group_length = u32::from_le_bytes(saved[140..144].try_into().unwrap()) as usize;
+        let mut offset = 144;
+        while u16::from_le_bytes(saved[offset..offset + 2].try_into().unwrap()) == 0x0002 {
+            let vr = &saved[offset + 4..offset + 6];
+            let (header, length) = if matches!(vr, b"OB" | b"OW" | b"UN" | b"UT" | b"SQ") {
+                (
+                    12,
+                    u32::from_le_bytes(saved[offset + 8..offset + 12].try_into().unwrap()) as usize,
+                )
+            } else {
+                (
+                    8,
+                    u16::from_le_bytes(saved[offset + 6..offset + 8].try_into().unwrap()) as usize,
+                )
+            };
+            offset += header + length;
+        }
+        (meta, offset - 144 == group_length)
+    }
+
+    #[test]
+    fn sop_uid_changes_are_spliced_into_the_file_meta() {
+        let instance = "1.2.392.200036.9116.2.5.1.48.1221418410.1702345678.123456";
+        let class = "1.2.840.10008.5.1.4.1.1.481.5";
+        let path = temp_path("sop-uid-splice.dcm");
+        let original = write_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0018)"], instance);
+        set_value(&mut nodes, &["(0008,0016)"], class);
+        let spliced = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        // The full writer refuses this file, so this only saves by splicing.
+        assert!(spliced);
+        let saved = saved.unwrap();
+        let (meta, group_length_matches) = saved_meta("sop-uid-splice-meta.dcm", &saved);
+        assert_eq!(
+            meta.media_storage_sop_instance_uid.trim_end_matches('\0'),
+            instance
+        );
+        assert_eq!(
+            meta.media_storage_sop_class_uid.trim_end_matches('\0'),
+            class
+        );
+        assert!(group_length_matches);
+        assert_eq!(saved[..132], original[..132]);
+        let reopened = reopen("sop-uid-splice-reopened.dcm", &saved);
+        assert_eq!(values_in(&reopened, "(0008,0018)"), instance);
+        assert_eq!(values_in(&reopened, "(3006,0026)"), "ﾊﾝ");
+    }
+
+    #[test]
+    fn implicit_vr_sop_uid_changes_are_spliced() {
+        let path = temp_path("sop-uid-implicit.dcm");
+        write_implicit_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0018)"], "1.2.3.4.5");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let (meta, group_length_matches) = saved_meta("sop-uid-implicit-meta.dcm", &saved);
+        assert_eq!(
+            meta.media_storage_sop_instance_uid.trim_end_matches('\0'),
+            "1.2.3.4.5"
+        );
+        assert!(group_length_matches);
+    }
+
+    /// Removing a SOP UID leaves the file meta information to the full writer.
+    #[test]
+    fn removed_sop_uids_are_not_spliced() {
+        let path = temp_path("sop-uid-removed.dcm");
+        write_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes
+            .retain(|node| !matches!(node, DicomNode::Element { tag, .. } if tag == "(0008,0018)"));
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
     }
 
     // ---- Removing sequences and items (#8) ----
