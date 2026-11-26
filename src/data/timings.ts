@@ -71,13 +71,18 @@ export function recordOpen(file: string, started: number, received: number, read
   })
 }
 
-/** Record startup, once the first screen is painted. */
-export function recordStartup(elapsedSinceBackendStart: () => Promise<number>) {
+/**
+ * Record startup, once the first screen is painted. `backendStartedAt` gives when the
+ * backend started, in milliseconds since the Unix epoch: the time until the first paint
+ * is taken by the same clock, so the call itself does not count.
+ */
+export function recordStartup(backendStartedAt: () => Promise<number>) {
   if (!TIMINGS_ENABLED) return
   afterNextPaint(() => {
     const pageMs = performance.now()
-    void elapsedSinceBackendStart().then((totalMs) => {
-      const startup: StartupTiming = { totalMs, pageMs }
+    const paintedAt = performance.timeOrigin + pageMs
+    void backendStartedAt().then((startedAt) => {
+      const startup: StartupTiming = { totalMs: paintedAt - startedAt, pageMs }
       console.info('[taglet] startup', startup)
       update({ startup })
     }).catch(() => {})

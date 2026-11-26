@@ -14,7 +14,7 @@ export default function TimingBadge() {
   const timings = useSyncExternalStore(subscribeTimings, currentTimings)
 
   useEffect(() => {
-    recordStartup(() => invoke<number>('startup_elapsed_ms'))
+    recordStartup(() => invoke<number>('startup_epoch_ms'))
   }, [])
 
   if (!TIMINGS_ENABLED || (!timings.open && !timings.startup)) return null

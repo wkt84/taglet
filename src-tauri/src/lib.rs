@@ -9,7 +9,7 @@ use commands::image::{get_dicom_frame_image, get_dicom_frame_pixels, get_dicom_i
 use commands::plan::get_rt_plan_bev_info;
 use commands::structure::{get_rt_struct_info, get_rt_struct_slice_contours};
 use commands::tags::lookup_dicom_tag;
-use commands::timing::startup_elapsed_ms;
+use commands::timing::startup_epoch_ms;
 use commands::validate::validate_value;
 
 #[cfg(target_os = "macos")]
@@ -37,7 +37,7 @@ pub fn run() {
             get_rt_struct_info,
             get_rt_struct_slice_contours,
             lookup_dicom_tag,
-            startup_elapsed_ms,
+            startup_epoch_ms,
             validate_value
         ])
         .build(tauri::generate_context!())
