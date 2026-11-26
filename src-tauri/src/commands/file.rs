@@ -11,6 +11,7 @@ use crate::dicom::parser::{
     open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, trailing_tags,
     FILE_CHANGED_ON_DISK,
 };
+use crate::dicom::previews::{take_previews, with_full_values, FullValues, SEND_PREVIEWS};
 use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
 
@@ -28,6 +29,10 @@ struct StoredDicomObject {
     /// is opened again, so that elements added after Pixel Data's tag and shown since
     /// can be removed.
     hidden_trailing: Option<HashSet<Tag>>,
+    /// The whole values of the elements sent as previews, by key (see `previews`).
+    /// They stay valid after saves, which do not change values sent as previews (the
+    /// page drops the key of a value it changes).
+    full_values: FullValues,
 }
 
 #[derive(Default)]
@@ -215,6 +220,10 @@ pub async fn open_dicom_file(
     let stamp = file_stamp(&path);
     let started = std::time::Instant::now();
     let mut content = open_nodes(&path)?;
+    let mut full_values = FullValues::new();
+    if SEND_PREVIEWS {
+        take_previews(&mut content.nodes, &mut full_values);
+    }
     content.open_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
     let hidden_trailing = content.file_meta.is_empty().then(HashSet::new);
     store
@@ -228,6 +237,7 @@ pub async fn open_dicom_file(
                 rt_struct: None,
                 stamp,
                 hidden_trailing,
+                full_values,
             },
         );
     *store
@@ -300,6 +310,8 @@ fn save_to_path(
         stored.hidden_trailing = stored.full.as_ref().map(|full| trailing_tags(full));
     }
     let hidden_trailing = stored.hidden_trailing.clone();
+    // Never a preview instead of its value (see `previews`).
+    let nodes = with_full_values(&nodes, &stored.full_values)?;
     let object = stored
         .full
         .as_mut()
@@ -326,6 +338,8 @@ fn save_to_path(
     stored.rt_struct = None;
 
     if source_path != destination_path {
+        // The page keeps the nodes, previews and keys included, for the new file.
+        let full_values = stored.full_values.clone();
         objects.insert(
             destination_path.clone(),
             StoredDicomObject {
@@ -333,6 +347,7 @@ fn save_to_path(
                 rt_struct: None,
                 stamp: file_stamp(&destination_path),
                 hidden_trailing,
+                full_values,
             },
         );
     }
@@ -342,6 +357,23 @@ fn save_to_path(
         .map_err(|_| "DICOM store lock poisoned".to_string())? = Some(destination_path);
 
     Ok(())
+}
+
+/// The whole value of an element of the open file at `path` sent as a preview, by its
+/// key (see `previews`).
+#[tauri::command]
+pub async fn get_full_value(
+    path: String,
+    key: String,
+    store: State<'_, DicomStore>,
+) -> Result<String, String> {
+    store
+        .objects
+        .lock()
+        .map_err(|_| "DICOM store lock poisoned".to_string())?
+        .get(&path)
+        .and_then(|stored| stored.full_values.get(&key).cloned())
+        .ok_or_else(|| "The whole value is no longer available. Open the file again.".to_string())
 }
 
 /// Fail when the file at `path` no longer has the length and modification time it had

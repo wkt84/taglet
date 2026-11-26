@@ -381,6 +381,7 @@ where
         length: length_to_u32(length),
         path,
         editable: tag != PIXEL_DATA && is_text_editable(vr),
+        full_value_key: None,
     })
 }
 
@@ -896,6 +897,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                     length: length_to_u32(element.length()),
                     path,
                     editable: false,
+                    full_value_key: None,
                 },
                 _ => {
                     let vr = element.header().vr();
@@ -909,6 +911,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                         length: length_to_u32(element.length()),
                         path,
                         editable: tag != PIXEL_DATA && is_text_editable(vr),
+                        full_value_key: None,
                     }
                 }
             }
@@ -2737,6 +2740,7 @@ fn file_meta_to_nodes(meta: &FileMetaTable) -> Vec<DicomNode> {
                 length: length_to_u32(element.length()),
                 path: vec!["FileMetaInformation".to_string(), tag_text],
                 editable: false,
+                full_value_key: None,
             }
         })
         .collect()
@@ -3051,6 +3055,7 @@ fn primitive_token_to_node(
         length: length_to_u32(length),
         path,
         editable: tag != PIXEL_DATA && is_text_editable(vr),
+        full_value_key: None,
     }
 }
 
@@ -3086,6 +3091,7 @@ fn pixel_data_placeholder_node_with_length(length: u32) -> DicomNode {
         length,
         path: vec![format_tag(PIXEL_DATA)],
         editable: false,
+        full_value_key: None,
     }
 }
 
@@ -5077,6 +5083,7 @@ mod tests {
             length: 0,
             path: vec!["(0008,1030)".to_string()],
             editable: true,
+            full_value_key: None,
         });
         let saved = save_and_reopen(&path, &nodes);
         std::fs::remove_file(&path).ok();
@@ -5282,6 +5289,7 @@ mod tests {
                 length: 0,
                 path: vec![tag.to_string()],
                 editable: true,
+                full_value_key: None,
             });
             nodes
         };
@@ -5548,6 +5556,7 @@ mod tests {
             length: 0,
             path: vec!["(0008,1030)".to_string()],
             editable: true,
+            full_value_key: None,
         });
         let path_text = path.to_str().unwrap();
         let object = open_full_object(path_text).unwrap();
@@ -6590,6 +6599,7 @@ mod tests {
             length: 0,
             path: vec!["(8001,0010)".to_string()],
             editable: true,
+            full_value_key: None,
         });
         let saved = save_file(&path, &nodes);
         std::fs::remove_file(&path).ok();
@@ -6636,6 +6646,7 @@ mod tests {
             length: 0,
             path: vec!["(0008,1030)".to_string()],
             editable: true,
+            full_value_key: None,
         });
         let full = save_file_with_nodes(
             path_text,
@@ -6730,6 +6741,7 @@ mod tests {
             length: 0,
             path: vec!["(8001,0010)".to_string()],
             editable: true,
+            full_value_key: None,
         });
         let mut obj = open_full_object(path_text).unwrap();
         let first_text = TextValues::try_read(path_text).unwrap();
@@ -6834,6 +6846,7 @@ mod tests {
             length: 0,
             path,
             editable: true,
+            full_value_key: None,
         }
     }
 
@@ -8891,5 +8904,49 @@ mod tests {
             std::fs::write(out, &json).unwrap();
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// #20: a file opened with long values sent as previews saves byte for byte when
+    /// unchanged, and keeps the whole values when other elements are edited.
+    #[test]
+    fn previews_come_back_whole_when_saving() {
+        use crate::dicom::previews::{take_previews, with_full_values, FullValues};
+        let path = temp_path("previews-save.dcm");
+        let contour = (0..400)
+            .map(|index| format!("{index}.5"))
+            .collect::<Vec<_>>()
+            .join("\\");
+        let item = [
+            explicit_element(0x3006, 0x0042, b"CS", b"CLOSED_PLANAR"),
+            explicit_element(0x3006, 0x0050, b"DS", contour.as_bytes()),
+        ]
+        .concat();
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0010, b"PN", b"Yamada^Taro"),
+            sequence(
+                0x3006,
+                0x0039,
+                &[sequence(0x3006, 0x0040, &[item], true)],
+                true,
+            ),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let original = std::fs::read(&path).unwrap();
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let mut full_values = FullValues::new();
+        take_previews(&mut nodes, &mut full_values);
+        assert_eq!(full_values.len(), 1);
+
+        let unchanged = save_file(&path, &with_full_values(&nodes, &full_values).unwrap());
+        set_value(&mut nodes, &["(0010,0010)"], "Suzuki^Hanako");
+        let edited = save_file(&path, &with_full_values(&nodes, &full_values).unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(unchanged.unwrap(), original);
+        let edited = edited.unwrap();
+        assert!(contains(&edited, contour.as_bytes()));
+        assert!(contains(&edited, b"Suzuki^Hanako"));
     }
 }
