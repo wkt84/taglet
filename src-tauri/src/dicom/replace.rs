@@ -225,6 +225,18 @@ fn copy_access_control(from: &Path, to: &Path) -> Result<(), String> {
             }
         }
     }
+    // A temporary file in a folder with a default access control list inherits one,
+    // which the replaced file, without one, did not have (its mode says it all).
+    if xattr::get(from, POSIX_ACL)
+        .map(|value| value.is_none())
+        .unwrap_or(false)
+    {
+        match xattr::get(to, POSIX_ACL) {
+            Ok(Some(_)) => xattr::remove(to, POSIX_ACL).map_err(|error| error.to_string())?,
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     Ok(())
 }
 
@@ -381,5 +393,41 @@ mod tests {
 
         replaced.unwrap();
         assert_eq!(content, b"new");
+    }
+
+    /// A temporary file in a folder with a default access control list inherits one;
+    /// when the replaced file has none, the saved file has none either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drops_access_control_lists_the_replaced_file_did_not_have() {
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 65534),
+            (0x04, 4, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let destination = temp_path("no-acl.dcm");
+        let temporary = temp_path("no-acl-temporary.dcm");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&temporary, b"new").unwrap();
+        // As if inherited from the folder's default access control list.
+        if xattr::set(&temporary, "system.posix_acl_access", &acl).is_err() {
+            std::fs::remove_file(&destination).ok();
+            std::fs::remove_file(&temporary).ok();
+            eprintln!("skipped: no POSIX ACL support");
+            return;
+        }
+        let replaced = replace_file(&temporary, &destination);
+        let left = xattr::get(&destination, "system.posix_acl_access").unwrap();
+        std::fs::remove_file(&destination).ok();
+
+        replaced.unwrap();
+        assert_eq!(left, None);
     }
 }
