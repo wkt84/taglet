@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { deleteNodeAtPath } from '../src/data/nodeTree.ts'
+import { deleteNodeAtPath, withoutItemSources } from '../src/data/nodeTree.ts'
 
 const SEQ = '(3006,0020)'
 const NESTED = '(3006,0040)'
@@ -55,4 +55,13 @@ test('removing elements and sequences still works', () => {
   const withoutContours = deleteNodeAtPath(nodes(), [SEQ, 'Item#1', NESTED])
   assert.equal(withoutContours[1].items[1].length, 1)
   assert.equal(withoutContours[1].items[0].length, 2)
+})
+
+test('after saving, item sources are dropped as the file now has the shown items', () => {
+  const removed = deleteNodeAtPath(deleteNodeAtPath(nodes(), [SEQ, 'Item#2', NESTED, 'Item#0']), [SEQ, 'Item#0'])
+  const saved = withoutItemSources(removed)
+  assert.equal('item_sources' in saved[1], false)
+  assert.equal('item_sources' in saved[1].items[1][1], false)
+  assert.equal(saved[1].items[1][0].value, 'GTV')
+  assert.deepEqual(saved[1].items[1][0].path, [SEQ, 'Item#1', '(3006,0026)'])
 })

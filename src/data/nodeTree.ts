@@ -60,3 +60,15 @@ export function deleteNodeAtPath(nodes: DicomNode[], path: string[]): DicomNode[
     }
   })
 }
+
+/**
+ * The nodes without `item_sources`: after a save, the file's items are the shown
+ * ones, in order, so the sources no longer apply.
+ */
+export function withoutItemSources(nodes: DicomNode[]): DicomNode[] {
+  return nodes.map((node) => {
+    if (node.kind === 'Element') return node
+    const { item_sources: _sources, ...sequence } = node
+    return { ...sequence, items: node.items.map(withoutItemSources) }
+  })
+}

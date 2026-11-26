@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import type { DicomElement, DicomFileContent, DicomNode, ValidationResult } from '../types/dicom'
 import { applyBatchValueChanges, validateBatchValueChanges, type BatchValueChange } from '../data/batchEdit'
-import { deleteNodeAtPath } from '../data/nodeTree'
+import { deleteNodeAtPath, withoutItemSources } from '../data/nodeTree'
 
 export type DicomDocument = {
   id: string
@@ -267,7 +267,12 @@ export function useDicomFile() {
         path: activeDocument.filePath,
         nodes: activeDocument.nodes,
       })
-      updateDocument(activeDocument.id, (document) => ({ ...document, dirty: false }))
+      // The saved file's items are the shown ones, in order.
+      updateDocument(activeDocument.id, (document) => ({
+        ...document,
+        nodes: withoutItemSources(document.nodes),
+        dirty: false,
+      }))
     } catch (error) {
       setError(String(error))
     } finally {
@@ -291,6 +296,7 @@ export function useDicomFile() {
       updateDocument(activeDocument.id, (document) => ({
         ...document,
         filePath: destination,
+        nodes: withoutItemSources(document.nodes),
         dirty: false,
       }))
     } catch (error) {

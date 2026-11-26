@@ -1318,7 +1318,7 @@ fn convert_text(
     }
 }
 
-const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items needs editing the file in place, which is possible for Explicit or Implicit VR Little Endian files without group length elements, when the save does not add sequences or items or change the SOP UIDs.";
+const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items needs editing the file in place, which this file or these changes do not allow (it needs a Part 10 file in Explicit or Implicit VR Little Endian without group length elements, whose file meta SOP UIDs match the data set, and a save that adds no sequences or items, changes no SOP UIDs and removes no items holding encapsulated data).";
 
 /// The index of the file's item that the node item at `index` shows (see
 /// `DicomNode::Sequence::item_sources`).
