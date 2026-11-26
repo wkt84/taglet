@@ -2264,21 +2264,27 @@ fn write_file_atomically_with(
     guard: Option<(&str, splice::FileStamp)>,
     write: impl FnOnce(&mut dyn std::io::Write) -> Result<(), String>,
 ) -> Result<(), String> {
-    let existed = std::path::Path::new(destination).exists();
-    let (temporary, file) = create_temporary_save_file(destination)?;
-    let result = write_checked(file, write)
-        .and_then(|()| match guard {
-            Some((path, stamp)) if splice::file_stamp(path) != Some(stamp) => {
-                Err(FILE_CHANGED_ON_DISK.to_string())
-            }
-            _ => Ok(()),
-        })
-        // Keeps the replaced file's owner and access control list (#7).
-        .and_then(|()| replace::replace_file(&temporary, std::path::Path::new(destination)));
-    match result {
+    // Saving over a symbolic link replaces the file it points to, keeping the link
+    // and that file's access settings.
+    let destination = resolve_symbolic_link(destination);
+    let destination_text = destination.to_string_lossy();
+    let existed = destination.exists();
+    let (temporary, file) = create_temporary_save_file(&destination_text)?;
+    let written = write_checked(file, write).and_then(|()| match guard {
+        Some((path, stamp)) if splice::file_stamp(path) != Some(stamp) => {
+            Err(FILE_CHANGED_ON_DISK.to_string())
+        }
+        _ => Ok(()),
+    });
+    if let Err(error) = written {
+        std::fs::remove_file(&temporary).ok();
+        return Err(error);
+    }
+    // Keeps the replaced file's owner and access control list (#7).
+    match replace::replace_file(&temporary, &destination) {
         // A replacement that failed half way (which `replace_file` undoes where it
         // can) must not lose the new content too.
-        Err(error) if existed && !std::path::Path::new(destination).exists() => Err(format!(
+        Err(error) if existed && !destination.exists() => Err(format!(
             "{error} The saved content was kept in {}.",
             temporary.display()
         )),
@@ -2288,6 +2294,20 @@ fn write_file_atomically_with(
         }
         Ok(()) => Ok(()),
     }
+}
+
+/// The file a symbolic link at `path` points to, or `path` itself.
+fn resolve_symbolic_link(path: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(path);
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        if let Ok(target) = std::fs::canonicalize(path) {
+            return target;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Create a temporary file that only this save uses, readable by the owner only.
@@ -8399,5 +8419,34 @@ mod tests {
             assert!(saved.is_err(), "edit: {edit}");
             assert_eq!(after, original);
         }
+    }
+
+    /// Review on #31: saving over a symbolic link replaces the file it points to, so
+    /// that the link stays and that file's access settings are kept.
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_symbolic_link_replaces_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let target = temp_path("link-target.dcm");
+        let link = temp_path("link.dcm");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let saved = write_file_atomically_with(link.to_str().unwrap(), None, |out| {
+            out.write_all(b"new").map_err(|error| error.to_string())
+        });
+        let still_link = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let content = std::fs::read(&target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+
+        saved.unwrap();
+        assert!(still_link);
+        assert_eq!(content, b"new");
+        assert_eq!(mode & 0o777, 0o640);
     }
 }

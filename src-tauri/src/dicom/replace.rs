@@ -77,9 +77,25 @@ fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> 
             destination.display()
         ));
     }
-    // The replaced file, kept only until the replacement succeeded.
-    std::fs::remove_file(&backup).ok();
-    Ok(())
+    // The replaced file, kept only until the replacement succeeded. It must not stay
+    // behind (saving may be meant to remove patient data), so removing it is retried
+    // (e.g. while a virus scanner has it open) and a failure is reported.
+    let mut removed = std::fs::remove_file(&backup);
+    for _ in 0..10 {
+        if removed.is_ok() || !backup.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        removed = std::fs::remove_file(&backup);
+    }
+    match removed {
+        Ok(()) => Ok(()),
+        Err(error) => Err(format!(
+            "{} was saved, but the previous version could not be removed ({error}) and is still in {}. Delete it if it should not be kept.",
+            destination.display(),
+            backup.display()
+        )),
+    }
 }
 
 /// A path next to `path` that does not exist yet, ending in `extension`.
