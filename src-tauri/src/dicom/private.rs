@@ -5,7 +5,7 @@ use dicom_core::{Tag, VR};
 use dicom_object::InMemDicomObject;
 
 use super::model::DicomNode;
-use super::parser::parse_tag;
+use super::parser::{parse_tag, source_item};
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 
@@ -64,7 +64,12 @@ fn node_changed(obj: &InMemDicomObject, node: &DicomNode) -> Result<bool, String
                     .unwrap_or(true)
         })),
         DicomNode::Element { tag, .. } => Ok(obj.get(parse_tag(tag)?).is_none()),
-        DicomNode::Sequence { tag, items, .. } => {
+        DicomNode::Sequence {
+            tag,
+            items,
+            item_sources,
+            ..
+        } => {
             let Some(original) = obj
                 .get(parse_tag(tag)?)
                 .and_then(|element| element.value().items())
@@ -74,7 +79,10 @@ fn node_changed(obj: &InMemDicomObject, node: &DicomNode) -> Result<bool, String
             if original.len() != items.len() {
                 return Ok(true);
             }
-            for (item, next_nodes) in original.iter().zip(items) {
+            for (index, next_nodes) in items.iter().enumerate() {
+                let Some(item) = source_item(original, item_sources, index) else {
+                    return Ok(true);
+                };
                 let desired = next_nodes
                     .iter()
                     .map(|node| match node {
@@ -156,12 +164,21 @@ pub(super) fn validate_private_nodes(
     }
 
     for node in nodes {
-        if let DicomNode::Sequence { tag, items, .. } = node {
+        if let DicomNode::Sequence {
+            tag,
+            items,
+            item_sources,
+            ..
+        } = node
+        {
             if let Some(original) = obj
                 .get(parse_tag(tag)?)
                 .and_then(|element| element.value().items())
             {
-                for (index, (item, next_nodes)) in original.iter().zip(items).enumerate() {
+                for (index, next_nodes) in items.iter().enumerate() {
+                    let Some(item) = source_item(original, item_sources, index) else {
+                        continue;
+                    };
                     validate_private_nodes(item, next_nodes)
                         .map_err(|error| format!("{tag} / Item #{}: {error}", index + 1))?;
                 }

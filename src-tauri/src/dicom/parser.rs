@@ -578,6 +578,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                             object_to_nodes(item, item_path)
                         })
                         .collect(),
+                    item_sources: None,
                 },
                 Value::PixelSequence(_) if tag == PIXEL_DATA => DicomNode::Element {
                     tag: tag_text,
@@ -628,6 +629,9 @@ pub fn apply_nodes_to_object_with_text(
     text: &TextValues,
     nodes_show_trailing: bool,
 ) -> Result<HashSet<Vec<String>>, String> {
+    if !items_match_object(obj, nodes)? {
+        return Err(ITEMS_REMOVED_NEED_SPLICING.to_string());
+    }
     validate_private_nodes(obj, nodes)?;
     let mut edited = HashSet::new();
     let keep_trailing = !nodes_show_trailing;
@@ -737,6 +741,7 @@ pub fn save_file_with_nodes(
     opened: Option<splice::FileStamp>,
     nodes_show_trailing: bool,
 ) -> Result<bool, String> {
+    let nodes = &with_file_item_paths(nodes, &[]);
     // Implicit VR files do not store VRs, so readers take them from the dictionary.
     if is_implicit_vr(object) {
         ensure_vrs_match_dictionary(object, nodes)?;
@@ -818,19 +823,25 @@ fn pixel_representation_changes(
                     return Ok(true);
                 }
             }
-            DicomNode::Sequence { tag, items, .. } => {
+            DicomNode::Sequence {
+                tag,
+                items,
+                item_sources,
+                ..
+            } => {
                 let empty = InMemDicomObject::new_empty();
                 let obj_items = sequence_items(obj, parse_tag(tag)?).unwrap_or_default();
-                if items.len() != obj_items.len() {
-                    // Items added or removed may carry a Pixel Representation.
-                    let has_representation =
-                        |item: &InMemDicomObject| item.get(tags::PIXEL_REPRESENTATION).is_some();
-                    if obj_items.iter().any(has_representation) {
-                        return Ok(true);
-                    }
+                // Items removed may carry a Pixel Representation.
+                let kept = (0..items.len())
+                    .map(|index| item_source(item_sources, index))
+                    .collect::<HashSet<_>>();
+                if obj_items.iter().enumerate().any(|(index, item)| {
+                    !kept.contains(&index) && item.get(tags::PIXEL_REPRESENTATION).is_some()
+                }) {
+                    return Ok(true);
                 }
                 for (index, item_nodes) in items.iter().enumerate() {
-                    let item = obj_items.get(index).unwrap_or(&empty);
+                    let item = source_item(obj_items, item_sources, index).unwrap_or(&empty);
                     if pixel_representation_changes(item, item_nodes)? {
                         return Ok(true);
                     }
@@ -913,7 +924,12 @@ fn ensure_vrs_match_dictionary_in(
                     ));
                 }
             }
-            DicomNode::Sequence { items, path, .. } => {
+            DicomNode::Sequence {
+                items,
+                path,
+                item_sources,
+                ..
+            } => {
                 let existing = obj
                     .get(parsed)
                     .is_some_and(|element| matches!(element.value(), Value::Sequence(_)));
@@ -933,7 +949,7 @@ fn ensure_vrs_match_dictionary_in(
                 let obj_items = sequence_items(obj, parsed).unwrap_or_default();
                 for (index, item_nodes) in items.iter().enumerate() {
                     ensure_vrs_match_dictionary_in(
-                        obj_items.get(index).unwrap_or(&empty),
+                        source_item(obj_items, item_sources, index).unwrap_or(&empty),
                         item_nodes,
                         signed_pixel_data,
                         recheck_unchanged,
@@ -987,6 +1003,9 @@ fn plan_splice(
     // have to be updated: these go through the full writer. (A changed Specific
     // Character Set is handled below, by converting the text it applies to.)
     let needs_full_writer = |path: &Vec<String>| {
+        if path.last().is_some_and(|last| last.starts_with("Item#")) {
+            return false;
+        }
         let Some(Ok(tag)) = path.last().map(|tag| parse_tag(tag)) else {
             return true;
         };
@@ -1181,10 +1200,16 @@ fn node_declarations(
         }
     }
     for node in nodes {
-        if let DicomNode::Sequence { path, items, .. } = node {
+        if let DicomNode::Sequence {
+            path,
+            items,
+            item_sources,
+            ..
+        } = node
+        {
             for (index, item) in items.iter().enumerate() {
                 let mut item_path = path.clone();
-                item_path.push(format!("Item#{index}"));
+                item_path.push(format!("Item#{}", item_source(item_sources, index)));
                 node_declarations(item, &item_path, &declaration, out)?;
             }
         }
@@ -1243,6 +1268,10 @@ fn convert_text(
         let Some(vr) = vr.filter(|vr| is_charset_sensitive(*vr)) else {
             continue;
         };
+        // Elements removed, or in a removed sequence or item, are not written.
+        if (1..=path.len()).any(|end| removed.contains(&path[..end])) {
+            continue;
+        }
         let shown = path.join(" / ");
         let mut container = &path[..path.len() - 1];
         while !read.contains_key(container) && container.len() >= 2 {
@@ -1257,7 +1286,7 @@ fn convert_text(
             ));
             continue;
         }
-        if edited.contains(&path) || removed.contains(&path) {
+        if edited.contains(&path) {
             continue;
         }
         let Some(read) = text.get(&path).filter(|read| read.vr == vr) else {
@@ -1289,25 +1318,165 @@ fn convert_text(
     }
 }
 
-/// Plain elements added to or removed from the file by the nodes.
+const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items needs editing the file in place, which this file or these changes do not allow (it needs a Part 10 file in Explicit or Implicit VR Little Endian without group length elements, whose file meta SOP UIDs match the data set, and a save that adds no sequences or items, changes no SOP UIDs and removes no items holding encapsulated data).";
+
+/// The index of the file's item that the node item at `index` shows (see
+/// `DicomNode::Sequence::item_sources`).
+pub(crate) fn item_source(item_sources: &Option<Vec<usize>>, index: usize) -> usize {
+    item_sources
+        .as_ref()
+        .and_then(|sources| sources.get(index).copied())
+        .unwrap_or(index)
+}
+
+/// The file's item that the node item at `index` shows.
+pub(crate) fn source_item<'a>(
+    file_items: &'a [InMemDicomObject],
+    item_sources: &Option<Vec<usize>>,
+    index: usize,
+) -> Option<&'a InMemDicomObject> {
+    file_items.get(item_source(item_sources, index))
+}
+
+/// The nodes with their paths numbering items as the file does, following
+/// `item_sources`: after an item is removed, the shown paths of later items follow
+/// their new positions, while text values, the file index and the object address them
+/// by their place in the file.
+///
+/// Nodes whose paths do not follow their positions (e.g. items moved without
+/// `item_sources`) are returned as they are, so that `structure_diff` notices.
+pub(crate) fn with_file_item_paths(nodes: &[DicomNode], parent: &[String]) -> Vec<DicomNode> {
+    if parent.is_empty() && !paths_follow_positions(nodes, &[]) {
+        return nodes.to_vec();
+    }
+    nodes
+        .iter()
+        .map(|node| match node {
+            DicomNode::Element { tag, .. } => {
+                let mut node = node.clone();
+                if let DicomNode::Element { path, .. } = &mut node {
+                    *path = child_path(parent, tag);
+                }
+                node
+            }
+            DicomNode::Sequence {
+                tag,
+                description,
+                length,
+                items,
+                item_sources,
+                ..
+            } => {
+                let path = child_path(parent, tag);
+                let items = items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let item_path = child_path(
+                            &path,
+                            &format!("Item#{}", item_source(item_sources, index)),
+                        );
+                        with_file_item_paths(item, &item_path)
+                    })
+                    .collect();
+                DicomNode::Sequence {
+                    tag: tag.clone(),
+                    description: description.clone(),
+                    length: *length,
+                    path,
+                    items,
+                    item_sources: item_sources.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Whether every node's path is its parent's path and its tag, items numbered by
+/// their position.
+fn paths_follow_positions(nodes: &[DicomNode], parent: &[String]) -> bool {
+    nodes.iter().all(|node| {
+        let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) = node;
+        *path == child_path(parent, tag)
+            && match node {
+                DicomNode::Element { .. } => true,
+                DicomNode::Sequence { items, .. } => {
+                    items.iter().enumerate().all(|(index, item)| {
+                        paths_follow_positions(item, &child_path(path, &format!("Item#{index}")))
+                    })
+                }
+            }
+    })
+}
+
+fn child_path(parent: &[String], segment: &str) -> Vec<String> {
+    let mut path = parent.to_vec();
+    path.push(segment.to_string());
+    path
+}
+
+/// Whether no items were removed from the object's: where `item_sources` is set,
+/// it must list the object's items in order (removing the last items, or all of them,
+/// leaves a shorter list). Without it, the items are the ones read, which can be fewer
+/// in raw data sets read up to Pixel Data in an item.
+fn items_match_object(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<bool, String> {
+    for node in nodes {
+        let DicomNode::Sequence {
+            tag,
+            items,
+            item_sources,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        let Some(obj_items) = sequence_items(obj, parse_tag(tag)?) else {
+            continue;
+        };
+        if let Some(sources) = item_sources {
+            if sources.len() != obj_items.len()
+                || sources
+                    .iter()
+                    .enumerate()
+                    .any(|(index, source)| *source != index)
+            {
+                return Ok(false);
+            }
+        }
+        for (item, item_nodes) in obj_items.iter().zip(items) {
+            if !items_match_object(item, item_nodes)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Elements added by the nodes, and elements, sequences and items removed from the
+/// file (only the outermost of what is removed).
 struct StructureDiff {
     added: HashSet<Vec<String>>,
     removed: HashSet<Vec<String>>,
 }
 
-/// Compare the nodes with the file. Sequences and their items must be the same;
-/// plain elements may be added or removed. `None` otherwise. Top-level elements from
-/// Pixel Data (7FE0,0010) on are never shown as nodes (the file is opened up to Pixel
-/// Data), so the file's are left out; nodes there other than Pixel Data's placeholder
-/// were added by the user and count as added.
+/// Compare the nodes with the file. Plain elements may be added; elements, sequences
+/// and items may be removed. `None` when sequences or items are added. Items are
+/// matched by their path, which follows `item_sources` (see `with_file_item_paths`).
+/// Top-level elements from Pixel Data (7FE0,0010) on are never shown as nodes (the
+/// file is opened up to Pixel Data), so the file's are left out; nodes there other than
+/// Pixel Data's placeholder were added by the user and count as added.
 fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<StructureDiff> {
     #[derive(Default)]
     struct Shape {
         elements: HashSet<Vec<String>>,
-        sequences: HashMap<Vec<String>, usize>,
-        /// Set when a node's path does not match where it is, e.g. an item moved to
-        /// another position. Paths address the file's elements, so splicing could
-        /// then copy values from the wrong item.
+        sequences: HashSet<Vec<String>>,
+        items: HashSet<Vec<String>>,
+        /// Item counts of sequences: from the file, and from nodes without
+        /// `item_sources`, which show the file's items as they are.
+        item_counts: HashMap<Vec<String>, usize>,
+        opaque: HashSet<Vec<String>>,
+        /// Set when a node's path does not match where it is. Paths address the
+        /// file's elements, so splicing could then copy values from the wrong item.
         inconsistent: bool,
     }
 
@@ -1328,11 +1497,29 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
                 DicomNode::Element { .. } => {
                     shape.elements.insert(path.clone());
                 }
-                DicomNode::Sequence { items, .. } => {
-                    shape.sequences.insert(path.clone(), items.len());
+                DicomNode::Sequence {
+                    items,
+                    item_sources,
+                    ..
+                } => {
+                    shape.sequences.insert(path.clone());
+                    if item_sources.is_none() {
+                        shape.item_counts.insert(path.clone(), items.len());
+                    }
+                    // Items can be removed, not reordered: splicing writes them in the
+                    // file's order.
+                    if item_sources
+                        .as_ref()
+                        .is_some_and(|sources| sources.windows(2).any(|pair| pair[0] >= pair[1]))
+                    {
+                        shape.inconsistent = true;
+                    }
                     for (index, item) in items.iter().enumerate() {
                         let mut item_path = path.clone();
-                        item_path.push(format!("Item#{index}"));
+                        item_path.push(format!("Item#{}", item_source(item_sources, index)));
+                        if !shape.items.insert(item_path.clone()) {
+                            shape.inconsistent = true;
+                        }
                         node_shape(item, &item_path, shape);
                     }
                 }
@@ -1350,20 +1537,20 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
             path.push(format_tag(tag));
             match node {
                 splice::IndexNode::Sequence { items, .. } => {
-                    shape.sequences.insert(path.clone(), items.len());
+                    shape.sequences.insert(path.clone());
+                    shape.item_counts.insert(path.clone(), items.len());
                     for (index, item) in items.iter().enumerate() {
                         let mut item_path = path.clone();
                         item_path.push(format!("Item#{index}"));
+                        shape.items.insert(item_path.clone());
                         index_shape(item.nodes(), &item_path, shape);
                     }
                 }
                 splice::IndexNode::Element { .. } => {
                     shape.elements.insert(path);
                 }
-                // Encapsulated or other opaque values cannot be removed here; keep them
-                // as sequences with no items so that removing them is a mismatch.
                 splice::IndexNode::Opaque { .. } => {
-                    shape.sequences.insert(path, usize::MAX);
+                    shape.opaque.insert(path);
                 }
             }
         }
@@ -1376,14 +1563,46 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
     }
     let mut from_index = Shape::default();
     index_shape(index, &[], &mut from_index);
-    // Opaque values show up as plain element nodes.
-    for (path, count) in &from_index.sequences {
-        if *count == usize::MAX && from_nodes.elements.remove(path) {
-            from_nodes.sequences.insert(path.clone(), usize::MAX);
+    // Opaque values (e.g. encapsulated pixel data in an item) show up as plain element
+    // nodes, and cannot be removed here.
+    for path in &from_index.opaque {
+        if !from_nodes.elements.remove(path) {
+            return None;
         }
     }
-    if from_nodes.sequences != from_index.sequences {
+    // Items are only removed as `item_sources` records it; a sequence without it must
+    // show all of the file's items.
+    if from_nodes
+        .item_counts
+        .iter()
+        .any(|(path, count)| from_index.item_counts.get(path) != Some(count))
+    {
         return None;
+    }
+    if !from_nodes.sequences.is_subset(&from_index.sequences)
+        || !from_nodes.items.is_subset(&from_index.items)
+        || !from_nodes
+            .elements
+            .iter()
+            .all(|path| !from_index.sequences.contains(path))
+    {
+        return None;
+    }
+    let mut removed = from_index
+        .elements
+        .difference(&from_nodes.elements)
+        .chain(from_index.sequences.difference(&from_nodes.sequences))
+        .chain(from_index.items.difference(&from_nodes.items))
+        .cloned()
+        .collect::<HashSet<_>>();
+    // Only the outermost of what is removed.
+    let nested = removed
+        .iter()
+        .filter(|path| (1..path.len()).any(|end| removed.contains(&path[..end])))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in nested {
+        removed.remove(&path);
     }
     Some(StructureDiff {
         added: from_nodes
@@ -1391,11 +1610,7 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
             .difference(&from_index.elements)
             .cloned()
             .collect(),
-        removed: from_index
-            .elements
-            .difference(&from_nodes.elements)
-            .cloned()
-            .collect(),
+        removed,
     })
 }
 
@@ -1597,11 +1812,18 @@ fn collect_edited_paths(
                     edited.insert(path.clone());
                 }
             }
-            DicomNode::Sequence { tag, items, .. } => {
+            DicomNode::Sequence {
+                tag,
+                items,
+                item_sources,
+                ..
+            } => {
                 let tag = parse_tag(tag)?;
                 if let Some(obj_items) = sequence_items(obj, tag) {
-                    for (item, item_nodes) in obj_items.iter().zip(items.iter()) {
-                        collect_edited_paths(item, item_nodes, text, edited)?;
+                    for (index, item_nodes) in items.iter().enumerate() {
+                        if let Some(item) = source_item(obj_items, item_sources, index) {
+                            collect_edited_paths(item, item_nodes, text, edited)?;
+                        }
                     }
                 }
             }
@@ -2002,6 +2224,7 @@ where
                     length: length_to_u32(len),
                     path,
                     items,
+                    item_sources: None,
                 });
                 if found_pixel_data {
                     return Ok((nodes, true));
@@ -5004,7 +5227,7 @@ mod tests {
         plan_splice(
             path_text,
             &open_full_object(path_text).unwrap(),
-            nodes,
+            &with_file_item_paths(nodes, &[]),
             &TextValues::try_read(path_text).unwrap(),
             splice::file_stamp(path_text).unwrap(),
         )
@@ -5202,6 +5425,7 @@ mod tests {
                 &["(0008,1115)", "Item#0"],
             )]],
             path: vec!["(0008,1115)".to_string()],
+            item_sources: None,
         }];
         in_items.push(element_node("(0028,0106)", "SS", "-1", &[]));
         let signed_after_item =
@@ -5256,6 +5480,7 @@ mod tests {
                     length: 0,
                     items: vec![vec![]],
                     path: vec![sequence_tag.to_string()],
+                    item_sources: None,
                 },
             ]
         };
@@ -5403,7 +5628,7 @@ mod tests {
         plan_splice(
             path_text,
             &open_full_object(path_text).unwrap(),
-            nodes,
+            &with_file_item_paths(nodes, &[]),
             &TextValues::try_read(path_text).unwrap(),
             splice::file_stamp(path_text).unwrap(),
         )
@@ -5531,6 +5756,7 @@ mod tests {
             length: 0,
             path: vec!["(0040,0275)".to_string()],
             items: Vec::new(),
+            item_sources: None,
         });
         *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "ID002".to_string();
         let planned = plan_for(&path, &nodes);
@@ -5730,6 +5956,7 @@ mod tests {
             length: 0,
             path: vec!["(FFFA,FFFA)".to_string()],
             items: Vec::new(),
+            item_sources: None,
         });
         let planned = plan_for(&path, &nodes);
         std::fs::remove_file(&path).ok();
@@ -5933,29 +6160,297 @@ mod tests {
         assert!(saved.ends_with(&original[tail_start..]));
     }
 
-    /// Adding a sequence or removing one still needs the full writer.
+    // ---- Removing sequences and items (#8) ----
+
+    /// Remove the item at `index` from the sequence at `sequence_path`, as the editor
+    /// does: later items move up (their paths follow their new positions) and
+    /// `item_sources` keeps which of the file's items each one shows.
+    fn remove_item(nodes: &mut [DicomNode], sequence_path: &[&str], index: usize) {
+        fn renumber(nodes: &mut [DicomNode], depth: usize, item: &str) {
+            for node in nodes {
+                let (DicomNode::Element { path, .. } | DicomNode::Sequence { path, .. }) = node;
+                path[depth] = item.to_string();
+                if let DicomNode::Sequence { items, .. } = node {
+                    for nested in items {
+                        renumber(nested, depth, item);
+                    }
+                }
+            }
+        }
+        for node in nodes.iter_mut() {
+            if let DicomNode::Sequence {
+                path,
+                items,
+                item_sources,
+                ..
+            } = node
+            {
+                if path == sequence_path {
+                    let sources = item_sources.get_or_insert_with(|| (0..items.len()).collect());
+                    items.remove(index);
+                    sources.remove(index);
+                    let depth = path.len();
+                    for (position, item) in items.iter_mut().enumerate().skip(index) {
+                        renumber(item, depth, &format!("Item#{position}"));
+                    }
+                    return;
+                }
+                for item in items {
+                    remove_item(item, sequence_path, index);
+                }
+            }
+        }
+    }
+
+    fn roi_item(number: &[u8], name: &[u8]) -> Vec<u8> {
+        [
+            explicit_element(0x3006, 0x0022, b"IS", number),
+            explicit_element(0x3006, 0x0026, b"LO", name),
+        ]
+        .concat()
+    }
+
+    /// A file with three ROIs in a sequence of the given kind, followed by another
+    /// element.
+    fn write_three_rois(path: &std::path::Path, defined_length: bool) -> Vec<u8> {
+        let items = [
+            roi_item(b"1", PROSTATE_IR87),
+            roi_item(b"2", b"\x1b$BD>D2\x1b(B"),
+            roi_item(b"3", b"\x1b$Bg/fy\x1b(B"),
+        ];
+        let rois = if defined_length {
+            defined_sequence(0x3006, 0x0020, &items)
+        } else {
+            sequence(0x3006, 0x0020, &items, true)
+        };
+        let dataset = [
+            base_elements(b"\\ISO 2022 IR 87"),
+            explicit_element(0x0010, 0x0010, b"PN", YAMADA_IR87),
+            rois,
+            explicit_element(0x300E, 0x0002, b"CS", b"APPROVED"),
+        ]
+        .concat();
+        write_part10_with(path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        std::fs::read(path).unwrap()
+    }
+
+    fn sequence_items_of<'a>(nodes: &'a [DicomNode], tag: &str) -> &'a [Vec<DicomNode>] {
+        nodes
+            .iter()
+            .find_map(|node| match node {
+                DicomNode::Sequence {
+                    tag: found, items, ..
+                } if found == tag => Some(items.as_slice()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn values_in(item: &[DicomNode], tag: &str) -> String {
+        value_and_editable(item, tag).0
+    }
+
     #[test]
-    fn sequence_changes_are_not_spliced() {
-        let path = temp_path("splice-sequence-change.dcm");
-        write_mixed_charset_file(&path);
+    fn removed_items_are_spliced_out() {
+        for defined_length in [true, false] {
+            let path = temp_path(&format!("remove-item-{defined_length}.dcm"));
+            let original = write_three_rois(&path, defined_length);
+            let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+            remove_item(&mut nodes, &["(3006,0020)"], 1);
+            // The third ROI is now shown second; editing it must edit the file's third.
+            set_value(
+                &mut nodes,
+                &["(3006,0020)", "Item#1", "(3006,0026)"],
+                "膀胱 壁",
+            );
+            let spliced = plans_splice(&path, &nodes);
+            let saved = save_file(&path, &nodes);
+            std::fs::remove_file(&path).ok();
+
+            assert!(spliced, "defined length: {defined_length}");
+            let saved = saved.unwrap();
+            assert!(saved.len() < original.len());
+            assert!(
+                !contains(&saved, b"\x1b$BD>D2\x1b(B"),
+                "the second ROI is gone"
+            );
+            let reopened = reopen("remove-item-reopened.dcm", &saved);
+            let items = sequence_items_of(&reopened, "(3006,0020)");
+            assert_eq!(items.len(), 2);
+            assert_eq!(values_in(&items[0], "(3006,0022)"), "1");
+            assert_eq!(values_in(&items[0], "(3006,0026)"), "前立腺");
+            assert_eq!(values_in(&items[1], "(3006,0022)"), "3");
+            assert_eq!(values_in(&items[1], "(3006,0026)"), "膀胱 壁");
+            assert_eq!(values_in(&reopened, "(300E,0002)"), "APPROVED");
+        }
+    }
+
+    #[test]
+    fn removed_sequences_are_spliced_out() {
+        let path = temp_path("remove-sequence.dcm");
+        let original = write_mixed_charset_file(&path);
         let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
         let mut removed = opened.clone();
         removed.retain(
             |node| !matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0039)"),
         );
+        // Removing every item leaves an empty sequence.
         let mut emptied = opened.clone();
-        if let Some(DicomNode::Sequence { items, .. }) = emptied
-            .iter_mut()
-            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0039)"))
-        {
-            items.clear();
-        }
+        remove_item(&mut emptied, &["(3006,0039)"], 0);
         let removed_planned = plan_for(&path, &removed);
-        let emptied_planned = plan_for(&path, &emptied);
+        let removed_saved = save_file(&path, &removed);
+        let emptied_saved = save_file(&path, &emptied);
         std::fs::remove_file(&path).ok();
 
-        assert!(!removed_planned);
-        assert!(!emptied_planned);
+        assert!(removed_planned);
+        let removed_saved = removed_saved.unwrap();
+        let start = original
+            .windows(4)
+            .position(|window| window == [0x06, 0x30, 0x39, 0x00])
+            .unwrap();
+        let pixel = original
+            .windows(4)
+            .position(|window| window == [0xE0, 0x7F, 0x10, 0x00])
+            .unwrap();
+        assert_eq!(&removed_saved[..start], &original[..start]);
+        assert_eq!(&removed_saved[start..], &original[pixel..]);
+        let reopened = reopen("remove-sequence-reopened.dcm", &removed_saved);
+        assert!(!reopened
+            .iter()
+            .any(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0039)")));
+        assert_eq!(values_in(&reopened, "(3006,0026)"), "ﾊﾝ");
+        let reopened = reopen("remove-sequence-emptied.dcm", &emptied_saved.unwrap());
+        assert!(sequence_items_of(&reopened, "(3006,0039)").is_empty());
+    }
+
+    #[test]
+    fn removed_items_are_not_converted() {
+        let path = temp_path("remove-item-convert.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        remove_item(&mut nodes, &["(3006,0020)"], 0);
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert!(!saved.contains(&0x1B));
+        let reopened = reopen("remove-item-convert-reopened.dcm", &saved);
+        let items = sequence_items_of(&reopened, "(3006,0020)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(values_in(&items[0], "(3006,0026)"), "直腸");
+        assert_eq!(values_in(&items[1], "(3006,0026)"), "膀胱");
+    }
+
+    /// The full writer pairs items by position, so removing items needs splicing.
+    #[test]
+    fn the_full_writer_refuses_removed_items() {
+        let path = temp_path("remove-item-full.dcm");
+        write_three_rois(&path, true);
+        let path_text = path.to_str().unwrap();
+        let mut nodes = open_nodes(path_text).unwrap().nodes;
+        remove_item(&mut nodes, &["(3006,0020)"], 1);
+        let text = TextValues::try_read(path_text).unwrap();
+        let mut obj = open_full_object(path_text).unwrap();
+        let destination = temp_path("remove-item-full-out.dcm");
+        let result = save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert!(result.unwrap_err().contains("removing sequence items"));
+        assert!(!destination.exists());
+    }
+
+    /// Items missing from a sequence without `item_sources` are not taken as removed.
+    #[test]
+    fn missing_items_without_sources_are_not_removed() {
+        let path = temp_path("missing-items.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        if let Some(DicomNode::Sequence { items, .. }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0020)"))
+        {
+            items.truncate(1);
+        }
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+    }
+
+    /// Items can be removed but not reordered: splicing writes them in the file's order.
+    #[test]
+    fn reordered_items_are_not_spliced() {
+        let path = temp_path("reorder-items.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        remove_item(&mut nodes, &["(3006,0020)"], 1);
+        if let Some(DicomNode::Sequence {
+            items,
+            item_sources,
+            ..
+        }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0020)"))
+        {
+            items.swap(0, 1);
+            item_sources.as_mut().unwrap().swap(0, 1);
+            for (position, item) in items.iter_mut().enumerate() {
+                for node in item.iter_mut() {
+                    if let DicomNode::Element { path, .. } = node {
+                        path[1] = format!("Item#{position}");
+                    }
+                }
+            }
+        }
+        let spliced = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+        assert!(saved.unwrap_err().contains("removing sequence items"));
+    }
+
+    /// Removing the last items leaves `item_sources` in order (or empty); the full
+    /// writer still notices them by count.
+    #[test]
+    fn the_full_writer_refuses_removed_last_items() {
+        let path = temp_path("remove-last-item-full.dcm");
+        write_three_rois(&path, true);
+        let path_text = path.to_str().unwrap();
+        let opened = open_nodes(path_text).unwrap().nodes;
+        let mut last = opened.clone();
+        remove_item(&mut last, &["(3006,0020)"], 2);
+        let mut all = opened.clone();
+        for _ in 0..3 {
+            remove_item(&mut all, &["(3006,0020)"], 0);
+        }
+        let text = TextValues::try_read(path_text).unwrap();
+        let destination = temp_path("remove-last-item-full-out.dcm");
+        let results = [last, all].map(|nodes| {
+            let mut obj = open_full_object(path_text).unwrap();
+            save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap())
+        });
+        std::fs::remove_file(&path).ok();
+
+        for result in results {
+            assert!(result.unwrap_err().contains("removing sequence items"));
+        }
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn implicit_vr_items_are_removed() {
+        let path = temp_path("remove-item-implicit.dcm");
+        write_implicit_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        remove_item(&mut nodes, &["(3006,0020)"], 0);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let reopened = reopen("remove-item-implicit-reopened.dcm", &saved.unwrap());
+        assert!(sequence_items_of(&reopened, "(3006,0020)").is_empty());
+        assert_eq!(values_in(&reopened, "(3006,0084)"), "1");
     }
 
     /// Review: added nodes that are not edited text values are left to the full writer

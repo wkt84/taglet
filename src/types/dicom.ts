@@ -17,6 +17,11 @@ export type DicomSequence = {
   length: number
   path: string[]
   items: DicomNode[][]
+  /**
+   * For each item, the index of the file's item it shows. Absent while the items are
+   * the file's, in order; set when items are removed (see `deleteNodeAtPath`).
+   */
+  item_sources?: number[]
 }
 
 export type DicomNode = DicomElement | DicomSequence

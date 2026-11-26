@@ -20,6 +20,12 @@ pub enum DicomNode {
         length: u32,
         path: Vec<String>,
         items: Vec<Vec<DicomNode>>,
+        /// For each item, the index of the file's item it shows, so that items can be
+        /// removed while paths keep following their position. `None` when the items
+        /// are the file's, in order (as read); set once items are removed, even all of
+        /// them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_sources: Option<Vec<usize>>,
     },
 }
 
