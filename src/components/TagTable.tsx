@@ -42,8 +42,13 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
   const selectedElement = useMemo(() => selectedPath
     ? findTagOccurrences(nodes, selectedPath[selectedPath.length - 1]).find((match) => samePath(match.element.path, selectedPath))?.element
     : undefined, [nodes, selectedPath])
-  const rows = useMemo(() => toTableRows(nodes, fileMeta), [fileMeta, nodes])
-  const searchResults = useMemo(() => searchRows(rows, debouncedQuery), [debouncedQuery, rows])
+  // Rows inside collapsed sequences and items are only built once expanded, so that
+  // files with thousands of items (e.g. RT Structure Set contours) open quickly (#20).
+  const rows = useMemo(() => toTableRows(nodes, fileMeta, expanded), [expanded, fileMeta, nodes])
+  const searchResults = useMemo(
+    () => searchRows(nodes, fileMeta, debouncedQuery),
+    [debouncedQuery, fileMeta, nodes],
+  )
   const searching = query.trim() !== debouncedQuery.trim()
 
   useEffect(() => {
@@ -173,7 +178,7 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
             </span>
           ) : (
             <span className="inline-flex items-center rounded bg-white/15 px-2 py-0.5 text-xs font-medium text-white ring-1 ring-white/20">
-              {row.original.subRows.length} element{row.original.subRows.length === 1 ? '' : 's'}
+              {row.original.childCount} element{row.original.childCount === 1 ? '' : 's'}
             </span>
           ),
       },
@@ -202,6 +207,7 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
     columnResizeMode: 'onChange',
     getRowId: (row) => row.rowId,
     getSubRows: (row) => row.subRows,
+    getRowCanExpand: (row) => row.original.canExpand === true,
     getCoreRowModel: getCoreRowModel(),
     getExpandedRowModel: getExpandedRowModel(),
   })
@@ -286,7 +292,7 @@ export default function TagTable({ fileMeta, nodes, filePath, selectedPath, onCh
                     onClick={() => {
                       setExpanded((current) => ({
                         ...(current === true ? {} : current),
-                        ...expandedStateForPath(rows, result.path),
+                        ...expandedStateForPath(toTableRows(nodes, fileMeta, true), result.path),
                       }))
                       setPendingScrollPath(result.path)
                       onSelect(result.path)
@@ -403,15 +409,17 @@ function tagIndent(depth: number) {
 function rowValue(row: TableDicomRow) {
   if (row.kind === 'Element') return valuePreview(row.value).text || '-'
   if (row.kind === 'Sequence') return `${row.items.length} item${row.items.length === 1 ? '' : 's'}`
-  if (row.kind === 'FileMeta') return `${row.subRows.length} element${row.subRows.length === 1 ? '' : 's'}`
+  if (row.kind === 'FileMeta') return `${row.childCount} element${row.childCount === 1 ? '' : 's'}`
   return `${row.childCount} tag${row.childCount === 1 ? '' : 's'}`
 }
 
-function searchRows(rows: TableDicomRow[], query: string) {
+function searchRows(nodes: DicomNode[], fileMeta: DicomNode[], query: string) {
   const textNeedle = query.trim().toLowerCase()
   const compactNeedle = compactSearchText(query)
   const tagNeedle = normalizedTagKey(query)
   if (!textNeedle && !tagNeedle) return []
+  // Every row, collapsed or not.
+  const rows = toTableRows(nodes, fileMeta, true)
 
   const results: Array<{
     tag: string
@@ -466,9 +474,19 @@ function expandedStateForPath(rows: TableDicomRow[], path: string[]) {
   return next
 }
 
-function toTableRows(nodes: DicomNode[], fileMeta: DicomNode[]): TableDicomRow[] {
-  const rows = toDatasetRows(nodes)
+/** Whether the row is expanded in `expanded` (`true` expands every row). */
+function isExpanded(expanded: ExpandedState, rowId: string) {
+  return expanded === true || expanded[rowId] === true
+}
+
+/**
+ * The table rows, with the rows inside sequences, items and the file meta information
+ * only for those expanded (`true` builds them all).
+ */
+function toTableRows(nodes: DicomNode[], fileMeta: DicomNode[], expanded: ExpandedState): TableDicomRow[] {
+  const rows = toDatasetRows(nodes, expanded)
   if (fileMeta.length === 0) return rows
+  const fileMetaId = 'FileMetaInformation'
 
   return [
     {
@@ -477,15 +495,22 @@ function toTableRows(nodes: DicomNode[], fileMeta: DicomNode[]): TableDicomRow[]
       description: 'File Meta Information',
       length: Number.NaN,
       path: ['FileMetaInformation'],
-      rowId: 'FileMetaInformation',
+      rowId: fileMetaId,
       depth: 0,
-      subRows: toDatasetRows(fileMeta, 1),
+      childCount: fileMeta.length,
+      canExpand: fileMeta.length > 0,
+      subRows: isExpanded(expanded, fileMetaId) ? toDatasetRows(fileMeta, expanded, 1) : [],
     },
     ...rows,
   ]
 }
 
-function toDatasetRows(nodes: DicomNode[], depth = 0, itemIndex?: number): TableDicomRow[] {
+function toDatasetRows(
+  nodes: DicomNode[],
+  expanded: ExpandedState,
+  depth = 0,
+  itemIndex?: number,
+): TableDicomRow[] {
   return nodes.map((node, index) => {
     const rowId = `${node.path.join('/')}:${index}`
     if (node.kind === 'Element') {
@@ -497,19 +522,24 @@ function toDatasetRows(nodes: DicomNode[], depth = 0, itemIndex?: number): Table
       rowId,
       depth,
       itemIndex,
-      subRows: node.items.map((item, sequenceItemIndex) => {
+      canExpand: node.items.length > 0,
+      subRows: !isExpanded(expanded, rowId) ? [] : node.items.map((item, sequenceItemIndex) => {
         const itemPath = [...node.path, `Item#${sequenceItemIndex}`]
+        const itemRowId = `${itemPath.join('/')}`
         return {
           kind: 'Item',
           tag: `Item #${sequenceItemIndex + 1}`,
           description: `${node.description} item ${sequenceItemIndex + 1}`,
           length: item.length,
           path: itemPath,
-          rowId: `${itemPath.join('/')}`,
+          rowId: itemRowId,
           depth: depth + 1,
           itemIndex: sequenceItemIndex,
           childCount: item.length,
-          subRows: toDatasetRows(item, depth + 2, sequenceItemIndex),
+          canExpand: item.length > 0,
+          subRows: isExpanded(expanded, itemRowId)
+            ? toDatasetRows(item, expanded, depth + 2, sequenceItemIndex)
+            : [],
         }
       }),
     }
