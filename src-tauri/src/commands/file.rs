@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use dicom_core::Tag;
 use dicom_object::DefaultDicomObject;
 use tauri::State;
 
 use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
 use crate::dicom::parser::{
-    open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, FILE_CHANGED_ON_DISK,
+    open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, trailing_tags,
+    FILE_CHANGED_ON_DISK,
 };
 use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
@@ -18,9 +20,14 @@ struct StoredDicomObject {
     /// The file's length and modification time when it was opened or last saved, to
     /// tell whether another program changed it since.
     stamp: Option<(u64, std::time::SystemTime)>,
-    /// Whether the shown nodes include top-level elements after Pixel Data's tag, as
-    /// they do for raw data sets read without file meta information.
-    nodes_show_trailing: bool,
+    /// The top-level elements from Pixel Data's tag on that the shown nodes leave out
+    /// and saving keeps (see `parser::HiddenTrailing`): none for raw data sets read
+    /// without file meta information, which are shown whole. For Part 10 files, the
+    /// ones in the file as it was opened, recorded when it is first saved (reading them
+    /// when opening would read the whole file); until then `None`. Kept until the file
+    /// is opened again, so that elements added after Pixel Data's tag and shown since
+    /// can be removed.
+    hidden_trailing: Option<HashSet<Tag>>,
 }
 
 #[derive(Default)]
@@ -207,7 +214,7 @@ pub async fn open_dicom_file(
     // Taken before reading, so that a change made while reading is noticed on save.
     let stamp = file_stamp(&path);
     let content = open_nodes(&path)?;
-    let nodes_show_trailing = content.file_meta.is_empty();
+    let hidden_trailing = content.file_meta.is_empty().then(HashSet::new);
     store
         .objects
         .lock()
@@ -218,7 +225,7 @@ pub async fn open_dicom_file(
                 full: None,
                 rt_struct: None,
                 stamp,
-                nodes_show_trailing,
+                hidden_trailing,
             },
         );
     *store
@@ -260,13 +267,12 @@ fn save_to_path(
 ) -> Result<(), String> {
     // The shown nodes come from the file as it was opened (or last saved). If another
     // program changed it since, saving them would silently undo those changes.
-    let (opened_stamp, nodes_show_trailing) = store
+    let opened_stamp = store
         .objects
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())?
         .get(&source_path)
-        .map(|stored| (stored.stamp, stored.nodes_show_trailing))
-        .unwrap_or((None, false));
+        .and_then(|stored| stored.stamp);
     ensure_unchanged_since_opened(opened_stamp, &source_path)?;
 
     // Text values read from the original bytes: their character sets are used to
@@ -286,6 +292,12 @@ fn save_to_path(
     if stored.full.is_none() {
         stored.full = Some(open_full_object(&source_path)?);
     }
+    // The object is the file as opened (or as last saved, in which case the hidden
+    // elements were recorded at the first save).
+    if stored.hidden_trailing.is_none() {
+        stored.hidden_trailing = stored.full.as_ref().map(|full| trailing_tags(full));
+    }
+    let hidden_trailing = stored.hidden_trailing.clone();
     let object = stored
         .full
         .as_mut()
@@ -298,7 +310,7 @@ fn save_to_path(
         &text,
         &destination_path,
         opened_stamp,
-        nodes_show_trailing,
+        hidden_trailing.as_ref(),
     )?;
     if !object_matches_file || source_path != destination_path {
         // After a spliced save the object is read again from the file when needed.
@@ -318,7 +330,7 @@ fn save_to_path(
                 full: None,
                 rt_struct: None,
                 stamp: file_stamp(&destination_path),
-                nodes_show_trailing,
+                hidden_trailing,
             },
         );
     }
