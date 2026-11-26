@@ -1102,7 +1102,7 @@ fn plan_splice(
             };
             match encode_spliced_value(vr, value, Some(&charset)) {
                 Ok(Some(bytes)) => {
-                    match splice::encode_element(tag, vr, &bytes, index.is_explicit()) {
+                    match splice::encode_element(tag, vr, &bytes, index.encoding()) {
                         Ok(element) => edits
                             .insertions
                             .entry(parent.to_vec())
@@ -1160,7 +1160,7 @@ fn plan_splice(
     }
     // Sequences and items added: written whole, their text in the character set in
     // effect where they go.
-    let explicit = index.is_explicit();
+    let encoding = index.encoding();
     for path in &diff.added_sequences {
         let (parent, last) = path.split_at(path.len() - 1);
         let tag = parse_tag(&last[0])?;
@@ -1181,7 +1181,7 @@ fn plan_splice(
             items,
             item_sources,
             &new_declarations,
-            explicit,
+            encoding,
             &mut failures,
         )?
         else {
@@ -1208,7 +1208,7 @@ fn plan_splice(
             }
             let item_path = child_path(path, &item_segment(item_sources, index));
             let Some(bytes) =
-                encode_new_item(item, &item_path, &new_declarations, explicit, &mut failures)?
+                encode_new_item(item, &item_path, &new_declarations, encoding, &mut failures)?
             else {
                 return Ok(None);
             };
@@ -1298,19 +1298,19 @@ fn encode_new_sequence(
     items: &[Vec<DicomNode>],
     item_sources: &Option<Vec<Option<usize>>>,
     declarations: &HashMap<Vec<String>, String>,
-    explicit: bool,
+    encoding: splice::Encoding,
     failures: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>, String> {
-    let mut out = splice::sequence_start(tag, explicit);
+    let mut out = splice::sequence_start(tag, encoding);
     for (index, item) in items.iter().enumerate() {
         let item_path = child_path(path, &item_segment(item_sources, index));
-        let Some(bytes) = encode_new_item(item, &item_path, declarations, explicit, failures)?
+        let Some(bytes) = encode_new_item(item, &item_path, declarations, encoding, failures)?
         else {
             return Ok(None);
         };
         out.extend(bytes);
     }
-    out.extend(splice::sequence_end());
+    out.extend(splice::sequence_end(encoding));
     Ok(Some(out))
 }
 
@@ -1319,7 +1319,7 @@ fn encode_new_item(
     nodes: &[DicomNode],
     path: &[String],
     declarations: &HashMap<Vec<String>, String>,
-    explicit: bool,
+    encoding: splice::Encoding,
     failures: &mut Vec<String>,
 ) -> Result<Option<Vec<u8>>, String> {
     // An item declaring its own character set must declare one Taglet can write.
@@ -1341,7 +1341,7 @@ fn encode_new_item(
         })
         .collect::<Result<Vec<_>, _>>()?;
     sorted.sort_by_key(|(tag, _)| *tag);
-    let mut out = splice::item_start();
+    let mut out = splice::item_start(encoding);
     for (tag, node) in sorted {
         match node {
             DicomNode::Element {
@@ -1355,7 +1355,7 @@ fn encode_new_item(
                 }
                 let shown = shown_path(path);
                 match encode_spliced_value(vr, value, Some(&charset)) {
-                    Ok(Some(bytes)) => match splice::encode_element(tag, vr, &bytes, explicit) {
+                    Ok(Some(bytes)) => match splice::encode_element(tag, vr, &bytes, encoding) {
                         Ok(element) => out.extend(element),
                         Err(error) => failures.push(format!("{shown} ({error})")),
                     },
@@ -1378,7 +1378,7 @@ fn encode_new_item(
                     items,
                     item_sources,
                     declarations,
-                    explicit,
+                    encoding,
                     failures,
                 )?
                 else {
@@ -1388,7 +1388,7 @@ fn encode_new_item(
             }
         }
     }
-    out.extend(splice::item_end());
+    out.extend(splice::item_end(encoding));
     Ok(Some(out))
 }
 
@@ -5900,11 +5900,11 @@ mod tests {
             "1.2.840.10008.1.2.4.50",
             "1.2.840.10008.1.2.4.90",
             "1.2.840.10008.1.2.5",
+            "1.2.840.10008.1.2.2",
         ] {
             assert!(splice::supports_transfer_syntax(uid), "{uid}");
         }
         for uid in [
-            "1.2.840.10008.1.2.2",
             uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
             "1.2.840.10008.1.20",
         ] {
@@ -6680,7 +6680,13 @@ mod tests {
     /// Group length elements in a saved file whose value is not the length of the
     /// elements of their group that follow, in the same data set or item.
     fn wrong_group_lengths(saved: &[u8]) -> Vec<String> {
-        fn check(nodes: &[splice::IndexNode], saved: &[u8], parent: &str, wrong: &mut Vec<String>) {
+        fn check(
+            nodes: &[splice::IndexNode],
+            saved: &[u8],
+            big_endian: bool,
+            parent: &str,
+            wrong: &mut Vec<String>,
+        ) {
             let bounds = |node: &splice::IndexNode| match node {
                 splice::IndexNode::Element { start, end, .. }
                 | splice::IndexNode::Sequence { start, end, .. }
@@ -6690,7 +6696,12 @@ mod tests {
                 let tag = node.tag();
                 if tag.element() == 0x0000 {
                     let (_, end) = bounds(node);
-                    let value = u32::from_le_bytes(saved[end - 4..end].try_into().unwrap());
+                    let bytes = saved[end - 4..end].try_into().unwrap();
+                    let value = if big_endian {
+                        u32::from_be_bytes(bytes)
+                    } else {
+                        u32::from_le_bytes(bytes)
+                    };
                     let actual: usize = nodes
                         .iter()
                         .filter(|other| {
@@ -6711,7 +6722,7 @@ mod tests {
                 if let splice::IndexNode::Sequence { items, .. } = node {
                     for (index, item) in items.iter().enumerate() {
                         let path = format!("{parent}{} / Item#{index} / ", format_tag(tag));
-                        check(item.nodes(), saved, &path, wrong);
+                        check(item.nodes(), saved, big_endian, &path, wrong);
                     }
                 }
             }
@@ -6724,7 +6735,13 @@ mod tests {
         let index = splice::FileIndex::read(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         let mut wrong = Vec::new();
-        check(index.nodes(), saved, "", &mut wrong);
+        check(
+            index.nodes(),
+            saved,
+            index.encoding().big_endian,
+            "",
+            &mut wrong,
+        );
         wrong
     }
 
@@ -7535,6 +7552,213 @@ mod tests {
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0026)"),
             ("ﾊﾝ".to_string(), true)
+        );
+    }
+
+    // ---- Explicit VR Big Endian ----
+
+    fn big_endian_element(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+        let mut value = value.to_vec();
+        if value.len() % 2 == 1 {
+            value.push(if vr == b"UI" { 0 } else { b' ' });
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_be_bytes());
+        out.extend_from_slice(&element.to_be_bytes());
+        out.extend_from_slice(vr);
+        if matches!(vr, b"OB" | b"OW" | b"UN" | b"UT") {
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(&value);
+        out
+    }
+
+    fn big_endian_item(content: &[u8], defined_length: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0xFF, 0xFE, 0xE0, 0x00]);
+        if defined_length {
+            out.extend_from_slice(&(content.len() as u32).to_be_bytes());
+            out.extend_from_slice(content);
+        } else {
+            out.extend_from_slice(&u32::MAX.to_be_bytes());
+            out.extend_from_slice(content);
+            out.extend_from_slice(&[0xFF, 0xFE, 0xE0, 0x0D, 0, 0, 0, 0]);
+        }
+        out
+    }
+
+    fn big_endian_sequence(
+        group: u16,
+        element: u16,
+        items: &[Vec<u8>],
+        defined_length: bool,
+    ) -> Vec<u8> {
+        let content = items
+            .iter()
+            .flat_map(|item| big_endian_item(item, defined_length))
+            .collect::<Vec<_>>();
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_be_bytes());
+        out.extend_from_slice(&element.to_be_bytes());
+        out.extend_from_slice(b"SQ\0\0");
+        if defined_length {
+            out.extend_from_slice(&(content.len() as u32).to_be_bytes());
+            out.extend(content);
+        } else {
+            out.extend_from_slice(&u32::MAX.to_be_bytes());
+            out.extend(content);
+            out.extend_from_slice(&[0xFF, 0xFE, 0xE0, 0xDD, 0, 0, 0, 0]);
+        }
+        out
+    }
+
+    /// An Explicit VR Big Endian file: UTF-8 text, a group length, a US value, a
+    /// defined-length and an undefined-length sequence, and native pixel data.
+    fn write_big_endian_file(path: &std::path::Path) -> Vec<u8> {
+        let patient = [
+            big_endian_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+            big_endian_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        let roi = [
+            big_endian_element(0x3006, 0x0022, b"IS", b"1"),
+            big_endian_element(0x3006, 0x0026, b"LO", "前立腺".as_bytes()),
+        ]
+        .concat();
+        let dataset = [
+            big_endian_element(0x0008, 0x0005, b"CS", b"ISO_IR 192"),
+            big_endian_element(0x0008, 0x0016, b"UI", RTSTRUCT_SOP_CLASS.as_bytes()),
+            big_endian_element(0x0008, 0x0018, b"UI", b"1.2.3.4"),
+            big_endian_element(0x0008, 0x0060, b"CS", b"RTSTRUCT"),
+            big_endian_element(0x0010, 0x0000, b"UL", &(patient.len() as u32).to_be_bytes()),
+            patient,
+            big_endian_element(0x0028, 0x0010, b"US", &512_u16.to_be_bytes()),
+            big_endian_sequence(0x3006, 0x0020, &[roi], true),
+            big_endian_sequence(
+                0x3006,
+                0x0039,
+                &[big_endian_element(0x3006, 0x0084, b"IS", b"1")],
+                false,
+            ),
+            big_endian_element(0x7FE0, 0x0010, b"OW", &[1, 2, 3, 4]),
+        ]
+        .concat();
+        write_part10_with(path, "1.2.840.10008.1.2.2", &dataset);
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn big_endian_files_are_read() {
+        let path = temp_path("big-endian-read.dcm");
+        write_big_endian_file(&path);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        let index = splice::FileIndex::read(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        assert!(index.unwrap().encoding().big_endian);
+        let nodes = content.nodes;
+        assert_eq!(
+            value_and_editable(&nodes, "(0010,0010)"),
+            ("山田^太郎".to_string(), true)
+        );
+        assert_eq!(value_and_editable(&nodes, "(0028,0010)").0, "512");
+        assert_eq!(values_in(&nodes, "(3006,0026)"), "前立腺");
+        assert_eq!(values_in(&nodes, "(3006,0084)"), "1");
+    }
+
+    #[test]
+    fn big_endian_splice_without_edits_keeps_the_file_byte_for_byte() {
+        let path = temp_path("big-endian-identity.dcm");
+        let original = write_big_endian_file(&path);
+        let nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let planned = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned);
+        assert_eq!(saved.unwrap(), original);
+    }
+
+    /// Edits, added and removed elements, added sequences and items, group lengths,
+    /// lengths of defined-length items and SOP UID changes, all in big endian (the file
+    /// meta information stays little endian).
+    #[test]
+    fn big_endian_edits_are_spliced() {
+        let path = temp_path("big-endian-edit.dcm");
+        write_big_endian_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0010)"], "鈴木^花子子");
+        set_value(&mut nodes, &["(0008,0018)"], "1.2.3.4.5");
+        set_value(
+            &mut nodes,
+            &["(3006,0020)", "Item#0", "(3006,0026)"],
+            "前立腺 PTV",
+        );
+        remove_element(&mut nodes, "(0010,0020)");
+        let position = nodes
+            .iter()
+            .position(|node| matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0000)"))
+            .unwrap();
+        nodes.insert(position, element_node("(0008,1030)", "LO", "頭部", &[]));
+        nodes.insert(
+            position + 1,
+            new_sequence(
+                "(0008,1032)",
+                &[],
+                vec![vec![element_node(
+                    "(0008,0104)",
+                    "LO",
+                    "胸部",
+                    &["(0008,1032)", "Item#0"],
+                )]],
+            ),
+        );
+        append_item(&mut nodes, &["(3006,0039)"], &|parent| {
+            vec![element_node("(3006,0084)", "IS", "2", parent)]
+        });
+        let planned = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned, "saving should splice");
+        let saved = saved.unwrap();
+        assert_eq!(wrong_group_lengths(&saved), Vec::<String>::new());
+        // Text is written as is, with big-endian headers.
+        let mut added = vec![0x00, 0x08, 0x10, 0x30, b'L', b'O', 0x00, 0x06];
+        added.extend_from_slice("頭部".as_bytes());
+        assert!(contains(&saved, &added));
+        assert!(
+            saved.ends_with(&[0x7F, 0xE0, 0x00, 0x10, b'O', b'W', 0, 0, 0, 0, 0, 4, 1, 2, 3, 4])
+        );
+        assert!(!contains(&saved, b"ID001"));
+        let reopened = reopen("big-endian-edit-reopened.dcm", &saved);
+        assert_eq!(values_in(&reopened, "(0010,0010)"), "鈴木^花子子");
+        assert_eq!(values_in(&reopened, "(0008,1030)"), "頭部");
+        assert_eq!(values_in(&reopened, "(0008,0104)"), "胸部");
+        assert_eq!(values_in(&reopened, "(0028,0010)"), "512");
+        assert!(find_element(&reopened, "(0010,0020)").is_none());
+        assert_eq!(values_in(&reopened, "(3006,0026)"), "前立腺 PTV");
+        let items = sequence_items_of(&reopened, "(3006,0039)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(values_in(&items[1], "(3006,0084)"), "2");
+        let saved_path = temp_path("big-endian-edit-meta.dcm");
+        std::fs::write(&saved_path, &saved).unwrap();
+        let object = open_full_object(saved_path.to_str().unwrap());
+        std::fs::remove_file(&saved_path).ok();
+        let object = object.unwrap();
+        assert_eq!(
+            object
+                .meta()
+                .media_storage_sop_instance_uid()
+                .trim_end_matches('\0'),
+            "1.2.3.4.5"
+        );
+        assert_eq!(
+            object.meta().transfer_syntax().trim_end_matches('\0'),
+            "1.2.840.10008.1.2.2"
         );
     }
 }

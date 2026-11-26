@@ -8,7 +8,7 @@
 //! pixel data, is copied byte for byte.
 //!
 //! Supported: Part 10 files whose data set is Explicit VR Little Endian (including
-//! encapsulated pixel data) or Implicit VR Little Endian.
+//! encapsulated pixel data), Implicit VR Little Endian or Explicit VR Big Endian.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -24,11 +24,86 @@ const ITEM_DELIMITER: Tag = Tag(0xFFFE, 0xE00D);
 const SEQUENCE_DELIMITER: Tag = Tag(0xFFFE, 0xE0DD);
 const UNDEFINED: u32 = u32::MAX;
 
+const EXPLICIT_VR_BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
+
 /// Transfer syntaxes whose data set is encoded as Explicit or Implicit VR Little
-/// Endian.
+/// Endian, or as Explicit VR Big Endian.
 pub fn supports_transfer_syntax(uid: &str) -> bool {
-    let uid = uid.trim_end_matches(['\0', ' ']);
-    uid == uids::IMPLICIT_VR_LITTLE_ENDIAN || is_explicit_vr_little_endian(uid)
+    Encoding::of_transfer_syntax(uid).is_some()
+}
+
+/// How a data set is encoded: Explicit or Implicit VR, and the byte order of tags,
+/// lengths and binary values. Text values read the same in either byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Encoding {
+    pub explicit: bool,
+    pub big_endian: bool,
+}
+
+impl Encoding {
+    /// The file meta information, which is always Explicit VR Little Endian.
+    const META: Self = Self {
+        explicit: true,
+        big_endian: false,
+    };
+
+    /// The encoding of the data set for a transfer syntax, if splicing supports it.
+    pub fn of_transfer_syntax(uid: &str) -> Option<Self> {
+        let uid = uid.trim_end_matches(['\0', ' ']);
+        if uid == uids::IMPLICIT_VR_LITTLE_ENDIAN {
+            Some(Self {
+                explicit: false,
+                big_endian: false,
+            })
+        } else if uid == EXPLICIT_VR_BIG_ENDIAN {
+            Some(Self {
+                explicit: true,
+                big_endian: true,
+            })
+        } else if is_explicit_vr_little_endian(uid) {
+            Some(Self::META)
+        } else {
+            None
+        }
+    }
+
+    fn u16_bytes(self, value: u16) -> [u8; 2] {
+        if self.big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        }
+    }
+
+    fn u32_bytes(self, value: u32) -> [u8; 4] {
+        if self.big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        }
+    }
+
+    fn read_u16(self, bytes: [u8; 2]) -> u16 {
+        if self.big_endian {
+            u16::from_be_bytes(bytes)
+        } else {
+            u16::from_le_bytes(bytes)
+        }
+    }
+
+    fn read_u32(self, bytes: [u8; 4]) -> u32 {
+        if self.big_endian {
+            u32::from_be_bytes(bytes)
+        } else {
+            u32::from_le_bytes(bytes)
+        }
+    }
+
+    fn tag_bytes(self, tag: Tag) -> [u8; 4] {
+        let [a, b] = self.u16_bytes(tag.group());
+        let [c, d] = self.u16_bytes(tag.element());
+        [a, b, c, d]
+    }
 }
 
 /// Transfer syntaxes whose data set is encoded as Explicit VR Little Endian.
@@ -39,7 +114,7 @@ fn is_explicit_vr_little_endian(uid: &str) -> bool {
     uid.starts_with("1.2.840.10008.1.2.")
         && !matches!(
             uid,
-            "1.2.840.10008.1.2.2" // Explicit VR Big Endian (retired)
+            EXPLICIT_VR_BIG_ENDIAN // Explicit VR Big Endian (retired)
             | uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN
             | "1.2.840.10008.1.2.4.95" // JPIP Referenced Deflate
         )
@@ -101,8 +176,8 @@ pub struct FileIndex {
     meta: Vec<IndexNode>,
     /// Offset of the first data set element (after the file meta information).
     dataset_start: u64,
-    /// Whether the data set is Explicit VR (Implicit VR otherwise).
-    explicit: bool,
+    /// How the data set is encoded.
+    encoding: Encoding,
     file_length: u64,
     nodes: Vec<IndexNode>,
 }
@@ -118,7 +193,7 @@ impl FileIndex {
             position: 0,
             length: file_length,
             // File meta information (group 0002) is always Explicit VR Little Endian.
-            explicit: true,
+            encoding: Encoding::META,
         };
         let mut head = [0_u8; 132];
         reader.read_exact(&mut head)?;
@@ -135,16 +210,16 @@ impl FileIndex {
         }
         let dataset_start = reader.position;
         let transfer_syntax = read_transfer_syntax(&mut reader, &meta)?;
-        if !supports_transfer_syntax(&transfer_syntax) {
+        let Some(encoding) = Encoding::of_transfer_syntax(&transfer_syntax) else {
             return Err(format!(
                 "Transfer syntax {transfer_syntax} is not supported"
             ));
-        }
-        reader.explicit = is_explicit_vr_little_endian(&transfer_syntax);
+        };
+        reader.encoding = encoding;
         let nodes = read_nodes(&mut reader, file_length, |_| false)?;
         Ok(Self {
             modified,
-            explicit: reader.explicit,
+            encoding,
             meta_start,
             meta,
             dataset_start,
@@ -157,9 +232,9 @@ impl FileIndex {
         &self.nodes
     }
 
-    /// Whether the data set is Explicit VR (Implicit VR otherwise).
-    pub fn is_explicit(&self) -> bool {
-        self.explicit
+    /// How the data set is encoded.
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
     }
 }
 
@@ -192,7 +267,7 @@ struct Reader {
     inner: BufReader<File>,
     position: u64,
     length: u64,
-    explicit: bool,
+    encoding: Encoding,
 }
 
 impl Reader {
@@ -237,25 +312,26 @@ impl Reader {
     fn tag_and_length(&mut self) -> Result<(Tag, [u8; 2], u32, bool), String> {
         let mut header = [0_u8; 8];
         self.read_exact(&mut header)?;
+        let encoding = self.encoding;
         let tag = Tag(
-            u16::from_le_bytes([header[0], header[1]]),
-            u16::from_le_bytes([header[2], header[3]]),
+            encoding.read_u16([header[0], header[1]]),
+            encoding.read_u16([header[2], header[3]]),
         );
-        if tag.group() == 0xFFFE || !self.explicit {
+        if tag.group() == 0xFFFE || !encoding.explicit {
             // Items, delimiters and Implicit VR elements: no VR, 32-bit length.
-            let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+            let length = encoding.read_u32([header[4], header[5], header[6], header[7]]);
             return Ok((tag, [0, 0], length, true));
         }
         let vr = [header[4], header[5]];
         if has_32_bit_length(&vr) {
             let mut length = [0_u8; 4];
             self.read_exact(&mut length)?;
-            Ok((tag, vr, u32::from_le_bytes(length), true))
+            Ok((tag, vr, encoding.read_u32(length), true))
         } else {
             Ok((
                 tag,
                 vr,
-                u32::from(u16::from_le_bytes([header[6], header[7]])),
+                u32::from(encoding.read_u16([header[6], header[7]])),
                 false,
             ))
         }
@@ -273,8 +349,8 @@ impl Reader {
             .seek_relative(-4)
             .map_err(|error| error.to_string())?;
         Ok(Some(Tag(
-            u16::from_le_bytes([buffer[0], buffer[1]]),
-            u16::from_le_bytes([buffer[2], buffer[3]]),
+            self.encoding.read_u16([buffer[0], buffer[1]]),
+            self.encoding.read_u16([buffer[2], buffer[3]]),
         )))
     }
 }
@@ -334,7 +410,7 @@ fn read_node(reader: &mut Reader) -> Result<IndexNode, String> {
     // Implicit VR elements take their VR from the dictionary, like dicom-rs does: a
     // sequence when the dictionary says SQ or the length is undefined (except for
     // Pixel Data, whose fragments are not items with data sets).
-    let implicit_vr = (!reader.explicit).then(|| dictionary_vr(tag));
+    let implicit_vr = (!reader.encoding.explicit).then(|| dictionary_vr(tag));
     let vr = match implicit_vr {
         Some(Some(vr)) => vr.to_bytes(),
         Some(None) => *b"UN",
@@ -480,17 +556,22 @@ pub fn write_spliced(
         source: &mut file,
         out,
         edits,
-        explicit: index.explicit,
+        encoding: index.encoding,
     };
     writer.meta(index)?;
     writer.nodes(&index.nodes, &[])?;
     writer.copy(index.dataset_end(), index.file_length)
 }
 
-/// An element with an Explicit or Implicit VR Little Endian header, its value padded by
-/// the caller.
-pub fn encode_element(tag: Tag, vr: VR, value: &[u8], explicit: bool) -> Result<Vec<u8>, String> {
-    let mut element = element_header(tag, vr.to_bytes(), value.len(), explicit)?;
+/// An element with a header in the data set's encoding, its value (text, which needs no
+/// byte swapping) padded by the caller.
+pub fn encode_element(
+    tag: Tag,
+    vr: VR,
+    value: &[u8],
+    encoding: Encoding,
+) -> Result<Vec<u8>, String> {
+    let mut element = element_header(tag, vr.to_bytes(), value.len(), encoding)?;
     element.extend_from_slice(value);
     Ok(element)
 }
@@ -577,7 +658,7 @@ struct SpliceWriter<'a> {
     source: &'a mut File,
     out: &'a mut dyn Write,
     edits: &'a Edits,
-    explicit: bool,
+    encoding: Encoding,
 }
 
 impl SpliceWriter<'_> {
@@ -602,7 +683,8 @@ impl SpliceWriter<'_> {
             };
             Ok(match replacements.get(tag) {
                 Some(value) => {
-                    (element_header(*tag, *vr_bytes, value.len(), true)?.len() + value.len()) as u64
+                    (element_header(*tag, *vr_bytes, value.len(), Encoding::META)?.len()
+                        + value.len()) as u64
                 }
                 None => end - start,
             })
@@ -635,7 +717,12 @@ impl SpliceWriter<'_> {
                 self.copy(*start, start + 8)?;
                 self.write(&checked_length(total, "The file meta information")?.to_le_bytes())?;
             } else if let Some(value) = replacements.get(tag) {
-                self.write(&element_header(*tag, *vr_bytes, value.len(), true)?)?;
+                self.write(&element_header(
+                    *tag,
+                    *vr_bytes,
+                    value.len(),
+                    Encoding::META,
+                )?)?;
                 self.write(value)?;
             } else {
                 self.copy(*start, *end)?;
@@ -687,7 +774,7 @@ impl SpliceWriter<'_> {
                     }
                     let length = self.group_length(&nodes[position + 1..], parent, tag.group())?;
                     self.copy(*start, end - 4)?;
-                    self.write(&length.to_le_bytes())?;
+                    self.write(&self.encoding.u32_bytes(length))?;
                     continue;
                 }
             }
@@ -711,7 +798,7 @@ impl SpliceWriter<'_> {
                     *tag,
                     *vr_bytes,
                     value.len(),
-                    self.explicit,
+                    self.encoding,
                 )?)?;
                 self.write(value)
             }
@@ -726,7 +813,7 @@ impl SpliceWriter<'_> {
             } => {
                 if *defined_length {
                     let length = self.items_length(items, &path)?;
-                    self.write(&long_header(*tag, *vr, length, self.explicit))?;
+                    self.write(&long_header(*tag, *vr, length, self.encoding))?;
                 } else {
                     self.copy(*start, start + header_length)?;
                 }
@@ -756,7 +843,7 @@ impl SpliceWriter<'_> {
         }
         if item.defined_length {
             let length = self.nodes_length(&item.nodes, path)?;
-            self.write(&item_header(length))?;
+            self.write(&item_header(length, self.encoding))?;
         } else {
             self.copy(item.start, item.start + 8)?;
         }
@@ -847,7 +934,7 @@ impl SpliceWriter<'_> {
         match node {
             IndexNode::Element { tag, vr_bytes, .. } => {
                 let value = &self.edits.replacements[&path];
-                let header = element_header(*tag, *vr_bytes, value.len(), self.explicit)?;
+                let header = element_header(*tag, *vr_bytes, value.len(), self.encoding)?;
                 u32::try_from(header.len() + value.len())
                     .map_err(|_| "An element is too long".to_string())
             }
@@ -888,30 +975,29 @@ impl SpliceWriter<'_> {
 }
 
 /// The start of a new sequence, of undefined length (closed by `sequence_end`).
-pub fn sequence_start(tag: Tag, explicit: bool) -> Vec<u8> {
-    long_header(tag, *b"SQ", UNDEFINED, explicit)
+pub fn sequence_start(tag: Tag, encoding: Encoding) -> Vec<u8> {
+    long_header(tag, *b"SQ", UNDEFINED, encoding)
 }
 
 /// The sequence delimitation item.
-pub fn sequence_end() -> Vec<u8> {
-    let mut out = Vec::with_capacity(8);
-    out.extend_from_slice(&SEQUENCE_DELIMITER.group().to_le_bytes());
-    out.extend_from_slice(&SEQUENCE_DELIMITER.element().to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes());
-    out
+pub fn sequence_end(encoding: Encoding) -> Vec<u8> {
+    delimiter(SEQUENCE_DELIMITER, encoding)
 }
 
 /// The start of a new item, of undefined length (closed by `item_end`).
-pub fn item_start() -> Vec<u8> {
-    item_header(UNDEFINED)
+pub fn item_start(encoding: Encoding) -> Vec<u8> {
+    item_header(UNDEFINED, encoding)
 }
 
 /// The item delimitation item.
-pub fn item_end() -> Vec<u8> {
+pub fn item_end(encoding: Encoding) -> Vec<u8> {
+    delimiter(ITEM_DELIMITER, encoding)
+}
+
+fn delimiter(tag: Tag, encoding: Encoding) -> Vec<u8> {
     let mut out = Vec::with_capacity(8);
-    out.extend_from_slice(&ITEM_DELIMITER.group().to_le_bytes());
-    out.extend_from_slice(&ITEM_DELIMITER.element().to_le_bytes());
-    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&encoding.tag_bytes(tag));
+    out.extend_from_slice(&encoding.u32_bytes(0));
     out
 }
 
@@ -943,18 +1029,17 @@ fn element_header(
     tag: Tag,
     vr_bytes: [u8; 2],
     length: usize,
-    explicit: bool,
+    encoding: Encoding,
 ) -> Result<Vec<u8>, String> {
     let mut header = Vec::with_capacity(12);
-    header.extend_from_slice(&tag.group().to_le_bytes());
-    header.extend_from_slice(&tag.element().to_le_bytes());
-    if !explicit {
+    header.extend_from_slice(&encoding.tag_bytes(tag));
+    if !encoding.explicit {
         // Implicit VR: no VR, 32-bit length.
         let length = u32::try_from(length)
             .ok()
             .filter(|length| *length != UNDEFINED)
             .ok_or_else(|| format!("The value of {} is too long", format_tag(tag)))?;
-        header.extend_from_slice(&length.to_le_bytes());
+        header.extend_from_slice(&encoding.u32_bytes(length));
         return Ok(header);
     }
     header.extend_from_slice(&vr_bytes);
@@ -964,7 +1049,7 @@ fn element_header(
             .filter(|length| *length != UNDEFINED)
             .ok_or_else(|| format!("The value of {} is too long", format_tag(tag)))?;
         header.extend_from_slice(&[0, 0]);
-        header.extend_from_slice(&length.to_le_bytes());
+        header.extend_from_slice(&encoding.u32_bytes(length));
     } else {
         let length = u16::try_from(length).map_err(|_| {
             format!(
@@ -972,27 +1057,25 @@ fn element_header(
                 format_tag(tag)
             )
         })?;
-        header.extend_from_slice(&length.to_le_bytes());
+        header.extend_from_slice(&encoding.u16_bytes(length));
     }
     Ok(header)
 }
 
-fn long_header(tag: Tag, vr: [u8; 2], length: u32, explicit: bool) -> Vec<u8> {
+fn long_header(tag: Tag, vr: [u8; 2], length: u32, encoding: Encoding) -> Vec<u8> {
     let mut header = Vec::with_capacity(12);
-    header.extend_from_slice(&tag.group().to_le_bytes());
-    header.extend_from_slice(&tag.element().to_le_bytes());
-    if explicit {
+    header.extend_from_slice(&encoding.tag_bytes(tag));
+    if encoding.explicit {
         header.extend_from_slice(&vr);
         header.extend_from_slice(&[0, 0]);
     }
-    header.extend_from_slice(&length.to_le_bytes());
+    header.extend_from_slice(&encoding.u32_bytes(length));
     header
 }
 
-fn item_header(length: u32) -> Vec<u8> {
+fn item_header(length: u32, encoding: Encoding) -> Vec<u8> {
     let mut header = Vec::with_capacity(8);
-    header.extend_from_slice(&ITEM.group().to_le_bytes());
-    header.extend_from_slice(&ITEM.element().to_le_bytes());
-    header.extend_from_slice(&length.to_le_bytes());
+    header.extend_from_slice(&encoding.tag_bytes(ITEM));
+    header.extend_from_slice(&encoding.u32_bytes(length));
     header
 }
