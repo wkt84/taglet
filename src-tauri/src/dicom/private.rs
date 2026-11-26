@@ -176,7 +176,6 @@ pub(super) fn validate_private_nodes(
             let original = obj
                 .get(parse_tag(tag)?)
                 .and_then(|element| element.value().items())
-                .map(|items| &items[..])
                 .unwrap_or_default();
             {
                 for (index, next_nodes) in items.iter().enumerate() {
