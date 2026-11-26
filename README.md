@@ -177,6 +177,7 @@ Taglet は現在、以下を中心に対応しています。
 - Implicit VR Little Endian
 - Explicit VR Little Endian
 - Explicit VR Big Endian（廃止された転送構文。保存時もバイト順を保ちます）
+- Deflated Explicit VR Little Endian（開くときに展開し、保存時は編集を反映して再圧縮します。編集せずに保存した場合はファイルをそのまま保ちます。テキスト以外の要素の追加など、ファイルをその場で書き換えられない変更は保存できません）
 - grayscale image
 - 8 / 16 / 32 bit pixel data
 - single-frame / multi-frame

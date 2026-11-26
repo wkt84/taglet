@@ -3535,6 +3535,7 @@ dependencies = [
  "dicom-parser",
  "dicom-transfer-syntax-registry",
  "encoding_rs",
+ "flate2",
  "regex",
  "serde",
  "serde_json",
