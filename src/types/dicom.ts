@@ -183,12 +183,15 @@ export type TableDicomRow =
       path: string[]
       rowId: string
       depth: number
+      childCount: number
+      canExpand: boolean
       subRows: TableDicomRow[]
     }
   | (DicomElement & {
       rowId: string
       depth: number
       itemIndex?: number
+      canExpand?: undefined
       subRows?: TableDicomRow[]
     })
   | {
@@ -201,12 +204,14 @@ export type TableDicomRow =
       depth: number
       itemIndex: number
       childCount: number
+      canExpand: boolean
       subRows: TableDicomRow[]
     }
   | (Omit<DicomSequence, 'items'> & {
       rowId: string
       depth: number
       itemIndex?: number
+      canExpand: boolean
       subRows: TableDicomRow[]
       items: DicomNode[][]
     })
