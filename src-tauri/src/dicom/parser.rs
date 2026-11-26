@@ -1471,6 +1471,9 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
         elements: HashSet<Vec<String>>,
         sequences: HashSet<Vec<String>>,
         items: HashSet<Vec<String>>,
+        /// Item counts of sequences: from the file, and from nodes without
+        /// `item_sources`, which show the file's items as they are.
+        item_counts: HashMap<Vec<String>, usize>,
         opaque: HashSet<Vec<String>>,
         /// Set when a node's path does not match where it is. Paths address the
         /// file's elements, so splicing could then copy values from the wrong item.
@@ -1500,6 +1503,9 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
                     ..
                 } => {
                     shape.sequences.insert(path.clone());
+                    if item_sources.is_none() {
+                        shape.item_counts.insert(path.clone(), items.len());
+                    }
                     // Items can be removed, not reordered: splicing writes them in the
                     // file's order.
                     if item_sources
@@ -1532,6 +1538,7 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
             match node {
                 splice::IndexNode::Sequence { items, .. } => {
                     shape.sequences.insert(path.clone());
+                    shape.item_counts.insert(path.clone(), items.len());
                     for (index, item) in items.iter().enumerate() {
                         let mut item_path = path.clone();
                         item_path.push(format!("Item#{index}"));
@@ -1562,6 +1569,15 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
         if !from_nodes.elements.remove(path) {
             return None;
         }
+    }
+    // Items are only removed as `item_sources` records it; a sequence without it must
+    // show all of the file's items.
+    if from_nodes
+        .item_counts
+        .iter()
+        .any(|(path, count)| from_index.item_counts.get(path) != Some(count))
+    {
+        return None;
     }
     if !from_nodes.sequences.is_subset(&from_index.sequences)
         || !from_nodes.items.is_subset(&from_index.items)
@@ -6342,6 +6358,24 @@ mod tests {
 
         assert!(result.unwrap_err().contains("removing sequence items"));
         assert!(!destination.exists());
+    }
+
+    /// Items missing from a sequence without `item_sources` are not taken as removed.
+    #[test]
+    fn missing_items_without_sources_are_not_removed() {
+        let path = temp_path("missing-items.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        if let Some(DicomNode::Sequence { items, .. }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0020)"))
+        {
+            items.truncate(1);
+        }
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
     }
 
     /// Items can be removed but not reordered: splicing writes them in the file's order.
