@@ -24,6 +24,7 @@ use super::charset::{
     dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_readable_declaration,
     is_single_valued_text, is_writable_declaration, trim_padding, TextCharset,
 };
+use super::deflate;
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
     RtPlanBeam, RtPlanBeamLimitingDeviceDefinition, RtPlanBeamLimitingDevicePosition,
@@ -71,6 +72,8 @@ const TEXT_SAVE_BLOCKED_WARNING: &str =
     "Some text in this file cannot be written back without changing its bytes, so saving is disabled for this file.";
 const TEXT_ADD_BLOCKED_WARNING: &str =
     "Some text in this file cannot be written back by the full writer, and the file's tags are not in order, so saving fails if elements are added. Values can still be edited and elements removed.";
+const DEFLATED_NEEDS_SPLICING: &str =
+    "Cannot save: this file's data set is deflated (Deflated Explicit VR Little Endian), and Taglet can save such files only by editing them in place, which these changes do not allow (e.g. adding a non-text element, or removing a group length or a SOP UID).";
 const RAW_DATASET_START_GROUPS: &[u16] = &[
     0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x3006, 0x300A, 0x300C,
 ];
@@ -102,8 +105,9 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
 }
 
 /// Whether value edits to this file can be saved by splicing: a Part 10 file whose
-/// data set is Explicit or Implicit VR Little Endian, that can be indexed, and whose file
-/// meta SOP UIDs match the data set's (see `plan_splice`).
+/// data set is Explicit or Implicit VR Little Endian, Explicit VR Big Endian or deflated,
+/// that can be indexed, and whose file meta SOP UIDs match the data set's (see
+/// `plan_splice`).
 /// `Some` with whether its tags are in order (needed to add elements), or `None`.
 fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
     let value_of = |nodes: &[DicomNode], wanted: &str| {
@@ -132,10 +136,18 @@ fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
 }
 
 fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
-    match OpenFileOptions::new()
-        .read_until(tags::PIXEL_DATA)
-        .open_file(path)
-    {
+    let opened = match open_deflated_object(path)? {
+        Some(mut obj) => {
+            // As read up to Pixel Data, like other files.
+            remove_from_pixel_data(&mut obj);
+            Ok(obj)
+        }
+        None => OpenFileOptions::new()
+            .read_until(tags::PIXEL_DATA)
+            .open_file(path)
+            .map_err(|error| error.to_string()),
+    };
+    match opened {
         Ok(obj) => {
             let file_meta = file_meta_to_nodes(obj.meta());
             let mut nodes = object_to_nodes(&obj, Vec::new());
@@ -765,6 +777,10 @@ pub fn save_file_with_nodes(
         None => None,
     };
     let Some((index, edits)) = planned else {
+        // dicom-rs cannot write deflated data sets.
+        if deflate::is_deflated(object.meta().transfer_syntax()) {
+            return Err(DEFLATED_NEEDS_SPLICING.to_string());
+        }
         save_object_with_nodes_guarded(
             object,
             nodes,
@@ -2346,10 +2362,43 @@ fn file_meta_to_nodes(meta: &FileMetaTable) -> Vec<DicomNode> {
         .collect()
 }
 
+/// A Deflated Explicit VR Little Endian file, read whole with its data set inflated
+/// (dicom-rs cannot read these), or `None` for other files (see `deflate`).
+fn open_deflated_object(path: &str) -> Result<Option<DefaultDicomObject>, String> {
+    let Some(file) = deflate::read_inflated(path)? else {
+        return Ok(None);
+    };
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+        .ok_or_else(|| "Explicit VR Little Endian transfer syntax is not available".to_string())?;
+    let obj = InMemDicomObject::read_dataset_with_ts(file.dataset(), transfer_syntax)
+        .map_err(|error| format!("Could not read the deflated data set: {error}"))?;
+    Ok(Some(obj.with_exact_meta(file.meta)))
+}
+
+/// Leave out Pixel Data and the elements after it, as `OpenFileOptions::read_until`
+/// does.
+fn remove_from_pixel_data(obj: &mut InMemDicomObject) {
+    let from_pixel_data = obj
+        .iter()
+        .map(|element| element.tag())
+        .filter(|tag| *tag >= PIXEL_DATA)
+        .collect::<Vec<_>>();
+    for tag in from_pixel_data {
+        obj.remove_element(tag);
+    }
+}
+
 fn open_object_with_fallback(
     path: &str,
     read_until_pixel_data: bool,
 ) -> Result<(DefaultDicomObject, bool), String> {
+    if let Some(mut obj) = open_deflated_object(path)? {
+        if read_until_pixel_data {
+            remove_from_pixel_data(&mut obj);
+        }
+        return Ok((obj, false));
+    }
     let options = if read_until_pixel_data {
         OpenFileOptions::new().read_until(tags::PIXEL_DATA)
     } else {
@@ -5901,13 +5950,11 @@ mod tests {
             "1.2.840.10008.1.2.4.90",
             "1.2.840.10008.1.2.5",
             "1.2.840.10008.1.2.2",
+            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
         ] {
             assert!(splice::supports_transfer_syntax(uid), "{uid}");
         }
-        for uid in [
-            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
-            "1.2.840.10008.1.20",
-        ] {
+        for uid in ["1.2.840.10008.1.2.4.95", "1.2.840.10008.1.20"] {
             assert!(!splice::supports_transfer_syntax(uid), "{uid}");
         }
     }
@@ -7760,5 +7807,201 @@ mod tests {
             object.meta().transfer_syntax().trim_end_matches('\0'),
             "1.2.840.10008.1.2.2"
         );
+    }
+
+    // ---- Deflated Explicit VR Little Endian ----
+
+    /// The data set of a deflated file before deflating: UTF-8 text, an ISO_IR 13 item
+    /// in a defined-length sequence, an undefined-length sequence and native pixel data.
+    fn deflated_dataset() -> Vec<u8> {
+        let item = [
+            explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+            explicit_element(0x3006, 0x0022, b"IS", b"1"),
+            explicit_element(0x3006, 0x0026, b"LO", HAN_IR13),
+        ]
+        .concat();
+        let mut pixel_data = vec![0xE0, 0x7F, 0x10, 0x00, b'O', b'W', 0, 0];
+        pixel_data.extend_from_slice(&8_u32.to_le_bytes());
+        pixel_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+            defined_sequence(0x3006, 0x0020, &[item]),
+            sequence(
+                0x3006,
+                0x0039,
+                &[explicit_element(0x3006, 0x0084, b"IS", b"1")],
+                true,
+            ),
+            pixel_data,
+        ]
+        .concat()
+    }
+
+    fn write_deflated_file(path: &std::path::Path) -> Vec<u8> {
+        let deflated = deflate::deflate(&deflated_dataset()).unwrap();
+        write_part10_with(path, uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN, &deflated);
+        std::fs::read(path).unwrap()
+    }
+
+    /// The data set of a Part 10 file, inflated when deflated.
+    fn dataset_of(file: &[u8]) -> Vec<u8> {
+        let mut reader = std::io::Cursor::new(&file[128..]);
+        let meta = FileMetaTable::from_reader(&mut reader).unwrap();
+        let rest = &file[128 + reader.position() as usize..];
+        if deflate::is_deflated(meta.transfer_syntax()) {
+            let mut inflated = Vec::new();
+            deflate::inflate_into(&mut &rest[..], &mut inflated).unwrap();
+            inflated
+        } else {
+            rest.to_vec()
+        }
+    }
+
+    #[test]
+    fn deflated_files_are_read() {
+        let path = temp_path("deflated-read.dcm");
+        write_deflated_file(&path);
+        let path_text = path.to_str().unwrap();
+        let content = open_nodes(path_text).unwrap();
+        let full = open_full_object(path_text);
+        std::fs::remove_file(&path).ok();
+
+        assert!(content.warnings.is_empty(), "{:?}", content.warnings);
+        let nodes = content.nodes;
+        assert_eq!(
+            value_and_editable(&nodes, "(0010,0010)"),
+            ("山田^太郎".to_string(), true)
+        );
+        assert_eq!(
+            value_and_editable(&nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), true)
+        );
+        assert_eq!(values_in(&nodes, "(3006,0084)"), "1");
+        let full = full.unwrap();
+        assert_eq!(
+            full.meta().transfer_syntax(),
+            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN
+        );
+        assert_eq!(
+            full.element(PIXEL_DATA)
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+                .as_ref(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn deflated_splice_without_edits_keeps_the_file_byte_for_byte() {
+        let path = temp_path("deflated-identity.dcm");
+        let original = write_deflated_file(&path);
+        let nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let planned = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned);
+        assert_eq!(saved.unwrap(), original);
+    }
+
+    /// Edits to a deflated file give the same data set as the same edits to the file
+    /// not deflated, deflated again, with the file meta information kept.
+    #[test]
+    fn deflated_edits_are_spliced() {
+        let edit = |nodes: &mut Vec<DicomNode>| {
+            set_value(nodes, &["(0010,0010)"], "鈴木^花子子");
+            set_value(nodes, &["(0008,0018)"], "1.2.3.4.5");
+            set_value(nodes, &["(3006,0020)", "Item#0", "(3006,0026)"], "ﾊﾝﾀﾞ PTV");
+            remove_element(nodes, "(0010,0020)");
+            nodes.insert(0, element_node("(0008,1030)", "LO", "頭部", &[]));
+            nodes.insert(
+                1,
+                new_sequence(
+                    "(0008,1032)",
+                    &[],
+                    vec![vec![element_node(
+                        "(0008,0104)",
+                        "LO",
+                        "胸部",
+                        &["(0008,1032)", "Item#0"],
+                    )]],
+                ),
+            );
+            append_item(nodes, &["(3006,0039)"], &|parent| {
+                vec![element_node("(3006,0084)", "IS", "2", parent)]
+            });
+        };
+        let plain_path = temp_path("deflated-edit-plain.dcm");
+        write_part10_with(
+            &plain_path,
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            &deflated_dataset(),
+        );
+        let mut plain_nodes = open_nodes(plain_path.to_str().unwrap()).unwrap().nodes;
+        edit(&mut plain_nodes);
+        let plain_saved = save_file(&plain_path, &plain_nodes);
+        std::fs::remove_file(&plain_path).ok();
+
+        let path = temp_path("deflated-edit.dcm");
+        let original = write_deflated_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        edit(&mut nodes);
+        let planned = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(planned, "saving should splice");
+        let saved = saved.unwrap();
+        assert_eq!(saved.len() % 2, 0);
+        assert_eq!(dataset_of(&saved), dataset_of(&plain_saved.unwrap()));
+        // The file meta information is as before, apart from the SOP Instance UID.
+        let meta_length = original.len() - write_deflated_dataset_length();
+        assert_eq!(&saved[..128], &original[..128]);
+        assert!(contains(&saved[..meta_length + 2], b"1.2.3.4.5"));
+        let reopened = reopen("deflated-edit-reopened.dcm", &saved);
+        assert_eq!(values_in(&reopened, "(0010,0010)"), "鈴木^花子子");
+        assert_eq!(values_in(&reopened, "(3006,0026)"), "ﾊﾝﾀﾞ PTV");
+        assert_eq!(values_in(&reopened, "(0008,0104)"), "胸部");
+        assert_eq!(sequence_items_of(&reopened, "(3006,0039)").len(), 2);
+        let saved_path = temp_path("deflated-edit-meta.dcm");
+        std::fs::write(&saved_path, &saved).unwrap();
+        let object = open_full_object(saved_path.to_str().unwrap());
+        std::fs::remove_file(&saved_path).ok();
+        let object = object.unwrap();
+        assert_eq!(
+            object.meta().transfer_syntax(),
+            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN
+        );
+        assert_eq!(
+            object
+                .meta()
+                .media_storage_sop_instance_uid()
+                .trim_end_matches('\0'),
+            "1.2.3.4.5"
+        );
+    }
+
+    fn write_deflated_dataset_length() -> usize {
+        deflate::deflate(&deflated_dataset()).unwrap().len()
+    }
+
+    /// dicom-rs cannot write deflated data sets, so changes splicing cannot save fail
+    /// with a message, and the file is left as it was.
+    #[test]
+    fn deflated_changes_needing_the_full_writer_are_refused() {
+        let path = temp_path("deflated-refused.dcm");
+        let original = write_deflated_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes.insert(0, element_node("(0008,0000)", "UL", "4", &[]));
+        let saved = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(error.contains("deflated"), "{error}");
+        assert_eq!(after, original);
     }
 }

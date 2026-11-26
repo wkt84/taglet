@@ -25,6 +25,7 @@ use super::charset::{
     dicom_rs_codec_after, dicom_rs_codec_is_byte_transparent, dicom_rs_round_trips,
     is_charset_sensitive, TextCharset,
 };
+use super::deflate;
 
 const PIXEL_DATA: Tag = Tag(0x7FE0, 0x0010);
 
@@ -93,16 +94,32 @@ impl TextValues {
                 uids::IMPLICIT_VR_LITTLE_ENDIAN.to_string()
             }
         };
+        let mut values = HashMap::new();
+        // Deflated data sets are inflated first (see `deflate`); they are Explicit VR
+        // Little Endian.
+        if deflate::is_deflated(&transfer_syntax_uid) {
+            let mut inflated = Vec::new();
+            deflate::inflate_into(&mut reader, &mut inflated)?;
+            let transfer_syntax = TransferSyntaxRegistry
+                .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .ok_or_else(|| "Explicit VR Little Endian is not available".to_string())?;
+            let mut dataset = LazyDataSetReader::new_with_ts_cs(
+                std::io::Cursor::new(inflated),
+                transfer_syntax,
+                SpecificCharacterSet::default(),
+            )
+            .map_err(|error| error.to_string())?;
+            walk(&mut dataset, &mut values)?;
+            return Ok(Self { values });
+        }
         let transfer_syntax = TransferSyntaxRegistry
             .get(&transfer_syntax_uid)
             .ok_or_else(|| format!("Unknown transfer syntax {transfer_syntax_uid}"))?;
-        // Deflated datasets would need inflating first; leave them to dicom-rs.
-        let deflated = transfer_syntax.uid().trim_end_matches('\0')
-            == uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN
-            || transfer_syntax
-                .name()
-                .to_ascii_lowercase()
-                .contains("deflate");
+        // Other deflated transfer syntaxes (JPIP Referenced Deflate) are not walked.
+        let deflated = transfer_syntax
+            .name()
+            .to_ascii_lowercase()
+            .contains("deflate");
         if deflated || !transfer_syntax.can_decode_dataset() {
             return Err(format!(
                 "Transfer syntax {transfer_syntax_uid} cannot be walked"
@@ -115,7 +132,6 @@ impl TextValues {
         )
         .map_err(|error| error.to_string())?;
 
-        let mut values = HashMap::new();
         walk(&mut dataset, &mut values)?;
         Ok(Self { values })
     }

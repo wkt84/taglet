@@ -8,16 +8,20 @@
 //! pixel data, is copied byte for byte.
 //!
 //! Supported: Part 10 files whose data set is Explicit VR Little Endian (including
-//! encapsulated pixel data), Implicit VR Little Endian or Explicit VR Big Endian.
+//! encapsulated pixel data), Implicit VR Little Endian or Explicit VR Big Endian, and
+//! deflated ones (Deflated Explicit VR Little Endian), which are inflated to be indexed
+//! and spliced, and deflated again when written (see `deflate`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::{Tag, VR};
 use dicom_dictionary_std::{uids, StandardDataDictionary};
 use std::str::FromStr;
+
+use super::deflate;
 
 const ITEM: Tag = Tag(0xFFFE, 0xE000);
 const ITEM_DELIMITER: Tag = Tag(0xFFFE, 0xE00D);
@@ -27,7 +31,7 @@ const UNDEFINED: u32 = u32::MAX;
 const EXPLICIT_VR_BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
 
 /// Transfer syntaxes whose data set is encoded as Explicit or Implicit VR Little
-/// Endian, or as Explicit VR Big Endian.
+/// Endian, or as Explicit VR Big Endian, including the deflated one.
 pub fn supports_transfer_syntax(uid: &str) -> bool {
     Encoding::of_transfer_syntax(uid).is_some()
 }
@@ -60,7 +64,7 @@ impl Encoding {
                 explicit: true,
                 big_endian: true,
             })
-        } else if is_explicit_vr_little_endian(uid) {
+        } else if is_explicit_vr_little_endian(uid) || deflate::is_deflated(uid) {
             Some(Self::META)
         } else {
             None
@@ -178,7 +182,14 @@ pub struct FileIndex {
     dataset_start: u64,
     /// How the data set is encoded.
     encoding: Encoding,
+    /// Whether the data set is deflated: offsets after `dataset_start` are then offsets
+    /// in the inflated data set (see `deflate::InflatedFile`).
+    deflated: bool,
+    /// The length of the file, as it was indexed.
     file_length: u64,
+    /// The length of what offsets refer to: the file, or the file meta information
+    /// followed by the inflated data set.
+    source_length: u64,
     nodes: Vec<IndexNode>,
 }
 
@@ -189,7 +200,7 @@ impl FileIndex {
         let file_length = metadata.len();
         let modified = metadata.modified().ok();
         let mut reader = Reader {
-            inner: BufReader::new(file),
+            inner: Box::new(BufReader::new(file)),
             position: 0,
             length: file_length,
             // File meta information (group 0002) is always Explicit VR Little Endian.
@@ -215,11 +226,22 @@ impl FileIndex {
                 "Transfer syntax {transfer_syntax} is not supported"
             ));
         };
+        let deflated = deflate::is_deflated(&transfer_syntax);
+        if deflated {
+            // Index the file meta information followed by the inflated data set.
+            let bytes = inflated_source(&mut *reader.inner, dataset_start)?;
+            reader.length = bytes.len() as u64;
+            reader.inner = Box::new(Cursor::new(bytes));
+            reader.inner.seek_to(dataset_start)?;
+        }
         reader.encoding = encoding;
-        let nodes = read_nodes(&mut reader, file_length, |_| false)?;
+        let source_length = reader.length;
+        let nodes = read_nodes(&mut reader, source_length, |_| false)?;
         Ok(Self {
             modified,
             encoding,
+            deflated,
+            source_length,
             meta_start,
             meta,
             dataset_start,
@@ -263,8 +285,70 @@ fn dictionary_vr(tag: Tag) -> Option<VR> {
         .map(|entry| entry.vr().relaxed())
 }
 
+/// Where indexed bytes are read from: a file, or a file with its data set inflated.
+trait Source: Read {
+    fn seek_to(&mut self, position: u64) -> Result<(), String>;
+    /// Move by `offset` from the current position, keeping buffered data.
+    fn skip_by(&mut self, offset: i64) -> Result<(), String>;
+}
+
+impl Source for BufReader<File> {
+    fn seek_to(&mut self, position: u64) -> Result<(), String> {
+        self.seek(SeekFrom::Start(position))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn skip_by(&mut self, offset: i64) -> Result<(), String> {
+        self.seek_relative(offset)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Source for File {
+    fn seek_to(&mut self, position: u64) -> Result<(), String> {
+        self.seek(SeekFrom::Start(position))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn skip_by(&mut self, offset: i64) -> Result<(), String> {
+        self.seek(SeekFrom::Current(offset))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Source for Cursor<Vec<u8>> {
+    fn seek_to(&mut self, position: u64) -> Result<(), String> {
+        self.set_position(position);
+        Ok(())
+    }
+
+    fn skip_by(&mut self, offset: i64) -> Result<(), String> {
+        self.seek(SeekFrom::Current(offset))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The bytes of a deflated file up to `dataset_start` (the preamble and the file meta
+/// information), followed by its inflated data set.
+fn inflated_source(file: &mut dyn Source, dataset_start: u64) -> Result<Vec<u8>, String> {
+    file.seek_to(0)?;
+    let mut bytes = Vec::new();
+    file.take(dataset_start)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != dataset_start {
+        return Err("Unexpected end of file".to_string());
+    }
+    deflate::inflate_into(file, &mut bytes)?;
+    Ok(bytes)
+}
+
 struct Reader {
-    inner: BufReader<File>,
+    inner: Box<dyn Source>,
     position: u64,
     length: u64,
     encoding: Encoding,
@@ -275,14 +359,10 @@ impl Reader {
     fn read_at(&mut self, start: u64, end: u64) -> Result<Vec<u8>, String> {
         let position = self.position;
         let mut buffer = vec![0_u8; end.saturating_sub(start) as usize];
-        self.inner
-            .seek(SeekFrom::Start(start))
-            .map_err(|error| error.to_string())?;
+        self.inner.seek_to(start)?;
         self.position = start;
         self.read_exact(&mut buffer)?;
-        self.inner
-            .seek(SeekFrom::Start(position))
-            .map_err(|error| error.to_string())?;
+        self.inner.seek_to(position)?;
         self.position = position;
         Ok(buffer)
     }
@@ -302,9 +382,7 @@ impl Reader {
                 self.position
             ));
         }
-        self.inner
-            .seek_relative(length as i64)
-            .map_err(|error| error.to_string())?;
+        self.inner.skip_by(length as i64)?;
         self.position += length;
         Ok(())
     }
@@ -345,9 +423,7 @@ impl Reader {
         self.inner
             .read_exact(&mut buffer)
             .map_err(|error| error.to_string())?;
-        self.inner
-            .seek_relative(-4)
-            .map_err(|error| error.to_string())?;
+        self.inner.skip_by(-4)?;
         Ok(Some(Tag(
             self.encoding.read_u16([buffer[0], buffer[1]]),
             self.encoding.read_u16([buffer[2], buffer[3]]),
@@ -552,15 +628,60 @@ pub fn write_spliced(
     if metadata.len() != index.file_length || metadata.modified().ok() != index.modified {
         return Err("The file changed since it was opened".to_string());
     }
-    let mut writer = SpliceWriter {
-        source: &mut file,
-        out,
-        edits,
-        encoding: index.encoding,
-    };
-    writer.meta(index)?;
-    writer.nodes(&index.nodes, &[])?;
-    writer.copy(index.dataset_end(), index.file_length)
+    if !index.deflated {
+        let mut writer = SpliceWriter {
+            source: &mut file,
+            out,
+            edits,
+            encoding: index.encoding,
+        };
+        writer.meta(index)?;
+        writer.nodes(&index.nodes, &[])?;
+        return writer.copy(index.dataset_end(), index.source_length);
+    }
+    // A deflated file is copied as it is when nothing changes, so that saving without
+    // edits keeps every byte (deflating again would give other bytes).
+    if edits.is_empty() {
+        let copied = std::io::copy(&mut file, out).map_err(|error| error.to_string())?;
+        if copied != index.file_length {
+            return Err("The file changed since it was opened".to_string());
+        }
+        return Ok(());
+    }
+    let mut inflated = Cursor::new(inflated_source(
+        &mut BufReader::new(file),
+        index.dataset_start,
+    )?);
+    if inflated.get_ref().len() as u64 != index.source_length {
+        return Err("The file changed since it was opened".to_string());
+    }
+    let mut head = Vec::new();
+    let mut dataset = Vec::new();
+    {
+        let mut writer = SpliceWriter {
+            source: &mut inflated,
+            out: &mut head,
+            edits,
+            encoding: index.encoding,
+        };
+        writer.meta(index)?;
+        writer.out = &mut dataset;
+        writer.nodes(&index.nodes, &[])?;
+        writer.copy(index.dataset_end(), index.source_length)?;
+    }
+    out.write_all(&head).map_err(|error| error.to_string())?;
+    out.write_all(&deflate::deflate(&dataset)?)
+        .map_err(|error| error.to_string())
+}
+
+impl Edits {
+    fn is_empty(&self) -> bool {
+        self.replacements.is_empty()
+            && self.insertions.is_empty()
+            && self.removals.is_empty()
+            && self.appended_items.is_empty()
+            && self.meta_replacements.is_empty()
+    }
 }
 
 /// An element with a header in the data set's encoding, its value (text, which needs no
@@ -655,7 +776,7 @@ fn sorted_insertions<'e>(edits: &'e Edits, parent: &[String]) -> Vec<&'e (Tag, V
 }
 
 struct SpliceWriter<'a> {
-    source: &'a mut File,
+    source: &'a mut dyn Source,
     out: &'a mut dyn Write,
     edits: &'a Edits,
     encoding: Encoding,
@@ -735,9 +856,7 @@ impl SpliceWriter<'_> {
         if end <= start {
             return Ok(());
         }
-        self.source
-            .seek(SeekFrom::Start(start))
-            .map_err(|error| error.to_string())?;
+        self.source.seek_to(start)?;
         let copied = std::io::copy(&mut (&mut *self.source).take(end - start), self.out)
             .map_err(|error| error.to_string())?;
         if copied != end - start {

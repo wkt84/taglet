@@ -1,4 +1,5 @@
 pub mod charset;
+pub mod deflate;
 pub mod model;
 pub mod parser;
 mod private;
