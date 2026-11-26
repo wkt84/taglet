@@ -6,7 +6,7 @@ use dicom_core::Tag;
 use dicom_object::DefaultDicomObject;
 use tauri::State;
 
-use crate::dicom::model::{DicomFileContent, DicomNode, RtStructData};
+use crate::dicom::model::{DicomNode, RtStructData};
 use crate::dicom::parser::{
     open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, trailing_tags,
     FILE_CHANGED_ON_DISK,
@@ -14,6 +14,7 @@ use crate::dicom::parser::{
 use crate::dicom::previews::{restore_full_values, take_previews, FullValues, SEND_PREVIEWS};
 use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
+use crate::dicom::wire::WireFileContent;
 
 struct StoredDicomObject {
     full: Option<DefaultDicomObject>,
@@ -215,7 +216,7 @@ pub async fn take_launch_file_paths(
 pub async fn open_dicom_file(
     path: String,
     store: State<'_, DicomStore>,
-) -> Result<DicomFileContent, String> {
+) -> Result<WireFileContent, String> {
     // Taken before reading, so that a change made while reading is noticed on save.
     let stamp = file_stamp(&path);
     let started = std::time::Instant::now();
@@ -244,7 +245,7 @@ pub async fn open_dicom_file(
         .current_path
         .lock()
         .map_err(|_| "DICOM store lock poisoned".to_string())? = Some(path);
-    Ok(content)
+    Ok(WireFileContent(content))
 }
 
 #[tauri::command]

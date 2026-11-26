@@ -1,0 +1,1141 @@
+{
+  "about": "Written by `cargo test wire` with TAGLET_UPDATE_FIXTURES=1 (src-tauri/src/dicom/wire.rs); read by tests/openedFile.test.mjs.",
+  "cases": [
+    {
+      "name": "every shape",
+      "nodes": {
+        "file_meta": [
+          {
+            "description": "Description of (0002,0010)",
+            "editable": false,
+            "kind": "Element",
+            "length": 19,
+            "path": [
+              "FileMetaInformation",
+              "(0002,0010)"
+            ],
+            "tag": "(0002,0010)",
+            "value": "1.2.840.10008.1.2.1",
+            "vr": "UI"
+          },
+          {
+            "description": "Description of (0002,0013)",
+            "editable": true,
+            "kind": "Element",
+            "length": 28,
+            "path": [
+              "(0002,0013)"
+            ],
+            "tag": "(0002,0013)",
+            "value": "path not under the file meta",
+            "vr": "SH"
+          }
+        ],
+        "nodes": [
+          {
+            "description": "Description of (0008,0005)",
+            "editable": true,
+            "kind": "Element",
+            "length": 10,
+            "path": [
+              "(0008,0005)"
+            ],
+            "tag": "(0008,0005)",
+            "value": "ISO_IR 192",
+            "vr": "CS"
+          },
+          {
+            "description": "Description of (0010,0010)",
+            "editable": true,
+            "kind": "Element",
+            "length": 13,
+            "path": [
+              "(0010,0010)"
+            ],
+            "tag": "(0010,0010)",
+            "value": "山田^太郎",
+            "vr": "PN"
+          },
+          {
+            "description": "Description of (0019,1001)",
+            "editable": true,
+            "inferred_vr": "LO",
+            "kind": "Element",
+            "length": 3,
+            "path": [
+              "(0019,1001)"
+            ],
+            "tag": "(0019,1001)",
+            "value": "1\\2",
+            "vr": "UN"
+          },
+          {
+            "description": "Description of (0008,1030)",
+            "editable": true,
+            "full_value_key": "not/the/path",
+            "kind": "Element",
+            "length": 7,
+            "path": [
+              "(0008,1030)"
+            ],
+            "tag": "(0008,1030)",
+            "value": "preview",
+            "vr": "LO"
+          },
+          {
+            "description": "Description of unexpected",
+            "editable": true,
+            "kind": "Element",
+            "length": 16,
+            "path": [
+              "(0008,103E)",
+              "unexpected"
+            ],
+            "tag": "unexpected",
+            "value": "path not derived",
+            "vr": "LO"
+          },
+          {
+            "description": "Description of (3006,0039)",
+            "items": [
+              [
+                {
+                  "description": "Description of (3006,0084)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 1,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#0",
+                    "(3006,0084)"
+                  ],
+                  "tag": "(3006,0084)",
+                  "value": "1",
+                  "vr": "IS"
+                },
+                {
+                  "description": "Description of (3006,0040)",
+                  "items": [
+                    [
+                      {
+                        "description": "Description of (3006,0042)",
+                        "editable": true,
+                        "kind": "Element",
+                        "length": 13,
+                        "path": [
+                          "(3006,0039)",
+                          "Item#0",
+                          "(3006,0040)",
+                          "Item#0",
+                          "(3006,0042)"
+                        ],
+                        "tag": "(3006,0042)",
+                        "value": "CLOSED_PLANAR",
+                        "vr": "CS"
+                      },
+                      {
+                        "description": "Description of (3006,0050)",
+                        "editable": true,
+                        "full_value_key": "(3006,0039)/Item#0/(3006,0040)/Item#0/(3006,0050)",
+                        "kind": "Element",
+                        "length": 11,
+                        "path": [
+                          "(3006,0039)",
+                          "Item#0",
+                          "(3006,0040)",
+                          "Item#0",
+                          "(3006,0050)"
+                        ],
+                        "tag": "(3006,0050)",
+                        "value": "1.5\\2.5\\3.5",
+                        "vr": "DS"
+                      }
+                    ],
+                    [
+                      {
+                        "description": "Description of (3006,0050)",
+                        "editable": true,
+                        "full_value_key": "(3006,0039)/Item#0/(3006,0040)/Item#1/(3006,0050)",
+                        "kind": "Element",
+                        "length": 11,
+                        "path": [
+                          "(3006,0039)",
+                          "Item#0",
+                          "(3006,0040)",
+                          "Item#1",
+                          "(3006,0050)"
+                        ],
+                        "tag": "(3006,0050)",
+                        "value": "4.5\\5.5\\6.5",
+                        "vr": "DS"
+                      }
+                    ]
+                  ],
+                  "kind": "Sequence",
+                  "length": 4294967295,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#0",
+                    "(3006,0040)"
+                  ],
+                  "tag": "(3006,0040)"
+                }
+              ],
+              [],
+              [
+                {
+                  "description": "Description of (3006,0084)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 1,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#2",
+                    "(3006,0084)"
+                  ],
+                  "tag": "(3006,0084)",
+                  "value": "3",
+                  "vr": "IS"
+                },
+                {
+                  "description": "Description of (3006,0040)",
+                  "items": [],
+                  "kind": "Sequence",
+                  "length": 4294967295,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#2",
+                    "(3006,0040)"
+                  ],
+                  "tag": "(3006,0040)"
+                },
+                {
+                  "description": "Description of (3006,0085)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 5,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#1",
+                    "(3006,0085)"
+                  ],
+                  "tag": "(3006,0085)",
+                  "value": "moved",
+                  "vr": "SH"
+                }
+              ]
+            ],
+            "kind": "Sequence",
+            "length": 4294967295,
+            "path": [
+              "(3006,0039)"
+            ],
+            "tag": "(3006,0039)"
+          },
+          {
+            "description": "Description of (300A,00B0)",
+            "item_sources": [
+              2,
+              null
+            ],
+            "items": [
+              [
+                {
+                  "description": "Description of (300A,00C2)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 4,
+                  "path": [
+                    "(300A,00B0)",
+                    "Item#0",
+                    "(300A,00C2)"
+                  ],
+                  "tag": "(300A,00C2)",
+                  "value": "kept",
+                  "vr": "LO"
+                }
+              ],
+              [
+                {
+                  "description": "Description of (300A,00C2)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 5,
+                  "path": [
+                    "(300A,00B0)",
+                    "Item#1",
+                    "(300A,00C2)"
+                  ],
+                  "tag": "(300A,00C2)",
+                  "value": "added",
+                  "vr": "LO"
+                }
+              ]
+            ],
+            "kind": "Sequence",
+            "length": 4294967295,
+            "path": [
+              "(300A,00B0)"
+            ],
+            "tag": "(300A,00B0)"
+          },
+          {
+            "description": "Description of (7FE0,0010)",
+            "editable": true,
+            "kind": "Element",
+            "length": 13,
+            "path": [
+              "(7FE0,0010)"
+            ],
+            "tag": "(7FE0,0010)",
+            "value": "[Binary Data]",
+            "vr": "OW"
+          }
+        ],
+        "open_ms": 12.5,
+        "warnings": [
+          "A warning"
+        ]
+      },
+      "wire": {
+        "entries": [
+          [
+            "(0002,0010)",
+            "UI",
+            "Description of (0002,0010)"
+          ],
+          [
+            "(0002,0013)",
+            "SH",
+            "Description of (0002,0013)"
+          ],
+          [
+            "(0008,0005)",
+            "CS",
+            "Description of (0008,0005)"
+          ],
+          [
+            "(0010,0010)",
+            "PN",
+            "Description of (0010,0010)"
+          ],
+          [
+            "(0019,1001)",
+            "UN",
+            "Description of (0019,1001)"
+          ],
+          [
+            "(0008,1030)",
+            "LO",
+            "Description of (0008,1030)"
+          ],
+          [
+            "unexpected",
+            "LO",
+            "Description of unexpected"
+          ],
+          [
+            "(3006,0039)",
+            "",
+            "Description of (3006,0039)"
+          ],
+          [
+            "(3006,0084)",
+            "IS",
+            "Description of (3006,0084)"
+          ],
+          [
+            "(3006,0040)",
+            "",
+            "Description of (3006,0040)"
+          ],
+          [
+            "(3006,0042)",
+            "CS",
+            "Description of (3006,0042)"
+          ],
+          [
+            "(3006,0050)",
+            "DS",
+            "Description of (3006,0050)"
+          ],
+          [
+            "(3006,0085)",
+            "SH",
+            "Description of (3006,0085)"
+          ],
+          [
+            "(300A,00B0)",
+            "",
+            "Description of (300A,00B0)"
+          ],
+          [
+            "(300A,00C2)",
+            "LO",
+            "Description of (300A,00C2)"
+          ],
+          [
+            "(7FE0,0010)",
+            "OW",
+            "Description of (7FE0,0010)"
+          ]
+        ],
+        "file_meta": [
+          [
+            0,
+            0,
+            "1.2.840.10008.1.2.1",
+            19,
+            0
+          ],
+          [
+            0,
+            1,
+            "path not under the file meta",
+            28,
+            1,
+            {
+              "path": [
+                "(0002,0013)"
+              ]
+            }
+          ]
+        ],
+        "nodes": [
+          [
+            0,
+            2,
+            "ISO_IR 192",
+            10,
+            1
+          ],
+          [
+            0,
+            3,
+            "山田^太郎",
+            13,
+            1
+          ],
+          [
+            0,
+            4,
+            "1\\2",
+            3,
+            1,
+            {
+              "inferred_vr": "LO"
+            }
+          ],
+          [
+            0,
+            5,
+            "preview",
+            7,
+            1,
+            {
+              "full_value_key": "not/the/path"
+            }
+          ],
+          [
+            0,
+            6,
+            "path not derived",
+            16,
+            1,
+            {
+              "path": [
+                "(0008,103E)",
+                "unexpected"
+              ]
+            }
+          ],
+          [
+            1,
+            7,
+            4294967295,
+            [
+              [
+                [
+                  0,
+                  8,
+                  "1",
+                  1,
+                  1
+                ],
+                [
+                  1,
+                  9,
+                  4294967295,
+                  [
+                    [
+                      [
+                        0,
+                        10,
+                        "CLOSED_PLANAR",
+                        13,
+                        1
+                      ],
+                      [
+                        0,
+                        11,
+                        "1.5\\2.5\\3.5",
+                        11,
+                        3
+                      ]
+                    ],
+                    [
+                      [
+                        0,
+                        11,
+                        "4.5\\5.5\\6.5",
+                        11,
+                        3
+                      ]
+                    ]
+                  ]
+                ]
+              ],
+              [],
+              [
+                [
+                  0,
+                  8,
+                  "3",
+                  1,
+                  1
+                ],
+                [
+                  1,
+                  9,
+                  4294967295,
+                  []
+                ],
+                [
+                  0,
+                  12,
+                  "moved",
+                  5,
+                  1,
+                  {
+                    "path": [
+                      "(3006,0039)",
+                      "Item#1",
+                      "(3006,0085)"
+                    ]
+                  }
+                ]
+              ]
+            ]
+          ],
+          [
+            1,
+            13,
+            4294967295,
+            [
+              [
+                [
+                  0,
+                  14,
+                  "kept",
+                  4,
+                  1
+                ]
+              ],
+              [
+                [
+                  0,
+                  14,
+                  "added",
+                  5,
+                  1
+                ]
+              ]
+            ],
+            {
+              "item_sources": [
+                2,
+                null
+              ]
+            }
+          ],
+          [
+            0,
+            15,
+            "[Binary Data]",
+            13,
+            1
+          ]
+        ],
+        "open_ms": 12.5,
+        "warnings": [
+          "A warning"
+        ]
+      }
+    },
+    {
+      "name": "no timing or warnings",
+      "nodes": {
+        "file_meta": [
+          {
+            "description": "Description of (0002,0010)",
+            "editable": false,
+            "kind": "Element",
+            "length": 19,
+            "path": [
+              "FileMetaInformation",
+              "(0002,0010)"
+            ],
+            "tag": "(0002,0010)",
+            "value": "1.2.840.10008.1.2.1",
+            "vr": "UI"
+          },
+          {
+            "description": "Description of (0002,0013)",
+            "editable": true,
+            "kind": "Element",
+            "length": 28,
+            "path": [
+              "(0002,0013)"
+            ],
+            "tag": "(0002,0013)",
+            "value": "path not under the file meta",
+            "vr": "SH"
+          }
+        ],
+        "nodes": [
+          {
+            "description": "Description of (0008,0005)",
+            "editable": true,
+            "kind": "Element",
+            "length": 10,
+            "path": [
+              "(0008,0005)"
+            ],
+            "tag": "(0008,0005)",
+            "value": "ISO_IR 192",
+            "vr": "CS"
+          },
+          {
+            "description": "Description of (0010,0010)",
+            "editable": true,
+            "kind": "Element",
+            "length": 13,
+            "path": [
+              "(0010,0010)"
+            ],
+            "tag": "(0010,0010)",
+            "value": "山田^太郎",
+            "vr": "PN"
+          },
+          {
+            "description": "Description of (0019,1001)",
+            "editable": true,
+            "inferred_vr": "LO",
+            "kind": "Element",
+            "length": 3,
+            "path": [
+              "(0019,1001)"
+            ],
+            "tag": "(0019,1001)",
+            "value": "1\\2",
+            "vr": "UN"
+          },
+          {
+            "description": "Description of (0008,1030)",
+            "editable": true,
+            "full_value_key": "not/the/path",
+            "kind": "Element",
+            "length": 7,
+            "path": [
+              "(0008,1030)"
+            ],
+            "tag": "(0008,1030)",
+            "value": "preview",
+            "vr": "LO"
+          },
+          {
+            "description": "Description of unexpected",
+            "editable": true,
+            "kind": "Element",
+            "length": 16,
+            "path": [
+              "(0008,103E)",
+              "unexpected"
+            ],
+            "tag": "unexpected",
+            "value": "path not derived",
+            "vr": "LO"
+          },
+          {
+            "description": "Description of (3006,0039)",
+            "items": [
+              [
+                {
+                  "description": "Description of (3006,0084)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 1,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#0",
+                    "(3006,0084)"
+                  ],
+                  "tag": "(3006,0084)",
+                  "value": "1",
+                  "vr": "IS"
+                },
+                {
+                  "description": "Description of (3006,0040)",
+                  "items": [
+                    [
+                      {
+                        "description": "Description of (3006,0042)",
+                        "editable": true,
+                        "kind": "Element",
+                        "length": 13,
+                        "path": [
+                          "(3006,0039)",
+                          "Item#0",
+                          "(3006,0040)",
+                          "Item#0",
+                          "(3006,0042)"
+                        ],
+                        "tag": "(3006,0042)",
+                        "value": "CLOSED_PLANAR",
+                        "vr": "CS"
+                      },
+                      {
+                        "description": "Description of (3006,0050)",
+                        "editable": true,
+                        "full_value_key": "(3006,0039)/Item#0/(3006,0040)/Item#0/(3006,0050)",
+                        "kind": "Element",
+                        "length": 11,
+                        "path": [
+                          "(3006,0039)",
+                          "Item#0",
+                          "(3006,0040)",
+                          "Item#0",
+                          "(3006,0050)"
+                        ],
+                        "tag": "(3006,0050)",
+                        "value": "1.5\\2.5\\3.5",
+                        "vr": "DS"
+                      }
+                    ],
+                    [
+                      {
+                        "description": "Description of (3006,0050)",
+                        "editable": true,
+                        "full_value_key": "(3006,0039)/Item#0/(3006,0040)/Item#1/(3006,0050)",
+                        "kind": "Element",
+                        "length": 11,
+                        "path": [
+                          "(3006,0039)",
+                          "Item#0",
+                          "(3006,0040)",
+                          "Item#1",
+                          "(3006,0050)"
+                        ],
+                        "tag": "(3006,0050)",
+                        "value": "4.5\\5.5\\6.5",
+                        "vr": "DS"
+                      }
+                    ]
+                  ],
+                  "kind": "Sequence",
+                  "length": 4294967295,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#0",
+                    "(3006,0040)"
+                  ],
+                  "tag": "(3006,0040)"
+                }
+              ],
+              [],
+              [
+                {
+                  "description": "Description of (3006,0084)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 1,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#2",
+                    "(3006,0084)"
+                  ],
+                  "tag": "(3006,0084)",
+                  "value": "3",
+                  "vr": "IS"
+                },
+                {
+                  "description": "Description of (3006,0040)",
+                  "items": [],
+                  "kind": "Sequence",
+                  "length": 4294967295,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#2",
+                    "(3006,0040)"
+                  ],
+                  "tag": "(3006,0040)"
+                },
+                {
+                  "description": "Description of (3006,0085)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 5,
+                  "path": [
+                    "(3006,0039)",
+                    "Item#1",
+                    "(3006,0085)"
+                  ],
+                  "tag": "(3006,0085)",
+                  "value": "moved",
+                  "vr": "SH"
+                }
+              ]
+            ],
+            "kind": "Sequence",
+            "length": 4294967295,
+            "path": [
+              "(3006,0039)"
+            ],
+            "tag": "(3006,0039)"
+          },
+          {
+            "description": "Description of (300A,00B0)",
+            "item_sources": [
+              2,
+              null
+            ],
+            "items": [
+              [
+                {
+                  "description": "Description of (300A,00C2)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 4,
+                  "path": [
+                    "(300A,00B0)",
+                    "Item#0",
+                    "(300A,00C2)"
+                  ],
+                  "tag": "(300A,00C2)",
+                  "value": "kept",
+                  "vr": "LO"
+                }
+              ],
+              [
+                {
+                  "description": "Description of (300A,00C2)",
+                  "editable": true,
+                  "kind": "Element",
+                  "length": 5,
+                  "path": [
+                    "(300A,00B0)",
+                    "Item#1",
+                    "(300A,00C2)"
+                  ],
+                  "tag": "(300A,00C2)",
+                  "value": "added",
+                  "vr": "LO"
+                }
+              ]
+            ],
+            "kind": "Sequence",
+            "length": 4294967295,
+            "path": [
+              "(300A,00B0)"
+            ],
+            "tag": "(300A,00B0)"
+          },
+          {
+            "description": "Description of (7FE0,0010)",
+            "editable": true,
+            "kind": "Element",
+            "length": 13,
+            "path": [
+              "(7FE0,0010)"
+            ],
+            "tag": "(7FE0,0010)",
+            "value": "[Binary Data]",
+            "vr": "OW"
+          }
+        ],
+        "warnings": []
+      },
+      "wire": {
+        "entries": [
+          [
+            "(0002,0010)",
+            "UI",
+            "Description of (0002,0010)"
+          ],
+          [
+            "(0002,0013)",
+            "SH",
+            "Description of (0002,0013)"
+          ],
+          [
+            "(0008,0005)",
+            "CS",
+            "Description of (0008,0005)"
+          ],
+          [
+            "(0010,0010)",
+            "PN",
+            "Description of (0010,0010)"
+          ],
+          [
+            "(0019,1001)",
+            "UN",
+            "Description of (0019,1001)"
+          ],
+          [
+            "(0008,1030)",
+            "LO",
+            "Description of (0008,1030)"
+          ],
+          [
+            "unexpected",
+            "LO",
+            "Description of unexpected"
+          ],
+          [
+            "(3006,0039)",
+            "",
+            "Description of (3006,0039)"
+          ],
+          [
+            "(3006,0084)",
+            "IS",
+            "Description of (3006,0084)"
+          ],
+          [
+            "(3006,0040)",
+            "",
+            "Description of (3006,0040)"
+          ],
+          [
+            "(3006,0042)",
+            "CS",
+            "Description of (3006,0042)"
+          ],
+          [
+            "(3006,0050)",
+            "DS",
+            "Description of (3006,0050)"
+          ],
+          [
+            "(3006,0085)",
+            "SH",
+            "Description of (3006,0085)"
+          ],
+          [
+            "(300A,00B0)",
+            "",
+            "Description of (300A,00B0)"
+          ],
+          [
+            "(300A,00C2)",
+            "LO",
+            "Description of (300A,00C2)"
+          ],
+          [
+            "(7FE0,0010)",
+            "OW",
+            "Description of (7FE0,0010)"
+          ]
+        ],
+        "file_meta": [
+          [
+            0,
+            0,
+            "1.2.840.10008.1.2.1",
+            19,
+            0
+          ],
+          [
+            0,
+            1,
+            "path not under the file meta",
+            28,
+            1,
+            {
+              "path": [
+                "(0002,0013)"
+              ]
+            }
+          ]
+        ],
+        "nodes": [
+          [
+            0,
+            2,
+            "ISO_IR 192",
+            10,
+            1
+          ],
+          [
+            0,
+            3,
+            "山田^太郎",
+            13,
+            1
+          ],
+          [
+            0,
+            4,
+            "1\\2",
+            3,
+            1,
+            {
+              "inferred_vr": "LO"
+            }
+          ],
+          [
+            0,
+            5,
+            "preview",
+            7,
+            1,
+            {
+              "full_value_key": "not/the/path"
+            }
+          ],
+          [
+            0,
+            6,
+            "path not derived",
+            16,
+            1,
+            {
+              "path": [
+                "(0008,103E)",
+                "unexpected"
+              ]
+            }
+          ],
+          [
+            1,
+            7,
+            4294967295,
+            [
+              [
+                [
+                  0,
+                  8,
+                  "1",
+                  1,
+                  1
+                ],
+                [
+                  1,
+                  9,
+                  4294967295,
+                  [
+                    [
+                      [
+                        0,
+                        10,
+                        "CLOSED_PLANAR",
+                        13,
+                        1
+                      ],
+                      [
+                        0,
+                        11,
+                        "1.5\\2.5\\3.5",
+                        11,
+                        3
+                      ]
+                    ],
+                    [
+                      [
+                        0,
+                        11,
+                        "4.5\\5.5\\6.5",
+                        11,
+                        3
+                      ]
+                    ]
+                  ]
+                ]
+              ],
+              [],
+              [
+                [
+                  0,
+                  8,
+                  "3",
+                  1,
+                  1
+                ],
+                [
+                  1,
+                  9,
+                  4294967295,
+                  []
+                ],
+                [
+                  0,
+                  12,
+                  "moved",
+                  5,
+                  1,
+                  {
+                    "path": [
+                      "(3006,0039)",
+                      "Item#1",
+                      "(3006,0085)"
+                    ]
+                  }
+                ]
+              ]
+            ]
+          ],
+          [
+            1,
+            13,
+            4294967295,
+            [
+              [
+                [
+                  0,
+                  14,
+                  "kept",
+                  4,
+                  1
+                ]
+              ],
+              [
+                [
+                  0,
+                  14,
+                  "added",
+                  5,
+                  1
+                ]
+              ]
+            ],
+            {
+              "item_sources": [
+                2,
+                null
+              ]
+            }
+          ],
+          [
+            0,
+            15,
+            "[Binary Data]",
+            13,
+            1
+          ]
+        ],
+        "warnings": []
+      }
+    }
+  ]
+}

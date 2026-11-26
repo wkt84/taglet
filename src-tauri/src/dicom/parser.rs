@@ -8954,4 +8954,115 @@ mod tests {
         assert!(contains(&edited, contour.as_bytes()));
         assert!(contains(&edited, b"Suzuki^Hanako"));
     }
+
+    /// An RT Structure Set with one ROI of `contours` contours of `points` points, each
+    /// with a contour image (as RT Structure Sets have).
+    fn write_rtstruct_with_contours(
+        name: &str,
+        points: usize,
+        contours: usize,
+    ) -> std::path::PathBuf {
+        let mut point = 0_u32;
+        let contour_items = (0..contours)
+            .map(|_| {
+                let values = (0..points * 3)
+                    .map(|_| {
+                        point += 1;
+                        format!("{:.3}", f64::from(point % 100_000) * 0.137)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\\");
+                let image = [
+                    explicit_element(0x0008, 0x1150, b"UI", b"1.2.840.10008.5.1.4.1.1.2"),
+                    explicit_element(
+                        0x0008,
+                        0x1155,
+                        b"UI",
+                        b"1.2.392.200036.9116.2.6.1.48.1214833767.1234567890.123456",
+                    ),
+                ]
+                .concat();
+                [
+                    sequence(0x3006, 0x0016, &[image], true),
+                    explicit_element(0x3006, 0x0042, b"CS", b"CLOSED_PLANAR"),
+                    explicit_element(0x3006, 0x0046, b"IS", points.to_string().as_bytes()),
+                    explicit_element(0x3006, 0x0050, b"DS", values.as_bytes()),
+                ]
+                .concat()
+            })
+            .collect::<Vec<_>>();
+        let roi = [
+            explicit_element(0x3006, 0x0084, b"IS", b"1"),
+            sequence(0x3006, 0x0040, &contour_items, true),
+        ]
+        .concat();
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+            sequence(0x3006, 0x0039, &[roi], true),
+        ]
+        .concat();
+        let path = temp_path(name);
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        path
+    }
+
+    /// Opened files send no paths and no preview keys (`wire`): the page rebuilds them
+    /// all, for the data set and the file meta information.
+    #[test]
+    fn opened_files_send_no_paths_or_keys() {
+        use crate::dicom::previews::{take_previews, FullValues};
+        use crate::dicom::wire::WireFileContent;
+        let path = write_rtstruct_with_contours("wire-paths.dcm", 120, 3);
+        let mut content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut full_values = FullValues::new();
+        take_previews(&mut content.nodes, &mut full_values);
+        assert_eq!(full_values.len(), 3);
+        assert!(!content.file_meta.is_empty());
+        let wire = serde_json::to_string(&WireFileContent(content)).unwrap();
+        assert!(!wire.contains("\"path\""), "{wire}");
+        assert!(!wire.contains("full_value_key"), "{wire}");
+        assert!(!wire.contains("Item#"), "{wire}");
+    }
+
+    /// The size of what is sent when opening, and how long making it takes, as JSON
+    /// objects and in `wire`'s form, for RT Structure Sets with many short contours
+    /// (#20). Run with `cargo test --release --lib wire_size -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn wire_size() {
+        use crate::dicom::previews::{take_previews, FullValues};
+        use crate::dicom::wire::WireFileContent;
+        for (points, contours) in [(25, 6000), (40, 4000), (120, 1200)] {
+            let path = write_rtstruct_with_contours("wire-size.dcm", points, contours);
+            let size = std::fs::metadata(&path).unwrap().len();
+            let mut content = open_nodes(path.to_str().unwrap()).unwrap();
+            std::fs::remove_file(&path).ok();
+            let mut full_values = FullValues::new();
+            take_previews(&mut content.nodes, &mut full_values);
+            let time = |run: &mut dyn FnMut() -> usize| {
+                let mut best = (f64::MAX, 0);
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    let length = run();
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if ms < best.0 {
+                        best = (ms, length);
+                    }
+                }
+                best
+            };
+            let (objects_ms, objects) =
+                time(&mut || serde_json::to_string(&content).unwrap().len());
+            let wire_content = WireFileContent(content.clone());
+            let (wire_ms, wire) = time(&mut || serde_json::to_string(&wire_content).unwrap().len());
+            println!(
+                "{points:>3} points x {contours:>4} contours, file {:.1} MB: objects {:.1} MB ({objects_ms:.1} ms), wire {:.1} MB ({wire_ms:.1} ms)",
+                size as f64 / 1e6,
+                objects as f64 / 1e6,
+                wire as f64 / 1e6,
+            );
+        }
+    }
 }
