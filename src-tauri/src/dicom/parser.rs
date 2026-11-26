@@ -8910,7 +8910,7 @@ mod tests {
     /// unchanged, and keeps the whole values when other elements are edited.
     #[test]
     fn previews_come_back_whole_when_saving() {
-        use crate::dicom::previews::{take_previews, with_full_values, FullValues};
+        use crate::dicom::previews::{restore_full_values, take_previews, FullValues};
         let path = temp_path("previews-save.dcm");
         let contour = (0..400)
             .map(|index| format!("{index}.5"))
@@ -8939,9 +8939,14 @@ mod tests {
         take_previews(&mut nodes, &mut full_values);
         assert_eq!(full_values.len(), 1);
 
-        let unchanged = save_file(&path, &with_full_values(&nodes, &full_values).unwrap());
+        let restored = |nodes: &[DicomNode]| {
+            let mut nodes = nodes.to_vec();
+            restore_full_values(&mut nodes, &full_values).unwrap();
+            nodes
+        };
+        let unchanged = save_file(&path, &restored(&nodes));
         set_value(&mut nodes, &["(0010,0010)"], "Suzuki^Hanako");
-        let edited = save_file(&path, &with_full_values(&nodes, &full_values).unwrap());
+        let edited = save_file(&path, &restored(&nodes));
         std::fs::remove_file(&path).ok();
 
         assert_eq!(unchanged.unwrap(), original);

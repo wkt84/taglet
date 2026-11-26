@@ -11,7 +11,7 @@ use crate::dicom::parser::{
     open_full_object, open_nodes, rt_struct_data, save_file_with_nodes, trailing_tags,
     FILE_CHANGED_ON_DISK,
 };
-use crate::dicom::previews::{take_previews, with_full_values, FullValues, SEND_PREVIEWS};
+use crate::dicom::previews::{restore_full_values, take_previews, FullValues, SEND_PREVIEWS};
 use crate::dicom::splice::file_stamp;
 use crate::dicom::text_values::TextValues;
 
@@ -274,7 +274,7 @@ pub async fn save_dicom_file_as(
 fn save_to_path(
     source_path: String,
     destination_path: String,
-    nodes: Vec<DicomNode>,
+    mut nodes: Vec<DicomNode>,
     store: State<'_, DicomStore>,
 ) -> Result<(), String> {
     // The shown nodes come from the file as it was opened (or last saved). If another
@@ -311,7 +311,7 @@ fn save_to_path(
     }
     let hidden_trailing = stored.hidden_trailing.clone();
     // Never a preview instead of its value (see `previews`).
-    let nodes = with_full_values(&nodes, &stored.full_values)?;
+    restore_full_values(&mut nodes, &stored.full_values)?;
     let object = stored
         .full
         .as_mut()

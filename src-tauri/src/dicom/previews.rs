@@ -62,22 +62,25 @@ pub fn take_previews(nodes: &mut [DicomNode], full_values: &mut FullValues) {
     }
 }
 
-/// The nodes with whole values in place of previews, for saving. Fails, so that the
-/// save does not happen, when a node with a key holds anything but the preview of the
-/// value kept under it, or the key is unknown.
-pub fn with_full_values(
-    nodes: &[DicomNode],
+/// Put the whole values back in place of previews, for saving, in place (the nodes of
+/// a large file are not copied). Fails, so that the save does not happen, when a node
+/// with a key holds anything but the preview of the value kept under it, or the key is
+/// unknown.
+pub fn restore_full_values(
+    nodes: &mut [DicomNode],
     full_values: &FullValues,
-) -> Result<Vec<DicomNode>, String> {
-    nodes
-        .iter()
-        .map(|node| match node {
+) -> Result<(), String> {
+    for node in nodes {
+        match node {
             DicomNode::Element {
                 value,
                 path,
-                full_value_key: Some(key),
+                full_value_key,
                 ..
             } => {
+                let Some(key) = full_value_key.as_ref() else {
+                    continue;
+                };
                 let shown = path.join(" / ");
                 let full = full_values.get(key).ok_or_else(|| {
                     format!("Cannot save: the whole value of {shown} is no longer available. Open the file again.")
@@ -87,39 +90,17 @@ pub fn with_full_values(
                         "Cannot save: {shown} holds only the start of its value, which was changed. Open the file again and edit the whole value."
                     ));
                 }
-                let mut node = node.clone();
-                if let DicomNode::Element {
-                    value,
-                    full_value_key,
-                    ..
-                } = &mut node
-                {
-                    value.clone_from(full);
-                    *full_value_key = None;
-                }
-                Ok(node)
+                value.clone_from(full);
+                *full_value_key = None;
             }
-            DicomNode::Element { .. } => Ok(node.clone()),
-            DicomNode::Sequence {
-                tag,
-                description,
-                length,
-                path,
-                items,
-                item_sources,
-            } => Ok(DicomNode::Sequence {
-                tag: tag.clone(),
-                description: description.clone(),
-                length: *length,
-                path: path.clone(),
-                items: items
-                    .iter()
-                    .map(|item| with_full_values(item, full_values))
-                    .collect::<Result<_, _>>()?,
-                item_sources: item_sources.clone(),
-            }),
-        })
-        .collect()
+            DicomNode::Sequence { items, .. } => {
+                for item in items {
+                    restore_full_values(item, full_values)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -208,7 +189,8 @@ mod tests {
         assert_eq!(full_values.len(), 2);
         assert!(has_previews(&nodes));
 
-        let saved = with_full_values(&nodes, &full_values).unwrap();
+        let mut saved = nodes.clone();
+        restore_full_values(&mut saved, &full_values).unwrap();
         assert_eq!(value_of(&saved[1]), (japanese.as_str(), None));
         assert_eq!(value_of(&items_of(&saved[2])[0][0]), (long.as_str(), None));
         assert!(!has_previews(&saved));
@@ -229,7 +211,7 @@ mod tests {
         if let DicomNode::Element { value, .. } = &mut nodes[0] {
             value.push('9');
         }
-        let error = with_full_values(&nodes, &full_values).unwrap_err();
+        let error = restore_full_values(&mut nodes, &full_values).unwrap_err();
         assert!(error.contains("holds only the start"), "{error}");
     }
 
@@ -249,7 +231,8 @@ mod tests {
             *value = "2.5".to_string();
             *full_value_key = None;
         }
-        let saved = with_full_values(&nodes, &full_values).unwrap();
+        let mut saved = nodes.clone();
+        restore_full_values(&mut saved, &full_values).unwrap();
         assert_eq!(value_of(&saved[0]), ("2.5", None));
     }
 
@@ -281,7 +264,8 @@ mod tests {
                 path[1] = "Item#0".to_string();
             }
         }
-        let saved = with_full_values(&nodes, &full_values).unwrap();
+        let mut saved = nodes.clone();
+        restore_full_values(&mut saved, &full_values).unwrap();
         assert_eq!(value_of(&items_of(&saved[0])[0][0]).0, second);
     }
 
@@ -291,7 +275,7 @@ mod tests {
         let mut nodes = vec![element(&["(3006,0050)"], &"1\\".repeat(600))];
         let mut full_values = FullValues::new();
         take_previews(&mut nodes, &mut full_values);
-        let error = with_full_values(&nodes, &FullValues::new()).unwrap_err();
+        let error = restore_full_values(&mut nodes, &FullValues::new()).unwrap_err();
         assert!(error.contains("no longer available"), "{error}");
     }
 }
