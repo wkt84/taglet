@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use super::model::DicomNode;
 
-/// Whether long values are sent as previews. Off until the page handles previews.
-pub const SEND_PREVIEWS: bool = false;
+/// Whether long values are sent as previews.
+pub const SEND_PREVIEWS: bool = true;
 
 /// Values longer than this many characters are sent as previews.
 pub const PREVIEW_ABOVE_CHARS: usize = 1000;
