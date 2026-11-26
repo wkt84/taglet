@@ -660,7 +660,7 @@ impl SpliceWriter<'_> {
         let edits = self.edits;
         let insertions = sorted_insertions(edits, parent);
         let mut pending = insertions.into_iter().peekable();
-        for node in nodes {
+        for (position, node) in nodes.iter().enumerate() {
             while let Some((_, element)) = pending.next_if(|(tag, _)| *tag < node.tag()) {
                 self.write(element)?;
             }
@@ -677,11 +677,12 @@ impl SpliceWriter<'_> {
             {
                 if tag.element() == 0x0000 && self.group_touched(nodes, parent, tag.group()) {
                     // Group length (gggg,0000), a UL value after an 8-byte header in
-                    // either VR encoding.
-                    if end - start != 12 {
+                    // either VR encoding. Others are left to the full writer by the
+                    // caller (see `is_plain_group_length`).
+                    if !is_plain_group_length(node) {
                         return Err(format!("Unexpected group length element {tag}"));
                     }
-                    let length = self.group_length(nodes, parent, tag.group())?;
+                    let length = self.group_length(&nodes[position + 1..], parent, tag.group())?;
                     self.copy(*start, end - 4)?;
                     self.write(&length.to_le_bytes())?;
                     continue;
@@ -772,7 +773,8 @@ impl SpliceWriter<'_> {
             .any(|(tag, _)| tag.group() == group)
     }
 
-    /// The length of the elements of `group` after its group length, as written.
+    /// The length of the elements of `group` among `nodes` (those after its group
+    /// length, in file order) and the ones inserted, as written.
     fn group_length(
         &self,
         nodes: &[IndexNode],
@@ -871,6 +873,13 @@ impl SpliceWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.out.write_all(bytes).map_err(|error| error.to_string())
     }
+}
+
+/// Whether a group length element (gggg,0000) is a 4-byte UL value, which splicing
+/// can update in place.
+pub fn is_plain_group_length(node: &IndexNode) -> bool {
+    matches!(node, IndexNode::Element { tag, vr: Some(VR::UL), start, end, .. }
+        if tag.element() == 0x0000 && end - start == 12)
 }
 
 /// A defined length, which cannot be 0xFFFFFFFF (reserved for undefined length).

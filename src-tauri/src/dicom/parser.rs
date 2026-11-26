@@ -997,6 +997,11 @@ fn plan_splice(
     // removing one, or removing a SOP UID, is left to the full writer, as before.
     // (Changed SOP UIDs are written to the file meta information too, and a changed
     // Specific Character Set is handled below, by converting the text it applies to.)
+    // Group lengths that are not plain 4-byte UL values cannot be updated in place.
+    let changes_anything = !edited.is_empty() || !diff.added.is_empty() || !diff.removed.is_empty();
+    if changes_anything && has_irregular_group_length(index.nodes()) {
+        return Ok(None);
+    }
     let sop_uid_paths = [
         vec![format_tag(tags::SOP_CLASS_UID)],
         vec![format_tag(tags::SOP_INSTANCE_UID)],
@@ -1855,6 +1860,20 @@ fn collect_edited_paths(
         }
     }
     Ok(())
+}
+
+/// Whether the index has a group length element (gggg,0000) that is not a plain
+/// 4-byte UL value (see `splice::is_plain_group_length`).
+fn has_irregular_group_length(nodes: &[splice::IndexNode]) -> bool {
+    nodes.iter().any(|node| match node {
+        splice::IndexNode::Element { tag, .. } => {
+            tag.element() == 0x0000 && !splice::is_plain_group_length(node)
+        }
+        splice::IndexNode::Sequence { items, .. } => items
+            .iter()
+            .any(|item| has_irregular_group_length(item.nodes())),
+        splice::IndexNode::Opaque { .. } => false,
+    })
 }
 
 /// The VR of the plain element at `path` in the index.
@@ -6367,6 +6386,65 @@ mod tests {
         let wrong = wrong_group_lengths(&saved.unwrap());
         assert_eq!(wrong.len(), 1);
         assert!(wrong[0].starts_with("(0008,0000) = 0"), "{wrong:?}");
+    }
+
+    /// Group lengths that are not 4-byte UL values (here a zero-length OB, whose
+    /// header would otherwise be mistaken for a UL value) are left to the full writer.
+    #[test]
+    fn irregular_group_lengths_are_not_spliced() {
+        let path = temp_path("group-length-irregular.dcm");
+        let mut ob = Vec::new();
+        ob.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+        ob.extend_from_slice(b"OB\0\0");
+        ob.extend_from_slice(&0_u32.to_le_bytes());
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            ob,
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+    }
+
+    /// In a file with tags out of order, a group length only counts the elements of
+    /// its group that follow it.
+    #[test]
+    fn group_lengths_count_the_elements_after_them() {
+        let path = temp_path("group-length-unordered.dcm");
+        let before = explicit_element(0x0010, 0x0030, b"DA", b"19700101");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            before.clone(),
+            with_group_length(
+                0x0010,
+                &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+                true,
+            ),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let expected = explicit_element(0x0010, 0x0020, b"LO", b"ID-00002").len() as u32;
+        let group_length = [0x10, 0x00, 0x00, 0x00, b'U', b'L', 4, 0];
+        let at = saved
+            .windows(8)
+            .position(|window| window == group_length)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(saved[at + 8..at + 12].try_into().unwrap()),
+            expected
+        );
     }
 
     // ---- Changing SOP UIDs by splicing (#8) ----
