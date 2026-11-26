@@ -1,13 +1,15 @@
 import { useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { DICOM_TAG_OPTIONS, DicomTagOption } from '../data/dicomTags'
-import type { DicomElement } from '../types/dicom'
+import type { DicomNode } from '../types/dicom'
 import { isPrivateTag } from '../data/privateTags'
 
 type Props = {
   existingTags: string[]
   targetLabel: string
-  onAdd: (node: DicomElement) => void
+  /** Whether tags are added to the data set itself (not to a sequence item). */
+  rootTarget: boolean
+  onAdd: (node: DicomNode) => void
   onClose: () => void
 }
 
@@ -37,7 +39,7 @@ function normalizeTag(input: string) {
   return match ? `(${match[1]},${match[2]})` : undefined
 }
 
-export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose }: Props) {
+export default function AddTagDialog({ existingTags, targetLabel, rootTarget, onAdd, onClose }: Props) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<DicomTagOption>(DICOM_TAG_OPTIONS[0])
   const [customTag, setCustomTag] = useState('')
@@ -54,7 +56,11 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
   }, [query])
 
   const isDuplicate = existingTags.includes(selected.tag)
-  const isSupported = EDITABLE_TEXT_VRS.has(selected.vr)
+  const isSequence = selected.vr === 'SQ'
+  // Files are read up to Pixel Data, so sequences cannot be added from its tag on in the
+  // data set itself.
+  const afterPixelData = rootTarget && selected.tag >= '(7FE0,0010)'
+  const isSupported = isSequence ? !afterPixelData : EDITABLE_TEXT_VRS.has(selected.vr)
 
   async function lookupCustomTag() {
     setError(undefined)
@@ -84,8 +90,27 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
       setError(`${selected.tag} already exists at the root level.`)
       return
     }
+    if (isSequence && afterPixelData) {
+      setError('Sequences cannot be added at or after Pixel Data (7FE0,0010) in the data set.')
+      return
+    }
     if (!isSupported) {
-      setError(`${selected.vr} is visible in the dictionary, but Add Tag currently supports text VRs only.`)
+      setError(`${selected.vr} is visible in the dictionary, but Add Tag currently supports text VRs and sequences only.`)
+      return
+    }
+
+    const description = selected.description || (isPrivateTag(selected.tag) ? '[Private]' : '[Unknown]')
+    if (isSequence) {
+      // An empty sequence; add items to it with Add Item.
+      onAdd({
+        kind: 'Sequence',
+        tag: selected.tag,
+        description,
+        length: 0,
+        path: [selected.tag],
+        items: [],
+        item_sources: [],
+      })
       return
     }
 
@@ -93,7 +118,7 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
       kind: 'Element',
       tag: selected.tag,
       vr: selected.vr,
-      description: selected.description || (isPrivateTag(selected.tag) ? '[Private]' : '[Unknown]'),
+      description,
       value,
       length: value.length,
       path: [selected.tag],
@@ -154,14 +179,20 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
               </div>
             </div>
 
-            <label className="block text-sm">
-              Initial Value
-              <input
-                className="mt-1 w-full rounded border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-300"
-                value={value}
-                onChange={(event) => setValue(event.target.value)}
-              />
-            </label>
+            {isSequence ? (
+              <div className="rounded bg-slate-100 p-2 text-sm text-slate-600">
+                Adds an empty sequence. Select it and use Add Item to add items.
+              </div>
+            ) : (
+              <label className="block text-sm">
+                Initial Value
+                <input
+                  className="mt-1 w-full rounded border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-300"
+                  value={value}
+                  onChange={(event) => setValue(event.target.value)}
+                />
+              </label>
+            )}
 
             <div className="rounded border border-slate-200 p-3">
               <label className="block text-sm">
@@ -181,7 +212,11 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
             {error ? <div className="rounded bg-red-50 p-2 text-sm text-red-700">{error}</div> : null}
             {isDuplicate ? <div className="rounded bg-amber-50 p-2 text-sm text-amber-800">Already exists.</div> : null}
             {!isSupported ? (
-              <div className="rounded bg-slate-100 p-2 text-sm text-slate-600">This VR is not addable yet.</div>
+              <div className="rounded bg-slate-100 p-2 text-sm text-slate-600">
+                {isSequence
+                  ? 'Sequences cannot be added at or after Pixel Data (7FE0,0010) in the data set.'
+                  : 'This VR is not addable yet.'}
+              </div>
             ) : null}
 
             <button

@@ -833,7 +833,7 @@ fn pixel_representation_changes(
                 let obj_items = sequence_items(obj, parse_tag(tag)?).unwrap_or_default();
                 // Items removed may carry a Pixel Representation.
                 let kept = (0..items.len())
-                    .map(|index| item_source(item_sources, index))
+                    .filter_map(|index| item_source(item_sources, index))
                     .collect::<HashSet<_>>();
                 if obj_items.iter().enumerate().any(|(index, item)| {
                     !kept.contains(&index) && item.get(tags::PIXEL_REPRESENTATION).is_some()
@@ -915,7 +915,7 @@ fn ensure_vrs_match_dictionary_in(
                 if !allowed.contains(&vr) {
                     return Err(format!(
                         "Cannot save: {} has VR {vr}, but Implicit VR files do not store VRs and readers take it as {}{reason}.",
-                        path.join(" / "),
+                        shown_path(path),
                         allowed
                             .iter()
                             .map(|vr| vr.to_string())
@@ -941,7 +941,7 @@ fn ensure_vrs_match_dictionary_in(
                 {
                     return Err(format!(
                         "Cannot save: {} is a sequence, but Implicit VR files do not store VRs and readers take it as {}.",
-                        path.join(" / "),
+                        shown_path(path),
                         dictionary_vr.relaxed()
                     ));
                 }
@@ -999,7 +999,11 @@ fn plan_splice(
     // (Changed SOP UIDs are written to the file meta information too, and a changed
     // Specific Character Set is handled below, by converting the text it applies to.)
     // Group lengths that are not plain 4-byte UL values cannot be updated in place.
-    let changes_anything = !edited.is_empty() || !diff.added.is_empty() || !diff.removed.is_empty();
+    let changes_anything = !edited.is_empty()
+        || !diff.added.is_empty()
+        || !diff.removed.is_empty()
+        || !diff.added_sequences.is_empty()
+        || !diff.added_items.is_empty();
     if changes_anything && has_irregular_group_length(index.nodes()) {
         return Ok(None);
     }
@@ -1032,7 +1036,7 @@ fn plan_splice(
     // inserted in tag order, so files whose tags are not in order go to the full
     // writer when elements are added.
     if diff.added.iter().any(|path| !edited.contains(path))
-        || (!diff.added.is_empty() && !index.is_ordered())
+        || ((!diff.added.is_empty() || !diff.added_sequences.is_empty()) && !index.is_ordered())
     {
         return Ok(None);
     }
@@ -1044,7 +1048,12 @@ fn plan_splice(
     node_declarations(nodes, &[], "", &mut new_declarations)?;
     let mut converted = HashMap::new();
     for (container, declaration) in &new_declarations {
-        let old = old_declarations.get(container);
+        // Added items and sequences have no text to convert; their own declarations
+        // are checked where they are written (see `encode_new_item`).
+        let Some(old) = old_declarations.get(container) else {
+            continue;
+        };
+        let old = Some(old);
         // Declarations Taglet cannot write text in are left to the full writer, as
         // before, also when they read like the old one (e.g. an unknown spelling, read
         // as the default repertoire like no declaration).
@@ -1149,6 +1158,67 @@ fn plan_splice(
             _ => return Ok(None),
         }
     }
+    // Sequences and items added: written whole, their text in the character set in
+    // effect where they go.
+    let explicit = index.is_explicit();
+    for path in &diff.added_sequences {
+        let (parent, last) = path.split_at(path.len() - 1);
+        let tag = parse_tag(&last[0])?;
+        if parent.is_empty() && tag >= PIXEL_DATA {
+            return Ok(None);
+        }
+        let Some(DicomNode::Sequence {
+            items,
+            item_sources,
+            ..
+        }) = node_at(nodes, path)
+        else {
+            return Ok(None);
+        };
+        let Some(bytes) = encode_new_sequence(
+            tag,
+            path,
+            items,
+            item_sources,
+            &new_declarations,
+            explicit,
+            &mut failures,
+        )?
+        else {
+            return Ok(None);
+        };
+        edits
+            .insertions
+            .entry(parent.to_vec())
+            .or_default()
+            .push((tag, bytes));
+    }
+    for path in &diff.added_items {
+        let Some(DicomNode::Sequence {
+            items,
+            item_sources,
+            ..
+        }) = node_at(nodes, path)
+        else {
+            return Ok(None);
+        };
+        for (index, item) in items.iter().enumerate() {
+            if item_source(item_sources, index).is_some() {
+                continue;
+            }
+            let item_path = child_path(path, &item_segment(item_sources, index));
+            let Some(bytes) =
+                encode_new_item(item, &item_path, &new_declarations, explicit, &mut failures)?
+            else {
+                return Ok(None);
+            };
+            edits
+                .appended_items
+                .entry(path.clone())
+                .or_default()
+                .push(bytes);
+        }
+    }
     let mut conversion_failures = Vec::new();
     if !converted.is_empty() {
         match convert_text(
@@ -1183,6 +1253,143 @@ fn plan_splice(
     }
     edits.removals = diff.removed;
     Ok(Some((index, edits)))
+}
+
+/// A node path as shown in messages: added items (`Item#new3`, see `item_segment`)
+/// are numbered by their position, like the others.
+fn shown_path(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| match segment.strip_prefix("Item#new") {
+            Some(position) => format!("Item#{position} (new)"),
+            None => segment.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// The node at `path`.
+fn node_at<'a>(nodes: &'a [DicomNode], path: &[String]) -> Option<&'a DicomNode> {
+    nodes.iter().find_map(|node| {
+        let (DicomNode::Element {
+            path: node_path, ..
+        }
+        | DicomNode::Sequence {
+            path: node_path, ..
+        }) = node;
+        if node_path == path {
+            return Some(node);
+        }
+        match node {
+            DicomNode::Sequence { items, .. } if path.starts_with(node_path) => {
+                items.iter().find_map(|item| node_at(item, path))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Encode a sequence added by the nodes, of undefined length, with its items.
+/// `Ok(None)` when it holds something splicing cannot write (an element of a VR other
+/// than text, or a character set Taglet cannot write text in); values that cannot be
+/// written are added to `failures`.
+fn encode_new_sequence(
+    tag: Tag,
+    path: &[String],
+    items: &[Vec<DicomNode>],
+    item_sources: &Option<Vec<Option<usize>>>,
+    declarations: &HashMap<Vec<String>, String>,
+    explicit: bool,
+    failures: &mut Vec<String>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut out = splice::sequence_start(tag, explicit);
+    for (index, item) in items.iter().enumerate() {
+        let item_path = child_path(path, &item_segment(item_sources, index));
+        let Some(bytes) = encode_new_item(item, &item_path, declarations, explicit, failures)?
+        else {
+            return Ok(None);
+        };
+        out.extend(bytes);
+    }
+    out.extend(splice::sequence_end());
+    Ok(Some(out))
+}
+
+/// Encode an item added by the nodes, of undefined length (see `encode_new_sequence`).
+fn encode_new_item(
+    nodes: &[DicomNode],
+    path: &[String],
+    declarations: &HashMap<Vec<String>, String>,
+    explicit: bool,
+    failures: &mut Vec<String>,
+) -> Result<Option<Vec<u8>>, String> {
+    // An item declaring its own character set must declare one Taglet can write.
+    for node in nodes {
+        if let DicomNode::Element { tag, value, .. } = node {
+            if parse_tag(tag)? == tags::SPECIFIC_CHARACTER_SET && !is_writable_declaration(value) {
+                return Ok(None);
+            }
+        }
+    }
+    let charset = TextCharset::from_specific_character_set(
+        declarations.get(path).map(String::as_str).unwrap_or(""),
+    );
+    let mut sorted = nodes
+        .iter()
+        .map(|node| {
+            let (DicomNode::Element { tag, .. } | DicomNode::Sequence { tag, .. }) = node;
+            parse_tag(tag).map(|tag| (tag, node))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sorted.sort_by_key(|(tag, _)| *tag);
+    let mut out = splice::item_start();
+    for (tag, node) in sorted {
+        match node {
+            DicomNode::Element {
+                vr, value, path, ..
+            } => {
+                let Ok(vr) = VR::from_str(vr) else {
+                    return Ok(None);
+                };
+                if !is_text_editable(vr) {
+                    return Ok(None);
+                }
+                let shown = shown_path(path);
+                match encode_spliced_value(vr, value, Some(&charset)) {
+                    Ok(Some(bytes)) => match splice::encode_element(tag, vr, &bytes, explicit) {
+                        Ok(element) => out.extend(element),
+                        Err(error) => failures.push(format!("{shown} ({error})")),
+                    },
+                    // Values of VRs not affected by Specific Character Set must be ASCII.
+                    Ok(None) => failures.push(format!(
+                        "{shown} (a {vr} value must be ASCII, e.g. half-width digits)"
+                    )),
+                    Err(reason) => failures.push(format!("{shown} ({reason})")),
+                }
+            }
+            DicomNode::Sequence {
+                path,
+                items,
+                item_sources,
+                ..
+            } => {
+                let Some(bytes) = encode_new_sequence(
+                    tag,
+                    path,
+                    items,
+                    item_sources,
+                    declarations,
+                    explicit,
+                    failures,
+                )?
+                else {
+                    return Ok(None);
+                };
+                out.extend(bytes);
+            }
+        }
+    }
+    out.extend(splice::item_end());
+    Ok(Some(out))
 }
 
 /// The Specific Character Set value in effect for the data set and each item in
@@ -1239,7 +1446,7 @@ fn node_declarations(
         {
             for (index, item) in items.iter().enumerate() {
                 let mut item_path = path.clone();
-                item_path.push(format!("Item#{}", item_source(item_sources, index)));
+                item_path.push(item_segment(item_sources, index));
                 node_declarations(item, &item_path, &declaration, out)?;
             }
         }
@@ -1348,24 +1555,36 @@ fn convert_text(
     }
 }
 
-const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items needs editing the file in place, which this file or these changes do not allow (it needs a Part 10 file in Explicit or Implicit VR Little Endian whose file meta SOP UIDs match the data set, and a save that adds no sequences or items, removes no SOP UIDs, does not edit or remove group lengths, and removes no items holding encapsulated data).";
+const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: adding sequences or items, or removing items, needs editing the file in place, which this file or these changes do not allow (it needs a Part 10 file in Explicit or Implicit VR Little Endian whose file meta SOP UIDs match the data set and whose tags are in order when sequences are added, new items holding only text elements, and a save that removes no SOP UIDs, does not edit or remove group lengths, and removes no items holding encapsulated data).";
 
 /// The index of the file's item that the node item at `index` shows (see
 /// `DicomNode::Sequence::item_sources`).
-pub(crate) fn item_source(item_sources: &Option<Vec<usize>>, index: usize) -> usize {
-    item_sources
-        .as_ref()
-        .and_then(|sources| sources.get(index).copied())
-        .unwrap_or(index)
+pub(crate) fn item_source(
+    item_sources: &Option<Vec<Option<usize>>>,
+    index: usize,
+) -> Option<usize> {
+    match item_sources {
+        Some(sources) => sources.get(index).copied().flatten(),
+        None => Some(index),
+    }
+}
+
+/// The path segment of the node item at `index`: the file's numbering, or a name of
+/// its own for an item added since (see `with_file_item_paths`).
+fn item_segment(item_sources: &Option<Vec<Option<usize>>>, index: usize) -> String {
+    match item_source(item_sources, index) {
+        Some(source) => format!("Item#{source}"),
+        None => format!("Item#new{index}"),
+    }
 }
 
 /// The file's item that the node item at `index` shows.
 pub(crate) fn source_item<'a>(
     file_items: &'a [InMemDicomObject],
-    item_sources: &Option<Vec<usize>>,
+    item_sources: &Option<Vec<Option<usize>>>,
     index: usize,
 ) -> Option<&'a InMemDicomObject> {
-    file_items.get(item_source(item_sources, index))
+    file_items.get(item_source(item_sources, index)?)
 }
 
 /// The nodes with their paths numbering items as the file does, following
@@ -1402,10 +1621,7 @@ pub(crate) fn with_file_item_paths(nodes: &[DicomNode], parent: &[String]) -> Ve
                     .iter()
                     .enumerate()
                     .map(|(index, item)| {
-                        let item_path = child_path(
-                            &path,
-                            &format!("Item#{}", item_source(item_sources, index)),
-                        );
+                        let item_path = child_path(&path, &item_segment(item_sources, index));
                         with_file_item_paths(item, &item_path)
                     })
                     .collect();
@@ -1445,7 +1661,8 @@ fn child_path(parent: &[String], segment: &str) -> Vec<String> {
     path
 }
 
-/// Whether no items were removed from the object's: where `item_sources` is set,
+/// Whether no sequences were added, and no items removed from or added to the
+/// object's: where `item_sources` is set,
 /// it must list the object's items in order (removing the last items, or all of them,
 /// leaves a shorter list). Without it, the items are the ones read, which can be fewer
 /// in raw data sets read up to Pixel Data in an item.
@@ -1460,15 +1677,16 @@ fn items_match_object(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<boo
         else {
             continue;
         };
+        // A sequence the object does not have was added.
         let Some(obj_items) = sequence_items(obj, parse_tag(tag)?) else {
-            continue;
+            return Ok(false);
         };
         if let Some(sources) = item_sources {
             if sources.len() != obj_items.len()
                 || sources
                     .iter()
                     .enumerate()
-                    .any(|(index, source)| *source != index)
+                    .any(|(index, source)| *source != Some(index))
             {
                 return Ok(false);
             }
@@ -1482,10 +1700,15 @@ fn items_match_object(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<boo
     Ok(true)
 }
 
-/// Elements added by the nodes, and elements, sequences and items removed from the
-/// file (only the outermost of what is removed).
+/// Elements added by the nodes, sequences and items added (written whole), and
+/// elements, sequences and items removed from the file (only the outermost of what is
+/// removed).
 struct StructureDiff {
     added: HashSet<Vec<String>>,
+    /// Sequences not in the file, by path.
+    added_sequences: HashSet<Vec<String>>,
+    /// Sequences in the file with items added after their own (see `item_sources`).
+    added_items: HashSet<Vec<String>>,
     removed: HashSet<Vec<String>>,
 }
 
@@ -1505,12 +1728,21 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
         /// `item_sources`, which show the file's items as they are.
         item_counts: HashMap<Vec<String>, usize>,
         opaque: HashSet<Vec<String>>,
+        added_sequences: HashSet<Vec<String>>,
+        added_items: HashSet<Vec<String>>,
         /// Set when a node's path does not match where it is. Paths address the
         /// file's elements, so splicing could then copy values from the wrong item.
         inconsistent: bool,
     }
 
-    fn node_shape(nodes: &[DicomNode], parent: &[String], shape: &mut Shape) {
+    /// `file_sequences`: the file's sequences; other sequence nodes were added, and
+    /// are written whole, like added items.
+    fn node_shape(
+        nodes: &[DicomNode],
+        parent: &[String],
+        file_sequences: &HashSet<Vec<String>>,
+        shape: &mut Shape,
+    ) {
         for node in nodes {
             let (DicomNode::Element { tag, path, .. } | DicomNode::Sequence { tag, path, .. }) =
                 node;
@@ -1532,25 +1764,46 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
                     item_sources,
                     ..
                 } => {
+                    if !file_sequences.contains(path) {
+                        shape.added_sequences.insert(path.clone());
+                        continue;
+                    }
                     shape.sequences.insert(path.clone());
                     if item_sources.is_none() {
                         shape.item_counts.insert(path.clone(), items.len());
                     }
-                    // Items can be removed, not reordered: splicing writes them in the
-                    // file's order.
-                    if item_sources
-                        .as_ref()
-                        .is_some_and(|sources| sources.windows(2).any(|pair| pair[0] >= pair[1]))
-                    {
-                        shape.inconsistent = true;
+                    if let Some(sources) = item_sources {
+                        // Items can be removed and added at the end, not reordered:
+                        // splicing writes the file's items in their order, then the
+                        // new ones.
+                        let file_items = sources.iter().take_while(|source| source.is_some());
+                        let new_items = sources.len() - file_items.clone().count();
+                        if sources[sources.len() - new_items..]
+                            .iter()
+                            .any(Option::is_some)
+                            || file_items
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .windows(2)
+                                .any(|pair| pair[0] >= pair[1])
+                        {
+                            shape.inconsistent = true;
+                        }
+                        if new_items > 0 {
+                            shape.added_items.insert(path.clone());
+                        }
                     }
                     for (index, item) in items.iter().enumerate() {
+                        if item_source(item_sources, index).is_none() {
+                            // Added: written whole.
+                            continue;
+                        }
                         let mut item_path = path.clone();
-                        item_path.push(format!("Item#{}", item_source(item_sources, index)));
+                        item_path.push(item_segment(item_sources, index));
                         if !shape.items.insert(item_path.clone()) {
                             shape.inconsistent = true;
                         }
-                        node_shape(item, &item_path, shape);
+                        node_shape(item, &item_path, file_sequences, shape);
                     }
                 }
             }
@@ -1586,13 +1839,13 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
         }
     }
 
+    let mut from_index = Shape::default();
+    index_shape(index, &[], &mut from_index);
     let mut from_nodes = Shape::default();
-    node_shape(nodes, &[], &mut from_nodes);
+    node_shape(nodes, &[], &from_index.sequences, &mut from_nodes);
     if from_nodes.inconsistent {
         return None;
     }
-    let mut from_index = Shape::default();
-    index_shape(index, &[], &mut from_index);
     // Opaque values (e.g. encapsulated pixel data in an item) show up as plain element
     // nodes, and cannot be removed here.
     for path in &from_index.opaque {
@@ -1640,6 +1893,8 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
             .difference(&from_index.elements)
             .cloned()
             .collect(),
+        added_sequences: from_nodes.added_sequences,
+        added_items: from_nodes.added_items,
         removed,
     })
 }
@@ -5783,15 +6038,12 @@ mod tests {
         .concat();
         write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
         let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
-        // Adding a sequence needs the full writer.
-        nodes.push(DicomNode::Sequence {
-            tag: "(0040,0275)".to_string(),
-            description: String::new(),
-            length: 0,
-            path: vec!["(0040,0275)".to_string()],
-            items: Vec::new(),
-            item_sources: None,
-        });
+        // An added element splicing cannot write (not text) needs the full writer.
+        let mut node = element_node("(0028,0010)", "US", "512", &[]);
+        if let DicomNode::Element { editable, .. } = &mut node {
+            *editable = false;
+        }
+        nodes.push(node);
         *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "ID002".to_string();
         let planned = plan_for(&path, &nodes);
         let saved = save_file(&path, &nodes);
@@ -5978,9 +6230,11 @@ mod tests {
         assert!(contains(&saved, &expected));
     }
 
-    /// Review on #10: an empty sequence added after Pixel Data's tag is saved.
+    /// Review on #10: an empty sequence added after Pixel Data's tag is not spliced
+    /// (Part 10 files are read up to Pixel Data), and the full writer refuses it
+    /// rather than dropping it. The editor does not offer such tags for sequences.
     #[test]
-    fn added_sequences_after_pixel_data_are_saved() {
+    fn added_sequences_after_pixel_data_are_not_saved() {
         let path = temp_path("splice-add-trailing-sequence.dcm");
         write_mixed_charset_file(&path);
         let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
@@ -5993,9 +6247,11 @@ mod tests {
             item_sources: None,
         });
         let planned = plan_for(&path, &nodes);
+        let saved = save_file(&path, &nodes);
         std::fs::remove_file(&path).ok();
 
         assert!(!planned);
+        assert!(saved.unwrap_err().contains("adding sequences or items"));
     }
 
     /// Review on #10: after adding an element after Pixel Data's tag and saving, saving
@@ -6194,6 +6450,218 @@ mod tests {
         assert!(saved.ends_with(&original[tail_start..]));
     }
 
+    // ---- Adding sequences and items (#8) ----
+
+    /// Append an item made of `nodes` to the sequence at `sequence_path`, as the editor
+    /// does (`item_sources` records it as new).
+    fn append_item(
+        nodes: &mut [DicomNode],
+        sequence_path: &[&str],
+        make: &dyn Fn(&[&str]) -> Vec<DicomNode>,
+    ) {
+        for node in nodes.iter_mut() {
+            if let DicomNode::Sequence {
+                path,
+                items,
+                item_sources,
+                ..
+            } = node
+            {
+                if path == sequence_path {
+                    let sources =
+                        item_sources.get_or_insert_with(|| (0..items.len()).map(Some).collect());
+                    let item_path = format!("Item#{}", items.len());
+                    let mut parent = sequence_path.to_vec();
+                    parent.push(&item_path);
+                    items.push(make(&parent));
+                    sources.push(None);
+                    return;
+                }
+                for item in items {
+                    append_item(item, sequence_path, make);
+                }
+            }
+        }
+    }
+
+    fn new_sequence(tag: &str, parent: &[&str], items: Vec<Vec<DicomNode>>) -> DicomNode {
+        let mut path = parent
+            .iter()
+            .map(|segment| segment.to_string())
+            .collect::<Vec<_>>();
+        path.push(tag.to_string());
+        DicomNode::Sequence {
+            tag: tag.to_string(),
+            description: String::new(),
+            length: 0,
+            item_sources: Some(vec![None; items.len()]),
+            items,
+            path,
+        }
+    }
+
+    #[test]
+    fn added_sequences_are_spliced() {
+        let path = temp_path("add-sequence.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let item = |parent: &[&str]| {
+            vec![
+                element_node("(3006,0082)", "IS", "1", parent),
+                element_node("(3006,0085)", "SH", "前立腺", parent),
+            ]
+        };
+        nodes.push(new_sequence(
+            "(3006,0080)",
+            &[],
+            vec![item(&["(3006,0080)", "Item#0"])],
+        ));
+        let spliced = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(spliced);
+        let saved = saved.unwrap();
+        assert!(contains(&saved, PROSTATE_IR87));
+        let reopened = reopen("add-sequence-reopened.dcm", &saved);
+        let items = sequence_items_of(&reopened, "(3006,0080)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(values_in(&items[0], "(3006,0085)"), "前立腺");
+        assert_eq!(values_in(&items[0], "(3006,0082)"), "1");
+        assert_eq!(
+            values_in(&reopened, "(0010,0010)"),
+            "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        );
+    }
+
+    #[test]
+    fn added_items_are_spliced_after_the_others() {
+        for defined_length in [true, false] {
+            let path = temp_path(&format!("add-item-{defined_length}.dcm"));
+            write_three_rois(&path, defined_length);
+            let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+            append_item(&mut nodes, &["(3006,0020)"], &|parent| {
+                vec![
+                    element_node("(3006,0022)", "IS", "4", parent),
+                    element_node("(3006,0026)", "LO", "精嚢", parent),
+                ]
+            });
+            // An item from the file can be removed in the same save.
+            remove_item(&mut nodes, &["(3006,0020)"], 0);
+            let spliced = plans_splice(&path, &nodes);
+            let saved = save_file(&path, &nodes);
+            std::fs::remove_file(&path).ok();
+
+            assert!(spliced, "defined length: {defined_length}");
+            let reopened = reopen("add-item-reopened.dcm", &saved.unwrap());
+            let items = sequence_items_of(&reopened, "(3006,0020)");
+            let names = items
+                .iter()
+                .map(|item| values_in(item, "(3006,0026)"))
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["直腸", "膀胱", "精嚢"]);
+            assert_eq!(values_in(&items[2], "(3006,0022)"), "4");
+            assert_eq!(values_in(&reopened, "(300E,0002)"), "APPROVED");
+        }
+    }
+
+    /// An added item declaring its own character set is written in it.
+    #[test]
+    fn added_items_use_their_own_character_set() {
+        let path = temp_path("add-item-charset.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        append_item(&mut nodes, &["(3006,0020)"], &|parent| {
+            vec![
+                element_node("(0008,0005)", "CS", "ISO_IR 192", parent),
+                element_node("(3006,0026)", "LO", "精嚢", parent),
+            ]
+        });
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert!(contains(&saved, "精嚢".as_bytes()));
+        let reopened = reopen("add-item-charset-reopened.dcm", &saved);
+        let items = sequence_items_of(&reopened, "(3006,0020)");
+        assert_eq!(values_in(&items[3], "(3006,0026)"), "精嚢");
+        assert_eq!(values_in(&items[0], "(3006,0026)"), "前立腺");
+    }
+
+    #[test]
+    fn implicit_vr_items_are_added() {
+        let path = temp_path("add-item-implicit.dcm");
+        write_implicit_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        append_item(&mut nodes, &["(3006,0039)"], &|parent| {
+            vec![element_node("(3006,0084)", "IS", "2", parent)]
+        });
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let reopened = reopen("add-item-implicit-reopened.dcm", &saved.unwrap());
+        let items = sequence_items_of(&reopened, "(3006,0039)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(values_in(&items[1], "(3006,0084)"), "2");
+        assert_eq!(values_in(&reopened, "(3006,0026)"), "ﾊﾝ");
+    }
+
+    #[test]
+    fn group_lengths_follow_added_items() {
+        let path = temp_path("add-item-group-length.dcm");
+        write_group_length_file(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        append_item(&mut nodes, &["(3006,0020)"], &|parent| {
+            vec![element_node("(3006,0022)", "IS", "2", parent)]
+        });
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert_eq!(wrong_group_lengths(&saved), Vec::<String>::new());
+        let reopened = reopen("add-item-group-length-reopened.dcm", &saved);
+        assert_eq!(sequence_items_of(&reopened, "(3006,0020)").len(), 2);
+    }
+
+    /// Values that cannot be written in added items are named, as items are shown.
+    #[test]
+    fn values_that_cannot_be_written_in_added_items_are_reported() {
+        let path = temp_path("add-item-bad-value.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        append_item(&mut nodes, &["(3006,0020)"], &|parent| {
+            vec![element_node("(3006,0022)", "IS", "１", parent)]
+        });
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(3006,0020) / Item#3 (new) / (3006,0022) (a IS value must be ASCII"),
+            "{error}"
+        );
+    }
+
+    /// Added items holding elements splicing cannot write (not text) are not spliced,
+    /// and the full writer refuses them rather than dropping them.
+    #[test]
+    fn added_items_with_non_text_elements_are_refused() {
+        let path = temp_path("add-item-non-text.dcm");
+        let original = write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        append_item(&mut nodes, &["(3006,0020)"], &|parent| {
+            vec![element_node("(3006,0024)", "US", "1", parent)]
+        });
+        let spliced = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+        assert!(saved.unwrap_err().contains("adding sequences or items"));
+        assert_eq!(after, original);
+    }
+
     // ---- Group lengths (#8) ----
 
     /// A group length element (gggg,0000) for `elements` of that group, followed by
@@ -6248,7 +6716,10 @@ mod tests {
                 }
             }
         }
-        let path = temp_path("group-length-check.dcm");
+        // Tests run in parallel: a file of its own for each check.
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let check_number = CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = temp_path(&format!("group-length-check-{check_number}.dcm"));
         std::fs::write(&path, saved).unwrap();
         let index = splice::FileIndex::read(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
@@ -6637,7 +7108,8 @@ mod tests {
             } = node
             {
                 if path == sequence_path {
-                    let sources = item_sources.get_or_insert_with(|| (0..items.len()).collect());
+                    let sources =
+                        item_sources.get_or_insert_with(|| (0..items.len()).map(Some).collect());
                     items.remove(index);
                     sources.remove(index);
                     let depth = path.len();
@@ -6807,7 +7279,7 @@ mod tests {
         let result = save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap());
         std::fs::remove_file(&path).ok();
 
-        assert!(result.unwrap_err().contains("removing sequence items"));
+        assert!(result.unwrap_err().contains("removing items"));
         assert!(!destination.exists());
     }
 
@@ -6859,7 +7331,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(!spliced);
-        assert!(saved.unwrap_err().contains("removing sequence items"));
+        assert!(saved.unwrap_err().contains("removing items"));
     }
 
     /// Removing the last items leaves `item_sources` in order (or empty); the full
@@ -6885,7 +7357,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         for result in results {
-            assert!(result.unwrap_err().contains("removing sequence items"));
+            assert!(result.unwrap_err().contains("removing items"));
         }
         assert!(!destination.exists());
     }

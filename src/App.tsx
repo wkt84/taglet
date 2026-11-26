@@ -118,6 +118,7 @@ export default function App() {
     () => findNodeByPath(dicom.nodes, selectedPath),
     [dicom.nodes, selectedPath],
   )
+  const canAddItem = selectedNode?.kind === 'Sequence'
   const canDeleteSelected = Boolean(
     selectedPath
       && selectedNode
@@ -204,6 +205,10 @@ export default function App() {
           return closed
         }}
         openAddTagDialog={() => setAddingTag(true)}
+        addItem={() => {
+          if (selectedPath && canAddItem) dicom.addItem(selectedPath)
+        }}
+        canAddItem={canAddItem}
         deleteSelectedTag={() => {
           if (!selectedPath || !canDeleteSelected) return
           const label = nodeDeleteLabel(selectedNode)
@@ -273,6 +278,7 @@ export default function App() {
         <AddTagDialog
           existingTags={existingTagsForTarget}
           targetLabel={targetLabel(addTargetPath)}
+          rootTarget={addTargetPath.length === 0}
           onClose={() => setAddingTag(false)}
           onAdd={(node) => {
             if (dicom.addTag(addTargetPath, node)) {

@@ -171,14 +171,15 @@ pub(super) fn validate_private_nodes(
             ..
         } = node
         {
-            if let Some(original) = obj
+            // Items added (and items of sequences added) are checked as new.
+            let empty = InMemDicomObject::new_empty();
+            let original = obj
                 .get(parse_tag(tag)?)
                 .and_then(|element| element.value().items())
+                .unwrap_or_default();
             {
                 for (index, next_nodes) in items.iter().enumerate() {
-                    let Some(item) = source_item(original, item_sources, index) else {
-                        continue;
-                    };
+                    let item = source_item(original, item_sources, index).unwrap_or(&empty);
                     validate_private_nodes(item, next_nodes)
                         .map_err(|error| format!("{tag} / Item #{}: {error}", index + 1))?;
                 }

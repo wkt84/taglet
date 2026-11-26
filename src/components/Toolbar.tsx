@@ -10,6 +10,8 @@ type Props = {
   openFile: () => Promise<boolean>
   closeFile: () => boolean
   openAddTagDialog: () => void
+  addItem: () => void
+  canAddItem: boolean
   deleteSelectedTag: () => void
   canDeleteSelectedTag: boolean
   openImageViewer: () => void
@@ -28,6 +30,8 @@ export default function Toolbar({
   openFile,
   closeFile,
   openAddTagDialog,
+  addItem,
+  canAddItem,
   deleteSelectedTag,
   canDeleteSelectedTag,
   openImageViewer,
@@ -85,6 +89,14 @@ export default function Toolbar({
         </button>
         <button className="toolbar-button" disabled={!filePath || loading} onClick={openAddTagDialog}>
           Add Tag
+        </button>
+        <button
+          className="toolbar-button"
+          disabled={!filePath || loading || !canAddItem}
+          title="Add an empty item at the end of the selected sequence"
+          onClick={addItem}
+        >
+          Add Item
         </button>
         <button
           className="toolbar-button toolbar-button-danger"
