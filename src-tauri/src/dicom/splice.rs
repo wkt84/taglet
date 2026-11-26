@@ -660,7 +660,7 @@ impl SpliceWriter<'_> {
         let edits = self.edits;
         let insertions = sorted_insertions(edits, parent);
         let mut pending = insertions.into_iter().peekable();
-        for node in nodes {
+        for (position, node) in nodes.iter().enumerate() {
             while let Some((_, element)) = pending.next_if(|(tag, _)| *tag < node.tag()) {
                 self.write(element)?;
             }
@@ -670,6 +670,23 @@ impl SpliceWriter<'_> {
                 .contains(&child_path(parent, format_tag(node.tag())))
             {
                 continue;
+            }
+            if let IndexNode::Element {
+                tag, start, end, ..
+            } = node
+            {
+                if tag.element() == 0x0000 && self.group_touched(nodes, parent, tag.group()) {
+                    // Group length (gggg,0000), a UL value after an 8-byte header in
+                    // either VR encoding. Others are left to the full writer by the
+                    // caller (see `is_plain_group_length`).
+                    if !is_plain_group_length(node) {
+                        return Err(format!("Unexpected group length element {tag}"));
+                    }
+                    let length = self.group_length(&nodes[position + 1..], parent, tag.group())?;
+                    self.copy(*start, end - 4)?;
+                    self.write(&length.to_le_bytes())?;
+                    continue;
+                }
             }
             self.node(node, parent)?;
         }
@@ -743,6 +760,50 @@ impl SpliceWriter<'_> {
         Ok(())
     }
 
+    /// Whether an element of `group` (other than its group length) in the data set or
+    /// item at `parent` changes, is inserted or is removed.
+    fn group_touched(&self, nodes: &[IndexNode], parent: &[String], group: u16) -> bool {
+        nodes.iter().any(|node| {
+            let tag = node.tag();
+            tag.group() == group
+                && tag.element() != 0x0000
+                && self.touches(&child_path(parent, format_tag(tag)))
+        }) || sorted_insertions(self.edits, parent)
+            .iter()
+            .any(|(tag, _)| tag.group() == group)
+    }
+
+    /// The length of the elements of `group` that follow its group length in `nodes`,
+    /// up to the first element of another group, and of the ones inserted, as written.
+    fn group_length(
+        &self,
+        nodes: &[IndexNode],
+        parent: &[String],
+        group: u16,
+    ) -> Result<u32, String> {
+        let mut total = 0_u64;
+        // The group runs until an element of another group (files with tags out of
+        // order can have more of the group later; they are not part of it).
+        for node in nodes.iter().take_while(|node| node.tag().group() == group) {
+            let tag = node.tag();
+            if tag.element() == 0x0000
+                || self
+                    .edits
+                    .removals
+                    .contains(&child_path(parent, format_tag(tag)))
+            {
+                continue;
+            }
+            total += u64::from(self.node_length(node, parent)?);
+        }
+        for (tag, element) in sorted_insertions(self.edits, parent) {
+            if tag.group() == group {
+                total += element.len() as u64;
+            }
+        }
+        checked_length(total, "A group")
+    }
+
     /// Whether anything at or below `path` is replaced, inserted or removed.
     fn touches(&self, path: &[String]) -> bool {
         let below = |key: &Vec<String>| key.len() >= path.len() && key[..path.len()] == *path;
@@ -813,6 +874,13 @@ impl SpliceWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.out.write_all(bytes).map_err(|error| error.to_string())
     }
+}
+
+/// Whether a group length element (gggg,0000) is a 4-byte UL value, which splicing
+/// can update in place.
+pub fn is_plain_group_length(node: &IndexNode) -> bool {
+    matches!(node, IndexNode::Element { tag, vr: Some(VR::UL), start, end, .. }
+        if tag.element() == 0x0000 && end - start == 12)
 }
 
 /// A defined length, which cannot be 0xFFFFFFFF (reserved for undefined length).

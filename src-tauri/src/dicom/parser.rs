@@ -102,8 +102,8 @@ pub fn open_nodes(path: &str) -> Result<DicomFileContent, String> {
 }
 
 /// Whether value edits to this file can be saved by splicing: a Part 10 file whose
-/// data set is Explicit or Implicit VR Little Endian, that can be indexed, has no group length
-/// elements, and whose file meta SOP UIDs match the data set's (see `plan_splice`).
+/// data set is Explicit or Implicit VR Little Endian, that can be indexed, and whose file
+/// meta SOP UIDs match the data set's (see `plan_splice`).
 /// `Some` with whether its tags are in order (needed to add elements), or `None`.
 fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
     let value_of = |nodes: &[DicomNode], wanted: &str| {
@@ -127,7 +127,7 @@ fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
     }
     splice::FileIndex::read(path)
         .ok()
-        .filter(|index| !has_group_length(index.nodes()))
+        .filter(|index| !has_irregular_group_length(index.nodes()))
         .map(|index| index.is_ordered())
 }
 
@@ -994,15 +994,15 @@ fn plan_splice(
     if collect_edited_paths(object, nodes, text, &mut edited).is_err() {
         return Ok(None);
     }
-    // Group lengths would have to be recomputed for any change.
+    // Group lengths (gggg,0000) are updated by the splice writer, but editing or
+    // removing one, or removing a SOP UID, is left to the full writer, as before.
+    // (Changed SOP UIDs are written to the file meta information too, and a changed
+    // Specific Character Set is handled below, by converting the text it applies to.)
+    // Group lengths that are not plain 4-byte UL values cannot be updated in place.
     let changes_anything = !edited.is_empty() || !diff.added.is_empty() || !diff.removed.is_empty();
-    if changes_anything && has_group_length(index.nodes()) {
+    if changes_anything && has_irregular_group_length(index.nodes()) {
         return Ok(None);
     }
-    // Group lengths would have to be updated, and removing a SOP UID leaves the file
-    // meta information to the full writer, as before. (Changed SOP UIDs are written to
-    // the file meta information too, and a changed Specific Character Set is handled
-    // below, by converting the text it applies to.)
     let sop_uid_paths = [
         vec![format_tag(tags::SOP_CLASS_UID)],
         vec![format_tag(tags::SOP_INSTANCE_UID)],
@@ -1348,7 +1348,7 @@ fn convert_text(
     }
 }
 
-const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items needs editing the file in place, which this file or these changes do not allow (it needs a Part 10 file in Explicit or Implicit VR Little Endian without group length elements, whose file meta SOP UIDs match the data set, and a save that adds no sequences or items, changes no SOP UIDs and removes no items holding encapsulated data).";
+const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items needs editing the file in place, which this file or these changes do not allow (it needs a Part 10 file in Explicit or Implicit VR Little Endian whose file meta SOP UIDs match the data set, and a save that adds no sequences or items, removes no SOP UIDs, does not edit or remove group lengths, and removes no items holding encapsulated data).";
 
 /// The index of the file's item that the node item at `index` shows (see
 /// `DicomNode::Sequence::item_sources`).
@@ -1863,12 +1863,16 @@ fn collect_edited_paths(
     Ok(())
 }
 
-fn has_group_length(nodes: &[splice::IndexNode]) -> bool {
+/// Whether the index has a group length element (gggg,0000) that is not a plain
+/// 4-byte UL value (see `splice::is_plain_group_length`).
+fn has_irregular_group_length(nodes: &[splice::IndexNode]) -> bool {
     nodes.iter().any(|node| match node {
-        splice::IndexNode::Element { tag, .. } => tag.element() == 0x0000,
-        splice::IndexNode::Sequence { items, .. } => {
-            items.iter().any(|item| has_group_length(item.nodes()))
+        splice::IndexNode::Element { tag, .. } => {
+            tag.element() == 0x0000 && !splice::is_plain_group_length(node)
         }
+        splice::IndexNode::Sequence { items, .. } => items
+            .iter()
+            .any(|item| has_irregular_group_length(item.nodes())),
         splice::IndexNode::Opaque { .. } => false,
     })
 }
@@ -2728,7 +2732,7 @@ fn encode_edited_text(
         match dicom_rs_write(codec, stored) {
             Some(written) if charset.decode(vr, &written) == entered => Ok(None),
             _ => Err(
-                "it can only be written by editing the file in place, which is possible for Explicit or Implicit VR Little Endian files without group length elements, when the save does not add or remove sequences or items or change the SOP UIDs, and, when the Specific Character Set changes, if Taglet can write text in the new one".to_string(),
+                "it can only be written by editing the file in place, which is possible for Part 10 files in Explicit or Implicit VR Little Endian whose file meta SOP UIDs match the data set, when the save adds no sequences or items and removes no SOP UIDs, and, when the Specific Character Set changes, if Taglet can write text in the new one".to_string(),
             ),
         }
     }
@@ -6190,6 +6194,326 @@ mod tests {
         assert!(saved.ends_with(&original[tail_start..]));
     }
 
+    // ---- Group lengths (#8) ----
+
+    /// A group length element (gggg,0000) for `elements` of that group, followed by
+    /// them.
+    fn with_group_length(group: u16, elements: &[u8], explicit: bool) -> Vec<u8> {
+        let length = (elements.len() as u32).to_le_bytes();
+        let mut out = if explicit {
+            explicit_element(group, 0x0000, b"UL", &length)
+        } else {
+            implicit_element(group, 0x0000, &length)
+        };
+        out.extend_from_slice(elements);
+        out
+    }
+
+    /// Group length elements in a saved file whose value is not the length of the
+    /// elements of their group that follow, in the same data set or item.
+    fn wrong_group_lengths(saved: &[u8]) -> Vec<String> {
+        fn check(nodes: &[splice::IndexNode], saved: &[u8], parent: &str, wrong: &mut Vec<String>) {
+            let bounds = |node: &splice::IndexNode| match node {
+                splice::IndexNode::Element { start, end, .. }
+                | splice::IndexNode::Sequence { start, end, .. }
+                | splice::IndexNode::Opaque { start, end, .. } => (*start as usize, *end as usize),
+            };
+            for node in nodes {
+                let tag = node.tag();
+                if tag.element() == 0x0000 {
+                    let (_, end) = bounds(node);
+                    let value = u32::from_le_bytes(saved[end - 4..end].try_into().unwrap());
+                    let actual: usize = nodes
+                        .iter()
+                        .filter(|other| {
+                            other.tag().group() == tag.group() && other.tag().element() != 0
+                        })
+                        .map(|other| {
+                            let (start, end) = bounds(other);
+                            end - start
+                        })
+                        .sum();
+                    if value as usize != actual {
+                        wrong.push(format!(
+                            "{parent}{} = {value}, not {actual}",
+                            format_tag(tag)
+                        ));
+                    }
+                }
+                if let splice::IndexNode::Sequence { items, .. } = node {
+                    for (index, item) in items.iter().enumerate() {
+                        let path = format!("{parent}{} / Item#{index} / ", format_tag(tag));
+                        check(item.nodes(), saved, &path, wrong);
+                    }
+                }
+            }
+        }
+        let path = temp_path("group-length-check.dcm");
+        std::fs::write(&path, saved).unwrap();
+        let index = splice::FileIndex::read(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        let mut wrong = Vec::new();
+        check(index.nodes(), saved, "", &mut wrong);
+        wrong
+    }
+
+    /// A file with group lengths for every group, in the data set and in an item.
+    fn write_group_length_file(path: &std::path::Path, explicit: bool) -> Vec<u8> {
+        let element = |group: u16, number: u16, vr: &[u8; 2], value: &[u8]| {
+            if explicit {
+                explicit_element(group, number, vr, value)
+            } else {
+                implicit_element(group, number, value)
+            }
+        };
+        let item = [
+            with_group_length(
+                0x0008,
+                &element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+                explicit,
+            ),
+            with_group_length(
+                0x3006,
+                &[
+                    element(0x3006, 0x0022, b"IS", b"1"),
+                    element(0x3006, 0x0026, b"LO", HAN_IR13),
+                ]
+                .concat(),
+                explicit,
+            ),
+        ]
+        .concat();
+        let rois = if explicit {
+            defined_sequence(0x3006, 0x0020, &[item])
+        } else {
+            implicit_defined_sequence(0x3006, 0x0020, &[item])
+        };
+        let dataset = [
+            with_group_length(
+                0x0008,
+                &[
+                    element(0x0008, 0x0005, b"CS", b"ISO_IR 192"),
+                    element(
+                        0x0008,
+                        0x0016,
+                        b"UI",
+                        format!("{RTSTRUCT_SOP_CLASS}\0").as_bytes(),
+                    ),
+                    element(0x0008, 0x0018, b"UI", b"1.2.3.4\0"),
+                    element(0x0008, 0x0060, b"CS", b"RTSTRUCT"),
+                ]
+                .concat(),
+                explicit,
+            ),
+            with_group_length(
+                0x0010,
+                &[
+                    element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+                    element(0x0010, 0x0020, b"LO", b"ID001"),
+                ]
+                .concat(),
+                explicit,
+            ),
+            with_group_length(0x3006, &rois, explicit),
+        ]
+        .concat();
+        let syntax = if explicit {
+            uids::EXPLICIT_VR_LITTLE_ENDIAN
+        } else {
+            uids::IMPLICIT_VR_LITTLE_ENDIAN
+        };
+        write_part10_with(path, syntax, &dataset);
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn group_lengths_are_updated_by_splicing() {
+        for explicit in [true, false] {
+            let path = temp_path(&format!("group-length-splice-{explicit}.dcm"));
+            let original = write_group_length_file(&path, explicit);
+            assert!(wrong_group_lengths(&original).is_empty());
+            let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+            set_value(&mut nodes, &["(0010,0010)"], "鈴木^花子子");
+            nodes.retain(
+                |node| !matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0020)"),
+            );
+            let position = nodes
+                .iter()
+                .position(
+                    |node| matches!(node, DicomNode::Element { tag, .. } if tag == "(0010,0000)"),
+                )
+                .unwrap();
+            nodes.insert(position, element_node("(0008,1030)", "LO", "頭部", &[]));
+            set_value(&mut nodes, &["(3006,0020)", "Item#0", "(3006,0026)"], "ﾊﾝﾀﾞ");
+            let spliced = plans_splice(&path, &nodes);
+            let saved = save_file(&path, &nodes);
+            std::fs::remove_file(&path).ok();
+
+            assert!(spliced, "explicit: {explicit}");
+            let saved = saved.unwrap();
+            assert_eq!(
+                wrong_group_lengths(&saved),
+                Vec::<String>::new(),
+                "explicit: {explicit}"
+            );
+            let reopened = reopen("group-length-splice-reopened.dcm", &saved);
+            assert_eq!(values_in(&reopened, "(0010,0010)"), "鈴木^花子子");
+            assert_eq!(values_in(&reopened, "(0008,1030)"), "頭部");
+            assert!(find_element(&reopened, "(0010,0020)").is_none());
+            assert_eq!(values_in(&reopened, "(3006,0026)"), "ﾊﾝﾀﾞ");
+        }
+    }
+
+    /// Groups that do not change keep their group length as it is, even when wrong.
+    #[test]
+    fn untouched_group_lengths_are_kept() {
+        let path = temp_path("group-length-untouched.dcm");
+        let dataset = [
+            explicit_element(0x0008, 0x0000, b"UL", &[0, 0, 0, 0]),
+            base_elements(b"ISO_IR 192"),
+            with_group_length(
+                0x0010,
+                &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+                true,
+            ),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let wrong = wrong_group_lengths(&saved.unwrap());
+        assert_eq!(wrong.len(), 1);
+        assert!(wrong[0].starts_with("(0008,0000) = 0"), "{wrong:?}");
+    }
+
+    /// Group lengths that are not 4-byte UL values (here a zero-length OB, whose
+    /// header would otherwise be mistaken for a UL value) are left to the full writer.
+    #[test]
+    fn irregular_group_lengths_are_not_spliced() {
+        let path = temp_path("group-length-irregular.dcm");
+        let mut ob = Vec::new();
+        ob.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+        ob.extend_from_slice(b"OB\0\0");
+        ob.extend_from_slice(&0_u32.to_le_bytes());
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            ob,
+            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+    }
+
+    /// A group runs until an element of another group: elements of the group found
+    /// later (tags out of order) do not count.
+    #[test]
+    fn group_lengths_stop_at_the_next_group() {
+        let path = temp_path("group-length-gap.dcm");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            with_group_length(
+                0x0010,
+                &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+                true,
+            ),
+            explicit_element(0x0018, 0x0015, b"CS", b"HEAD"),
+            explicit_element(0x0010, 0x0030, b"DA", b"19700101"),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let expected = explicit_element(0x0010, 0x0020, b"LO", b"ID-00002").len() as u32;
+        let group_length = [0x10, 0x00, 0x00, 0x00, b'U', b'L', 4, 0];
+        let at = saved
+            .windows(8)
+            .position(|window| window == group_length)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(saved[at + 8..at + 12].try_into().unwrap()),
+            expected
+        );
+    }
+
+    /// Files with irregular group lengths are not treated as spliceable when opened,
+    /// so text the full writer cannot write back stays read-only.
+    #[test]
+    fn irregular_group_lengths_keep_unwritable_text_read_only() {
+        let path = temp_path("group-length-irregular-open.dcm");
+        let mut ob = Vec::new();
+        ob.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+        ob.extend_from_slice(b"OB\0\0");
+        ob.extend_from_slice(&0_u32.to_le_bytes());
+        let item = [
+            explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
+            explicit_element(0x3006, 0x0026, b"LO", HAN_IR13),
+        ]
+        .concat();
+        let dataset = [
+            ob,
+            base_elements(b"ISO_IR 192"),
+            defined_sequence(0x3006, 0x0020, &[item]),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let content = open_nodes(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            value_and_editable(&content.nodes, "(3006,0026)"),
+            ("ﾊﾝ".to_string(), false)
+        );
+        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+    }
+
+    /// In a file with tags out of order, a group length only counts the elements of
+    /// its group that follow it.
+    #[test]
+    fn group_lengths_count_the_elements_after_them() {
+        let path = temp_path("group-length-unordered.dcm");
+        let before = explicit_element(0x0010, 0x0030, b"DA", b"19700101");
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            before.clone(),
+            with_group_length(
+                0x0010,
+                &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+                true,
+            ),
+        ]
+        .concat();
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0020)"], "ID-00002");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        let expected = explicit_element(0x0010, 0x0020, b"LO", b"ID-00002").len() as u32;
+        let group_length = [0x10, 0x00, 0x00, 0x00, b'U', b'L', 4, 0];
+        let at = saved
+            .windows(8)
+            .position(|window| window == group_length)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(saved[at + 8..at + 12].try_into().unwrap()),
+            expected
+        );
+    }
+
     // ---- Changing SOP UIDs by splicing (#8) ----
 
     /// The saved file's file meta information, and whether its group length matches
@@ -6598,10 +6922,10 @@ mod tests {
         assert!(!planned);
     }
 
-    /// Review: files with group lengths are saved by the full writer, so values it
-    /// cannot write back stay read-only and the save-blocked warning is shown.
+    /// Files with group lengths are spliced (#8), so values the full writer cannot
+    /// write back stay editable.
     #[test]
-    fn files_with_group_lengths_are_not_treated_as_spliceable() {
+    fn files_with_group_lengths_are_spliceable() {
         let path = temp_path("group-length.dcm");
         let item = [
             explicit_element(0x0008, 0x0005, b"CS", b"ISO_IR 13"),
@@ -6609,8 +6933,7 @@ mod tests {
         ]
         .concat();
         let dataset = [
-            explicit_element(0x0008, 0x0000, b"UL", &[0, 0, 0, 0]),
-            base_elements(b"ISO_IR 192"),
+            with_group_length(0x0008, &base_elements(b"ISO_IR 192"), true),
             defined_sequence(0x3006, 0x0020, &[item]),
         ]
         .concat();
@@ -6620,9 +6943,9 @@ mod tests {
 
         assert_eq!(
             value_and_editable(&content.nodes, "(3006,0026)"),
-            ("ﾊﾝ".to_string(), false)
+            ("ﾊﾝ".to_string(), true)
         );
-        assert!(has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
+        assert!(!has_warning(&content, TEXT_SAVE_BLOCKED_WARNING));
     }
 
     /// Review: files with repeated or unordered tags are not spliced.
@@ -6640,26 +6963,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(index.unwrap_err().contains("repeated"));
-    }
-
-    /// Review on #12: adding an element to a file with group lengths goes through the
-    /// full writer, so the group lengths are not left stale.
-    #[test]
-    fn adding_elements_to_files_with_group_lengths_is_not_spliced() {
-        let path = temp_path("group-length-add.dcm");
-        let dataset = [
-            explicit_element(0x0008, 0x0000, b"UL", &[0, 0, 0, 0]),
-            base_elements(b"ISO_IR 192"),
-            explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
-        ]
-        .concat();
-        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
-        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
-        nodes.push(element_node("(0008,1030)", "LO", "HEAD", &[]));
-        let planned = plan_for(&path, &nodes);
-        std::fs::remove_file(&path).ok();
-
-        assert!(!planned);
     }
 
     /// Review on #12: files whose tags are out of order can still have values edited
