@@ -319,7 +319,7 @@ impl Source for File {
     }
 }
 
-impl Source for Cursor<Vec<u8>> {
+impl<T: AsRef<[u8]>> Source for Cursor<T> {
     fn seek_to(&mut self, position: u64) -> Result<(), String> {
         self.set_position(position);
         Ok(())
@@ -347,14 +347,14 @@ fn inflated_source(file: &mut dyn Source, dataset_start: u64) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-struct Reader {
-    inner: Box<dyn Source>,
+struct Reader<'a> {
+    inner: Box<dyn Source + 'a>,
     position: u64,
     length: u64,
     encoding: Encoding,
 }
 
-impl Reader {
+impl Reader<'_> {
     /// Read the bytes from `start` to `end`, then return to the current position.
     fn read_at(&mut self, start: u64, end: u64) -> Result<Vec<u8>, String> {
         let position = self.position;
@@ -449,6 +449,20 @@ fn has_32_bit_length(vr: &[u8; 2]) -> bool {
             | b"UT"
             | b"UV"
     )
+}
+
+/// Where the top-level element `stop` starts in an Explicit VR Little Endian data set,
+/// in file order (the end of the data set when there is none), found by walking the
+/// elements before it without reading their values.
+pub fn explicit_le_offset_of(dataset: &[u8], stop: Tag) -> Result<usize, String> {
+    let mut reader = Reader {
+        inner: Box::new(Cursor::new(dataset)),
+        position: 0,
+        length: dataset.len() as u64,
+        encoding: Encoding::META,
+    };
+    read_nodes(&mut reader, dataset.len() as u64, |tag| tag == stop)?;
+    Ok(reader.position as usize)
 }
 
 /// Read elements until `stop` returns true for the next tag, the end of the file, or

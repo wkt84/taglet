@@ -136,12 +136,8 @@ fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
 }
 
 fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
-    let opened = match open_deflated_object(path)? {
-        Some(mut obj) => {
-            // As read up to Pixel Data, like other files.
-            remove_from_pixel_data(&mut obj);
-            Ok(obj)
-        }
+    let opened = match open_deflated_object(path, true)? {
+        Some(obj) => Ok(obj),
         None => OpenFileOptions::new()
             .read_until(tags::PIXEL_DATA)
             .open_file(path)
@@ -2362,17 +2358,35 @@ fn file_meta_to_nodes(meta: &FileMetaTable) -> Vec<DicomNode> {
         .collect()
 }
 
-/// A Deflated Explicit VR Little Endian file, read whole with its data set inflated
-/// (dicom-rs cannot read these), or `None` for other files (see `deflate`).
-fn open_deflated_object(path: &str) -> Result<Option<DefaultDicomObject>, String> {
+/// A Deflated Explicit VR Little Endian file, read with its data set inflated (dicom-rs
+/// cannot read these), or `None` for other files (see `deflate`). With
+/// `read_until_pixel_data`, it is read up to Pixel Data as `OpenFileOptions::read_until`
+/// does: stopping where Pixel Data starts in the file, so that what follows is neither
+/// shown nor needs to be readable.
+fn open_deflated_object(
+    path: &str,
+    read_until_pixel_data: bool,
+) -> Result<Option<DefaultDicomObject>, String> {
     let Some(file) = deflate::read_inflated(path)? else {
         return Ok(None);
     };
     let transfer_syntax = TransferSyntaxRegistry
         .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
         .ok_or_else(|| "Explicit VR Little Endian transfer syntax is not available".to_string())?;
-    let obj = InMemDicomObject::read_dataset_with_ts(file.dataset(), transfer_syntax)
+    let mut dataset = file.dataset();
+    // When the elements cannot be walked (e.g. repeated tags), the whole data set is
+    // read and the elements from Pixel Data on are left out.
+    let cut = read_until_pixel_data
+        .then(|| splice::explicit_le_offset_of(dataset, PIXEL_DATA).ok())
+        .flatten();
+    if let Some(end) = cut {
+        dataset = &dataset[..end];
+    }
+    let mut obj = InMemDicomObject::read_dataset_with_ts(dataset, transfer_syntax)
         .map_err(|error| format!("Could not read the deflated data set: {error}"))?;
+    if read_until_pixel_data && cut.is_none() {
+        remove_from_pixel_data(&mut obj);
+    }
     Ok(Some(obj.with_exact_meta(file.meta)))
 }
 
@@ -2393,10 +2407,7 @@ fn open_object_with_fallback(
     path: &str,
     read_until_pixel_data: bool,
 ) -> Result<(DefaultDicomObject, bool), String> {
-    if let Some(mut obj) = open_deflated_object(path)? {
-        if read_until_pixel_data {
-            remove_from_pixel_data(&mut obj);
-        }
+    if let Some(obj) = open_deflated_object(path, read_until_pixel_data)? {
         return Ok((obj, false));
     }
     let options = if read_until_pixel_data {
@@ -8003,5 +8014,90 @@ mod tests {
         let error = saved.unwrap_err();
         assert!(error.contains("deflated"), "{error}");
         assert_eq!(after, original);
+    }
+
+    /// Review on #26: a cut-short Deflate stream is not read as a shorter data set
+    /// (which saving would write back), and data after the stream is not dropped.
+    #[test]
+    fn deflated_streams_must_end() {
+        let deflated = deflate::deflate(&deflated_dataset()).unwrap();
+        for (name, bytes, expected) in [
+            (
+                "cut",
+                deflated[..deflated.len() - 6].to_vec(),
+                "ends unexpectedly",
+            ),
+            (
+                "trailing",
+                [deflated.as_slice(), b"XY"].concat(),
+                "Unexpected data after",
+            ),
+        ] {
+            let path = temp_path(&format!("deflated-{name}.dcm"));
+            write_part10_with(&path, uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN, &bytes);
+            let path_text = path.to_str().unwrap();
+            let opened = open_nodes(path_text);
+            let index = splice::FileIndex::read(path_text);
+            let text = TextValues::try_read(path_text);
+            std::fs::remove_file(&path).ok();
+
+            let error = opened.err().unwrap_or_default();
+            assert!(error.contains(expected), "{name}: {error}");
+            assert!(index.is_err(), "{name}");
+            assert!(text.is_err(), "{name}");
+        }
+        // Zero padding after the stream is fine.
+        let path = temp_path("deflated-padding.dcm");
+        write_part10_with(
+            &path,
+            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
+            &[deflated.as_slice(), &[0, 0]].concat(),
+        );
+        let opened = open_nodes(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(values_in(&opened.unwrap().nodes, "(0010,0020)"), "ID001");
+    }
+
+    /// Review on #26: deflated files are read up to where Pixel Data starts in the file,
+    /// like other files, so that a broken Pixel Data or elements after it (with tags out
+    /// of order) do not change the tree.
+    #[test]
+    fn deflated_files_are_read_up_to_pixel_data() {
+        let mut broken_pixel_data = vec![0xE0, 0x7F, 0x10, 0x00, b'O', b'W', 0, 0];
+        broken_pixel_data.extend_from_slice(&1000_u32.to_le_bytes());
+        broken_pixel_data.extend_from_slice(&[1, 2, 3, 4]);
+        let mut pixel_data = vec![0xE0, 0x7F, 0x10, 0x00, b'O', b'W', 0, 0];
+        pixel_data.extend_from_slice(&4_u32.to_le_bytes());
+        pixel_data.extend_from_slice(&[1, 2, 3, 4]);
+        for (name, tail) in [
+            ("broken", broken_pixel_data),
+            (
+                "unordered",
+                [
+                    pixel_data,
+                    explicit_element(0x0010, 0x0030, b"DA", b"20000101"),
+                ]
+                .concat(),
+            ),
+        ] {
+            let dataset = [
+                base_elements(b"ISO_IR 192"),
+                explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+                tail,
+            ]
+            .concat();
+            let path = temp_path(&format!("deflated-pixel-{name}.dcm"));
+            write_part10_with(
+                &path,
+                uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
+                &deflate::deflate(&dataset).unwrap(),
+            );
+            let opened = open_nodes(path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+
+            let nodes = opened.unwrap().nodes;
+            assert_eq!(values_in(&nodes, "(0010,0010)"), "山田^太郎", "{name}");
+            assert!(find_element(&nodes, "(0010,0030)").is_none(), "{name}");
+        }
     }
 }

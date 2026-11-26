@@ -11,9 +11,8 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use dicom_dictionary_std::uids;
 use dicom_object::FileMetaTable;
-use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
-use flate2::Compression;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 
 pub fn is_deflated(transfer_syntax: &str) -> bool {
     transfer_syntax.trim_end_matches(['\0', ' ']) == uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN
@@ -73,12 +72,39 @@ pub fn read_inflated(path: &str) -> Result<Option<InflatedFile>, String> {
     }))
 }
 
-/// Inflate a deflated data set from `source`, appending it to `out`. A byte after the
-/// end of the Deflate stream (the padding to an even length) is ignored.
+/// Inflate a deflated data set from `source`, appending it to `out`. The Deflate stream
+/// must end (a truncated one would read as a shorter data set, and saving would write
+/// that back); zero bytes after it (the padding to an even length) are ignored.
 pub fn inflate_into(source: &mut dyn Read, out: &mut Vec<u8>) -> Result<(), String> {
-    DeflateDecoder::new(source)
-        .read_to_end(out)
-        .map_err(|error| format!("Could not inflate the deflated data set: {error}"))?;
+    let mut input = Vec::new();
+    source
+        .read_to_end(&mut input)
+        .map_err(|error| error.to_string())?;
+    let mut decompress = Decompress::new(false);
+    loop {
+        out.reserve((input.len() * 2).max(64 * 1024));
+        let consumed = decompress.total_in() as usize;
+        let status = decompress
+            .decompress_vec(&input[consumed..], out, FlushDecompress::None)
+            .map_err(|error| format!("Could not inflate the deflated data set: {error}"))?;
+        match status {
+            Status::StreamEnd => break,
+            // Room was made for more output above; without more input, the stream is
+            // cut short.
+            _ if decompress.total_in() as usize == input.len() && out.len() < out.capacity() => {
+                return Err(
+                    "Could not inflate the deflated data set: it ends unexpectedly".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if input[decompress.total_in() as usize..]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err("Unexpected data after the deflated data set".to_string());
+    }
     Ok(())
 }
 
