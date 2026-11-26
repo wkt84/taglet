@@ -14,7 +14,7 @@ use encoding_rs::EUC_JP;
 const ESC: u8 = 0x1B;
 
 /// The character set in effect for a dataset or sequence item, per the DICOM standard.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TextCharset {
     /// Japanese ISO 2022 code extensions.
     Iso2022(Iso2022Charset),
@@ -67,10 +67,28 @@ impl TextCharset {
         Ok(encoded.join(&b'\\'))
     }
 
+    /// Decode a value's bytes, without trailing padding, or `None` when they are not
+    /// valid in this character set: where `decode` falls back to ISO 8859-1, or dicom-rs
+    /// writes invalid bytes as octal escapes such as "\\377".
+    pub fn decode_strict(&self, vr: VR, bytes: &[u8]) -> Option<String> {
+        let decoded = match self {
+            // Bytes the declared character sets do not cover decode as U+FFFD, or (high
+            // bytes without a G1 set) as ISO 8859-1.
+            TextCharset::Iso2022(charset) => charset
+                .decode_with(vr, bytes, true)
+                .filter(|decoded| !decoded.contains(char::REPLACEMENT_CHARACTER)),
+            TextCharset::Codec(codec) => codec
+                .decode(bytes)
+                .ok()
+                .filter(|decoded| codec.encode(decoded).is_ok_and(|encoded| encoded == bytes)),
+        }?;
+        Some(trim_padding(&decoded).to_string())
+    }
+
     /// Decode a value's bytes, without trailing padding.
     pub fn decode(&self, vr: VR, bytes: &[u8]) -> String {
         let decoded = match self {
-            TextCharset::Iso2022(charset) => charset.decode(vr, bytes),
+            TextCharset::Iso2022(charset) => charset.decode_with(vr, bytes, false),
             TextCharset::Codec(codec) => codec.decode(bytes).ok(),
         };
         let decoded = decoded.unwrap_or_else(|| latin1(bytes));
@@ -143,6 +161,12 @@ pub struct Iso2022Charset {
     /// such as "ISO_IR 13" (PS3.3 C.12.1.1.2); a lone "ISO 2022 IR 87", seen in the
     /// field, still uses them as there is no other way to write kanji.
     code_extensions: bool,
+    /// Whether JIS X 0201 (ISO 2022 IR 13), JIS X 0212 (ISO 2022 IR 159) and ISO 8859-1
+    /// (ISO 2022 IR 100) are declared, so that strict decoding can reject values that
+    /// switch to character sets the declaration does not include.
+    has_jis0201: bool,
+    has_jis0212: bool,
+    has_latin1: bool,
 }
 
 impl Iso2022Charset {
@@ -155,11 +179,19 @@ impl Iso2022Charset {
         let has_jis0208 = terms
             .iter()
             .any(|term| normalize_term(term) == "ISO 2022 IR 87");
+        let declares = |wanted: &[&str]| {
+            terms
+                .iter()
+                .any(|term| wanted.contains(&normalize_term(term).as_str()))
+        };
         Self {
             initial_g0,
             initial_g1,
             has_jis0208,
             code_extensions: terms.len() > 1 || has_jis0208,
+            has_jis0201: declares(&["ISO_IR 13", "ISO 2022 IR 13"]),
+            has_jis0212: declares(&["ISO 2022 IR 159"]),
+            has_latin1: declares(&["ISO_IR 100", "ISO 2022 IR 100"]),
         }
     }
 
@@ -254,19 +286,51 @@ impl Iso2022Charset {
     }
 
     /// Returns `None` for escape sequences this decoder does not know.
-    fn decode(&self, vr: VR, bytes: &[u8]) -> Option<String> {
+    /// Whether the declaration includes the character set an escape sequence designates.
+    fn declares(&self, designation: Designation) -> bool {
+        match designation {
+            Designation::G0(G0::Ascii) => true,
+            Designation::G0(G0::JisRoman) | Designation::G1(G1::Katakana) => self.has_jis0201,
+            Designation::G0(G0::Jis0208) => self.has_jis0208,
+            Designation::G0(G0::Jis0212) => self.has_jis0212,
+            Designation::G1(G1::Latin1) => self.has_latin1,
+            Designation::G1(G1::None) => false,
+        }
+    }
+
+    /// Decode one value. Bytes the declared character sets do not cover decode as
+    /// U+FFFD, or, for high bytes with no G1 set designated, as ISO 8859-1, unless
+    /// `strict`, which fails on those.
+    fn decode_with(&self, vr: VR, bytes: &[u8], strict: bool) -> Option<String> {
         let multi_valued = !is_single_valued_text(vr);
         let person_name = vr == VR::PN;
         let mut out = String::with_capacity(bytes.len());
         let mut g0 = self.initial_g0;
         let mut g1 = self.initial_g1;
         let mut index = 0;
+        // Whether a Person Name value is in its first (alphabetic) component group,
+        // which must not switch to other character sets (PS3.5 6.2.1.2).
+        let mut first_name_group = person_name;
 
         while index < bytes.len() {
             let byte = bytes[index];
 
             if byte == ESC {
                 let (consumed, designation) = parse_escape(&bytes[index + 1..])?;
+                // Escape sequences need code extensions, which a single-valued
+                // declaration does not allow, and a character set that is declared.
+                if strict && !(self.code_extensions && self.declares(designation)) {
+                    return None;
+                }
+                if strict
+                    && first_name_group
+                    && match designation {
+                        Designation::G0(set) => set != self.initial_g0,
+                        Designation::G1(set) => set != self.initial_g1,
+                    }
+                {
+                    return None;
+                }
                 match designation {
                     Designation::G0(set) => g0 = set,
                     Designation::G1(set) => g1 = set,
@@ -281,6 +345,7 @@ impl Iso2022Charset {
                         out.push(char::from_u32(0xFF61 + u32::from(byte - 0xA1))?);
                     }
                     G1::Katakana => out.push(char::REPLACEMENT_CHARACTER),
+                    G1::None if strict => return None,
                     G1::Latin1 | G1::None => out.push(char::from(byte)),
                 }
                 index += 1;
@@ -324,6 +389,11 @@ impl Iso2022Charset {
                         _ => char::from(byte),
                     };
                     out.push(c);
+                    if person_name && byte == b'=' {
+                        first_name_group = false;
+                    } else if is_value_delimiter {
+                        first_name_group = person_name;
+                    }
                     if resets {
                         g0 = self.initial_g0;
                         g1 = self.initial_g1;
@@ -336,6 +406,7 @@ impl Iso2022Charset {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Designation {
     G0(G0),
     G1(G1),
@@ -366,6 +437,63 @@ fn parse_escape(rest: &[u8]) -> Option<(usize, Designation)> {
 /// special characters in row 13 (e.g. ①, Ⅰ, ㈱), which are not ISO-IR 87 characters.
 fn is_jis0208_row(row: u8) -> bool {
     (0x21..=0x28).contains(&row) || (0x30..=0x74).contains(&row)
+}
+
+/// Whether Taglet can write text under this Specific Character Set value: the default
+/// repertoire, one single-byte or Unicode character set that dicom-rs encodes, or the
+/// Japanese character sets (with ISO 2022 code extensions).
+///
+/// Terms are read as `from_specific_character_set` reads them, so that a declaration
+/// counts as writable only when the character set Taglet uses for it is the declared
+/// one.
+pub fn is_writable_declaration(value: &str) -> bool {
+    let terms = value
+        .split('\\')
+        .map(|term| term.trim_matches(|c: char| c == ' ' || c == '\0'))
+        .collect::<Vec<_>>();
+    match terms.as_slice() {
+        [""] => true,
+        // Single-valued: no code extensions (PS3.3 C.12.1.1.2).
+        ["ISO_IR 13"] => true,
+        [term] => !is_japanese_term(term) && SpecificCharacterSet::from_code(term).is_some(),
+        // Multi-valued: ISO 2022 terms only, the first one (or an empty first value)
+        // being the initial character set, and at least one Japanese multi-byte set.
+        [first, rest @ ..] => {
+            matches!(*first, "" | "ISO 2022 IR 6" | "ISO 2022 IR 13")
+                && rest.iter().all(|term| {
+                    matches!(
+                        *term,
+                        "ISO 2022 IR 13" | "ISO 2022 IR 87" | "ISO 2022 IR 159"
+                    )
+                })
+                && rest
+                    .iter()
+                    .any(|term| matches!(*term, "ISO 2022 IR 87" | "ISO 2022 IR 159"))
+        }
+        [] => true,
+    }
+}
+
+/// Whether Taglet reads text under this Specific Character Set value as declared:
+/// every term is one it knows, including spellings seen in the field that it does not
+/// write (e.g. a lone "ISO 2022 IR 87").
+pub fn is_readable_declaration(value: &str) -> bool {
+    if is_writable_declaration(value) {
+        return true;
+    }
+    let terms = value
+        .split('\\')
+        .map(|term| term.trim_matches(|c: char| c == ' ' || c == '\0'))
+        .collect::<Vec<_>>();
+    terms.iter().any(|term| is_japanese_term(term))
+        && terms.iter().all(|term| {
+            term.is_empty()
+                || is_japanese_term(term)
+                || matches!(
+                    normalize_term(term).as_str(),
+                    "ISO_IR 6" | "ISO 2022 IR 6" | "ISO_IR 100" | "ISO 2022 IR 100"
+                )
+        })
 }
 
 fn normalize_term(term: &str) -> String {
@@ -486,6 +614,108 @@ mod tests {
         for value in ["", "ISO_IR 100", "ISO_IR 192", "ISO 2022 IR 6", "GB18030"] {
             assert!(matches!(charset(value), TextCharset::Codec(_)), "{value:?}");
         }
+    }
+
+    #[test]
+    fn strict_decoding_rejects_invalid_bytes() {
+        let utf8 = charset("ISO_IR 192");
+        assert_eq!(
+            utf8.decode_strict(VR::LO, "山田 ".as_bytes()).unwrap(),
+            "山田"
+        );
+        assert!(utf8.decode_strict(VR::LO, b"ID\xff\xfe").is_none());
+        let jis = charset("\\ISO 2022 IR 87");
+        assert_eq!(
+            jis.decode_strict(VR::LO, b"\x1b$BA0N)A#\x1b(B").unwrap(),
+            "前立腺"
+        );
+        // Half-width katakana bytes without ISO 2022 IR 13 declared, or designated.
+        assert!(jis.decode_strict(VR::LO, b"\xca\xdd").is_none());
+        // Designating a character set the declaration does not include.
+        assert!(jis.decode_strict(VR::LO, b"\x1b)I\xca\xdd").is_none());
+        assert_eq!(jis.decode(VR::LO, b"\x1b)I\xca\xdd"), "ﾊﾝ");
+        // Kanji in the first (alphabetic) group of a Person Name.
+        assert!(jis
+            .decode_strict(VR::PN, b"\x1b$B;3ED\x1b(B^Tarou")
+            .is_none());
+        assert_eq!(
+            jis.decode_strict(VR::PN, b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B")
+                .unwrap(),
+            "Yamada^Tarou=山田^太郎"
+        );
+        // Half-width katakana in the first group (a G1 switch).
+        assert!(charset("\\ISO 2022 IR 13")
+            .decode_strict(VR::PN, b"\x1b)I\xca\xdd^Tarou")
+            .is_none());
+        // Escape sequences under a single-valued declaration (no code extensions).
+        assert!(charset("ISO_IR 13")
+            .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
+            .is_none());
+        assert_eq!(
+            charset("\\ISO 2022 IR 13")
+                .decode_strict(VR::LO, b"\x1b)I\xca\xdd")
+                .unwrap(),
+            "ﾊﾝ"
+        );
+        assert_eq!(
+            charset("ISO_IR 13")
+                .decode_strict(VR::LO, b"\xca\xdd")
+                .unwrap(),
+            "ﾊﾝ"
+        );
+    }
+
+    #[test]
+    fn readable_declarations() {
+        for value in [
+            "\\ISO 2022 IR 87",
+            "ISO 2022 IR 87",
+            "ISO_IR 13\\ISO 2022 IR 87",
+            "",
+        ] {
+            assert!(is_readable_declaration(value), "{value}");
+        }
+        for value in [
+            "\\ISO 2022 IR 87\\ISO 2022 IR 149",
+            "\\ISO 2022 IR 149",
+            "UTF-8",
+        ] {
+            assert!(!is_readable_declaration(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn writable_declarations() {
+        for value in [
+            "",
+            "ISO_IR 192",
+            "ISO_IR 100 ",
+            "GB18030",
+            "\\ISO 2022 IR 87",
+            "ISO 2022 IR 13\\ISO 2022 IR 87",
+            "ISO_IR 13",
+            "ISO 2022 IR 6\\ISO 2022 IR 87\\ISO 2022 IR 159",
+        ] {
+            assert!(is_writable_declaration(value), "{value}");
+        }
+        for value in [
+            "\\ISO 2022 IR 149",
+            "ISO_IR 100\\ISO 2022 IR 87",
+            // Single-valued terms in a multi-valued declaration, and the other way round.
+            "ISO_IR 13\\ISO 2022 IR 87",
+            "ISO_IR 6\\ISO 2022 IR 87",
+            "ISO 2022 IR 87",
+            "ISO 2022 IR 6\\ISO 2022 IR 13",
+            "ISO_IR 192\\ISO_IR 100",
+            "UTF-8",
+        ] {
+            assert!(!is_writable_declaration(value), "{value}");
+        }
+        // Spellings dicom-rs does not know are not written as if they were known.
+        assert!(!is_writable_declaration("ISO IR 192"));
+        assert!(!is_writable_declaration("ISO IR 100"));
+        assert_eq!(charset("ISO_IR 192 "), charset("ISO_IR 192"));
+        assert_ne!(charset("ISO IR 192"), charset("ISO_IR 192"));
     }
 
     #[test]

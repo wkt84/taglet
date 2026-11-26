@@ -21,8 +21,8 @@ use std::str::FromStr;
 
 use super::charset::{
     byte_transparent_string, dicom_rs_codec_after, dicom_rs_codec_is_byte_transparent,
-    dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_single_valued_text, trim_padding,
-    TextCharset,
+    dicom_rs_read, dicom_rs_write, is_charset_sensitive, is_readable_declaration,
+    is_single_valued_text, is_writable_declaration, trim_padding, TextCharset,
 };
 use super::model::{
     DicomFileContent, DicomFrameImage, DicomFramePixels, DicomImageInfo, DicomNode, DicomTagInfo,
@@ -983,15 +983,14 @@ fn plan_splice(
     if changes_anything && has_group_length(index.nodes()) {
         return Ok(None);
     }
-    // Changing or removing a declaration changes how other text reads; changing the SOP
-    // UIDs changes the file meta information; group lengths would have to be updated.
-    // All of these go through the full writer.
+    // Changing the SOP UIDs changes the file meta information, and group lengths would
+    // have to be updated: these go through the full writer. (A changed Specific
+    // Character Set is handled below, by converting the text it applies to.)
     let needs_full_writer = |path: &Vec<String>| {
         let Some(Ok(tag)) = path.last().map(|tag| parse_tag(tag)) else {
             return true;
         };
-        tag == tags::SPECIFIC_CHARACTER_SET
-            || tag.element() == 0x0000
+        tag.element() == 0x0000
             || (path.len() == 1 && (tag == tags::SOP_CLASS_UID || tag == tags::SOP_INSTANCE_UID))
     };
     if edited
@@ -1011,6 +1010,36 @@ fn plan_splice(
     {
         return Ok(None);
     }
+    // Data sets and items whose character set changes, with the new one. Their text is
+    // converted: written again in the new character set, reading the same.
+    let mut old_declarations = HashMap::new();
+    object_declarations(object, &[], "", &mut old_declarations);
+    let mut new_declarations = HashMap::new();
+    node_declarations(nodes, &[], "", &mut new_declarations)?;
+    let mut converted = HashMap::new();
+    for (container, declaration) in &new_declarations {
+        let old = old_declarations.get(container);
+        // Declarations Taglet cannot write text in are left to the full writer, as
+        // before, also when they read like the old one (e.g. an unknown spelling, read
+        // as the default repertoire like no declaration).
+        // The same for declarations Taglet does not read as declared (e.g. with a term
+        // it does not know), as their text could not be converted.
+        if old.map(|old: &String| trim_padding(old)) != Some(trim_padding(declaration))
+            && !(is_writable_declaration(declaration)
+                && old.is_some_and(|old| is_readable_declaration(old)))
+        {
+            return Ok(None);
+        }
+        let charset = TextCharset::from_specific_character_set(declaration);
+        if old
+            .map(|old| TextCharset::from_specific_character_set(old))
+            .as_ref()
+            != Some(&charset)
+        {
+            converted.insert(container.clone(), charset);
+        }
+    }
+
     let shown = shown_values(nodes);
     let mut edits = splice::Edits::default();
     let mut failures = Vec::new();
@@ -1029,7 +1058,11 @@ fn plan_splice(
             if !is_text_editable(vr) || (parent.is_empty() && tag >= PIXEL_DATA) {
                 return Ok(None);
             }
-            let Some(charset) = container_charset(object, parent) else {
+            let Some(charset) = converted
+                .get(parent)
+                .cloned()
+                .or_else(|| container_charset(object, parent))
+            else {
                 return Ok(None);
             };
             match encode_spliced_value(vr, value, Some(&charset)) {
@@ -1056,7 +1089,10 @@ fn plan_splice(
         if *node_vr != vr.to_string() {
             return Ok(None);
         }
-        match encode_spliced_value(vr, value, text.get(path).map(|read| &read.charset)) {
+        let charset = converted
+            .get(&path[..path.len() - 1])
+            .or_else(|| text.get(path).map(|read| &read.charset));
+        match encode_spliced_value(vr, value, charset) {
             Ok(Some(bytes)) => {
                 edits.replacements.insert(path.clone(), bytes);
             }
@@ -1064,15 +1100,193 @@ fn plan_splice(
             Err(reason) => failures.push(format!("{} ({reason})", path.join(" / "))),
         }
     }
-    if !failures.is_empty() {
-        failures.sort();
-        return Err(format!(
-            "Cannot save: these text values cannot be saved as shown: {}",
-            failures.join("; ")
-        ));
+    let mut conversion_failures = Vec::new();
+    if !converted.is_empty() {
+        match convert_text(
+            index.nodes(),
+            text,
+            &new_declarations,
+            &converted,
+            &edited,
+            &diff.removed,
+        ) {
+            Ok(replacements) => edits.replacements.extend(replacements),
+            Err(failures) => conversion_failures = failures,
+        }
+    }
+    if !failures.is_empty() || !conversion_failures.is_empty() {
+        let mut reasons = Vec::new();
+        if !failures.is_empty() {
+            failures.sort();
+            reasons.push(format!(
+                "these text values cannot be saved as shown: {}",
+                failures.join("; ")
+            ));
+        }
+        if !conversion_failures.is_empty() {
+            conversion_failures.sort();
+            reasons.push(format!(
+                "changing the Specific Character Set needs these values written in the new character set, which is not possible: {}",
+                conversion_failures.join("; ")
+            ));
+        }
+        return Err(format!("Cannot save: {}", reasons.join(". ")));
     }
     edits.removals = diff.removed;
     Ok(Some((index, edits)))
+}
+
+/// The Specific Character Set value in effect for the data set and each item in
+/// `obj`, by container path (empty for the data set).
+fn object_declarations(
+    obj: &InMemDicomObject,
+    parent: &[String],
+    inherited: &str,
+    out: &mut HashMap<Vec<String>, String>,
+) {
+    let declaration = match obj.get(tags::SPECIFIC_CHARACTER_SET) {
+        Some(element) => element
+            .to_str()
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        None => inherited.to_string(),
+    };
+    for element in obj.iter() {
+        if let Value::Sequence(sequence) = element.value() {
+            for (index, item) in sequence.items().iter().enumerate() {
+                let mut item_path = parent.to_vec();
+                item_path.push(format_tag(element.tag()));
+                item_path.push(format!("Item#{index}"));
+                object_declarations(item, &item_path, &declaration, out);
+            }
+        }
+    }
+    out.insert(parent.to_vec(), declaration);
+}
+
+/// The Specific Character Set value in effect for the data set and each item as saved
+/// from `nodes`, by container path (empty for the data set).
+fn node_declarations(
+    nodes: &[DicomNode],
+    parent: &[String],
+    inherited: &str,
+    out: &mut HashMap<Vec<String>, String>,
+) -> Result<(), String> {
+    let mut declaration = inherited.to_string();
+    for node in nodes {
+        if let DicomNode::Element { tag, value, .. } = node {
+            if parse_tag(tag)? == tags::SPECIFIC_CHARACTER_SET {
+                declaration = value.clone();
+            }
+        }
+    }
+    for node in nodes {
+        if let DicomNode::Sequence { path, items, .. } = node {
+            for (index, item) in items.iter().enumerate() {
+                let mut item_path = path.clone();
+                item_path.push(format!("Item#{index}"));
+                node_declarations(item, &item_path, &declaration, out)?;
+            }
+        }
+    }
+    out.insert(parent.to_vec(), declaration);
+    Ok(())
+}
+
+/// Encode the text values of data sets and items whose character set changes in their
+/// new character set (`converted`, by container path), so that they read the same.
+/// Values that are edited (encoded with the new character set by the caller) or
+/// removed are skipped. Fails with the values that cannot be converted.
+///
+/// `read` holds the data set and items that were read (as keys); items that were not
+/// (in sequences after Pixel Data) take their character set from the nearest one that
+/// was, so their text counts as unread when that one is converted.
+fn convert_text(
+    index: &[splice::IndexNode],
+    text: &TextValues,
+    read: &HashMap<Vec<String>, String>,
+    converted: &HashMap<Vec<String>, TextCharset>,
+    edited: &HashSet<Vec<String>>,
+    removed: &HashSet<Vec<String>>,
+) -> Result<HashMap<Vec<String>, Vec<u8>>, Vec<String>> {
+    fn indexed_elements(
+        nodes: &[splice::IndexNode],
+        parent: &[String],
+        out: &mut Vec<(Vec<String>, Option<VR>)>,
+    ) {
+        for node in nodes {
+            match node {
+                splice::IndexNode::Element { tag, vr, .. } => {
+                    let mut path = parent.to_vec();
+                    path.push(format_tag(*tag));
+                    out.push((path, *vr));
+                }
+                splice::IndexNode::Sequence { tag, items, .. } => {
+                    for (index, item) in items.iter().enumerate() {
+                        let mut item_path = parent.to_vec();
+                        item_path.push(format_tag(*tag));
+                        item_path.push(format!("Item#{index}"));
+                        indexed_elements(item.nodes(), &item_path, out);
+                    }
+                }
+                splice::IndexNode::Opaque { .. } => {}
+            }
+        }
+    }
+    let mut elements = Vec::new();
+    indexed_elements(index, &[], &mut elements);
+    let mut replacements = HashMap::new();
+    let mut failures = Vec::new();
+    for (path, vr) in elements {
+        // Elements of unknown VR (e.g. private elements in Implicit VR files, read as
+        // UN) are bytes to Taglet, so they are kept as they are.
+        let Some(vr) = vr.filter(|vr| is_charset_sensitive(*vr)) else {
+            continue;
+        };
+        let shown = path.join(" / ");
+        let mut container = &path[..path.len() - 1];
+        while !read.contains_key(container) && container.len() >= 2 {
+            container = &container[..container.len() - 2];
+        }
+        let Some(charset) = converted.get(container) else {
+            continue;
+        };
+        if !read.contains_key(&path[..path.len() - 1]) {
+            failures.push(format!(
+                "{shown} (it is not read, so it cannot be converted)"
+            ));
+            continue;
+        }
+        if edited.contains(&path) || removed.contains(&path) {
+            continue;
+        }
+        let Some(read) = text.get(&path).filter(|read| read.vr == vr) else {
+            // E.g. text after Pixel Data, which is not read.
+            failures.push(format!(
+                "{shown} (it is not read, so it cannot be converted)"
+            ));
+            continue;
+        };
+        let Some(decoded) = read.charset.decode_strict(vr, &read.bytes) else {
+            failures.push(format!(
+                "{shown} (its bytes are not valid in the current character set, so it cannot be converted)"
+            ));
+            continue;
+        };
+        match encode_spliced_value(vr, &decoded, Some(charset)) {
+            Ok(Some(bytes)) if bytes == read.bytes => {}
+            Ok(Some(bytes)) => {
+                replacements.insert(path, bytes);
+            }
+            Ok(None) => failures.push(format!("{shown} (it cannot be converted)")),
+            Err(reason) => failures.push(format!("{shown} ({reason})")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(replacements)
+    } else {
+        Err(failures)
+    }
 }
 
 /// Plain elements added to or removed from the file by the nodes.
@@ -2261,7 +2475,7 @@ fn encode_edited_text(
         match dicom_rs_write(codec, stored) {
             Some(written) if charset.decode(vr, &written) == entered => Ok(None),
             _ => Err(
-                "it can only be written by editing the file in place, which needs an Explicit or Implicit VR Little Endian file and a save that does not add or remove sequences or items or change the Specific Character Set or SOP UIDs".to_string(),
+                "it can only be written by editing the file in place, which is possible for Explicit or Implicit VR Little Endian files without group length elements, when the save does not add or remove sequences or items or change the SOP UIDs, and, when the Specific Character Set changes, if Taglet can write text in the new one".to_string(),
             ),
         }
     }
@@ -4361,7 +4575,7 @@ mod tests {
     }
 
     #[test]
-    fn added_elements_are_spliced_and_declaration_changes_are_not() {
+    fn added_elements_are_spliced() {
         let path = temp_path("splice-fallback.dcm");
         write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
         let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
@@ -4386,17 +4600,316 @@ mod tests {
             .unwrap()
             .is_some());
         let added_result = save_file(&path, &added);
-        // Changing the declaration (the full writer then refuses, as the meaning of
-        // the existing Japanese text would change).
-        let mut declaration = opened.clone();
-        *find_element_mut(&mut declaration, &["(0008,0005)"]).unwrap() = "ISO_IR 192".to_string();
-        let declaration_result = save_file(&path, &declaration);
         std::fs::remove_file(&path).ok();
 
         assert!(contains(&added_result.unwrap(), b"\x1b$BF,It\x1b(B"));
-        assert!(declaration_result
-            .unwrap_err()
-            .contains("bytes or meaning would change"));
+    }
+
+    // ---- Changing Specific Character Set: the text is converted ----
+
+    fn set_value(nodes: &mut [DicomNode], path: &[&str], value: &str) {
+        *find_element_mut(nodes, path).unwrap() = value.to_string();
+    }
+
+    #[test]
+    fn changing_the_character_set_converts_text_to_it() {
+        let path = temp_path("convert-to-utf8.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        // An edit in the same save is written in the new character set too.
+        set_value(&mut nodes, &["(0010,0020)"], "患者01");
+        let spliced = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(spliced);
+        let saved = saved.unwrap();
+        assert!(
+            !saved.contains(&0x1B),
+            "no ISO 2022 escape sequences remain"
+        );
+        assert!(contains(
+            &saved,
+            "Yamada^Tarou=山田^太郎=やまだ^たろう".as_bytes()
+        ));
+        assert!(contains(&saved, "前立腺".as_bytes()));
+        assert!(contains(&saved, "患者01".as_bytes()));
+        let reopened = reopen("convert-to-utf8-reopened.dcm", &saved);
+        assert_eq!(
+            value_and_editable(&reopened, "(0010,0010)").0,
+            "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        );
+        assert_eq!(value_and_editable(&reopened, "(3006,0026)").0, "前立腺");
+        assert_eq!(value_and_editable(&reopened, "(0010,0020)").0, "患者01");
+    }
+
+    #[test]
+    fn converting_to_iso_2022_follows_its_rules() {
+        let path = temp_path("convert-to-jis.dcm");
+        let rest = [
+            explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+            roi_sequence(None, "前立腺".as_bytes()),
+        ]
+        .concat();
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let original = std::fs::read(&path).unwrap();
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "\\ISO 2022 IR 87");
+        // Kanji cannot be in the first (alphabetic) name group with code extensions.
+        let first_group = save_file(&path, &nodes);
+        set_value(&mut nodes, &["(0010,0010)"], "Yamada^Taro=山田^太郎");
+        let saved = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let error = first_group.unwrap_err();
+        assert!(
+            error.contains("(0010,0010)") && error.contains("first (alphabetic) name group"),
+            "{error}"
+        );
+        let saved = saved.unwrap();
+        assert!(contains(&saved, PROSTATE_IR87));
+        assert!(contains(
+            &saved,
+            b"Yamada^Taro=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B"
+        ));
+        let reopened = reopen("convert-to-jis-reopened.dcm", &saved);
+        assert_eq!(value_and_editable(&reopened, "(3006,0026)").0, "前立腺");
+        assert_eq!(after, original);
+    }
+
+    /// Items declaring their own character set keep it when the data set's changes, and
+    /// changing an item's converts only that item.
+    #[test]
+    fn character_set_changes_follow_items() {
+        let path = temp_path("convert-items.dcm");
+        write_mixed_charset_file(&path);
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        let mut root = opened.clone();
+        set_value(&mut root, &["(0008,0005)"], "\\ISO 2022 IR 87");
+        set_value(&mut root, &["(0010,0010)"], "Suzuki^Hanako=鈴木^花子");
+        let root_saved = save_file(&path, &root);
+        let mut item = opened.clone();
+        set_value(
+            &mut item,
+            &["(3006,0020)", "Item#0", "(0008,0005)"],
+            "ISO_IR 192",
+        );
+        let item_saved = save_file(&path, &item);
+        std::fs::remove_file(&path).ok();
+
+        let root_saved = root_saved.unwrap();
+        assert!(contains(&root_saved, b"\x1b$BNkLZ\x1b(B^\x1b$B2V;R\x1b(B"));
+        assert!(
+            contains(&root_saved, HAN_IR13),
+            "the ISO_IR 13 item is kept"
+        );
+        let item_saved = item_saved.unwrap();
+        assert!(!contains(&item_saved, HAN_IR13));
+        assert!(contains(&item_saved, "ﾊﾝ".as_bytes()));
+        assert!(contains(&item_saved, "山田^太郎".as_bytes()));
+        let reopened = reopen("convert-items-reopened.dcm", &item_saved);
+        assert_eq!(value_and_editable(&reopened, "(3006,0026)").0, "ﾊﾝ");
+    }
+
+    #[test]
+    fn text_that_cannot_be_converted_blocks_saving() {
+        let path = temp_path("convert-fails.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87");
+        let original = std::fs::read(&path).unwrap();
+        let opened = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        // Removing the declaration leaves the default repertoire (ASCII).
+        let removed = opened
+            .iter()
+            .filter(|node| !matches!(node, DicomNode::Element { tag, .. } if tag == "(0008,0005)"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = save_file(&path, &removed);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let error = removed.unwrap_err();
+        assert!(error.contains("(0010,0010)"), "{error}");
+        assert!(
+            error.contains("(3006,0020) / Item#0 / (3006,0026)"),
+            "{error}"
+        );
+        assert!(error.contains("cannot be written"), "{error}");
+        assert_eq!(after, original);
+    }
+
+    /// Text in items after Pixel Data is not read; when it would take the converted
+    /// character set, saving stops instead of leaving it in the old one.
+    #[test]
+    fn unread_text_after_pixel_data_blocks_conversion() {
+        let path = temp_path("convert-trailing.dcm");
+        let mut pixel = Vec::new();
+        pixel.extend_from_slice(&[0xE0, 0x7F, 0x10, 0x00]);
+        pixel.extend_from_slice(b"OW\0\0");
+        pixel.extend_from_slice(&4_u32.to_le_bytes());
+        pixel.extend_from_slice(&[1, 2, 3, 4]);
+        let rest = [
+            explicit_element(0x0010, 0x0010, b"PN", YAMADA_IR87),
+            pixel,
+            explicit_element(0x7FE1, 0x0010, b"LO", b"VENDOR"),
+            sequence(
+                0x7FE1,
+                0x1001,
+                &[explicit_element(0x7FE1, 0x1002, b"LO", PROSTATE_IR87)],
+                true,
+            ),
+        ]
+        .concat();
+        write_part10(&path, Some(b"\\ISO 2022 IR 87"), &rest);
+        let original = std::fs::read(&path).unwrap();
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0010,0010)"], "Yamada^Tarou");
+        let unchanged_charset = save_file(&path, &nodes);
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let converted = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(unchanged_charset.is_ok());
+        let error = converted.unwrap_err();
+        assert!(
+            error.contains("(7FE1,1001) / Item#0 / (7FE1,1002) (it is not read"),
+            "{error}"
+        );
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn unknown_declarations_are_left_to_the_full_writer_even_when_read_alike() {
+        let path = temp_path("convert-unknown-alike.dcm");
+        write_part10(
+            &path,
+            None,
+            &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        );
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        nodes.insert(0, element_node("(0008,0005)", "CS", "ISO IR 192", &[]));
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+    }
+
+    /// Declarations with terms Taglet does not know are not converted from, while
+    /// known spellings it does not write (a lone "ISO 2022 IR 87") are.
+    #[test]
+    fn declarations_taglet_cannot_read_are_not_converted_from() {
+        let path = temp_path("convert-from-unknown.dcm");
+        write_iso2022_rtstruct(&path, "\\ISO 2022 IR 87\\ISO 2022 IR 149");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "\\ISO 2022 IR 87");
+        let unknown = plans_splice(&path, &nodes);
+        write_iso2022_rtstruct(&path, "ISO 2022 IR 87");
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let lone = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!unknown);
+        assert!(contains(&lone.unwrap(), "前立腺".as_bytes()));
+    }
+
+    #[test]
+    fn bytes_invalid_in_the_current_character_set_are_not_converted() {
+        let path = temp_path("convert-invalid.dcm");
+        let rest = explicit_element(0x0010, 0x0020, b"LO", b"ID\xff\xfe");
+        write_part10(&path, Some(b"ISO_IR 192"), &rest);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 100");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let error = saved.unwrap_err();
+        assert!(
+            error.contains("(0010,0020)")
+                && error.contains("not valid in the current character set"),
+            "{error}"
+        );
+    }
+
+    /// A declaration dicom-rs does not know (here a misspelling of ISO_IR 192) is not
+    /// taken as the character set it resembles: the text is neither left unconverted
+    /// nor garbled.
+    #[test]
+    fn misspelled_declarations_do_not_garble_text() {
+        let path = temp_path("convert-misspelled.dcm");
+        write_part10(
+            &path,
+            Some(b"ISO_IR 192"),
+            &explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+        );
+        let original = std::fs::read(&path).unwrap();
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "ISO IR 192");
+        let saved = save_file(&path, &nodes);
+        let after = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(saved.is_err());
+        assert_eq!(after, original);
+    }
+
+    /// ISO 2022 values may designate their G1 set themselves (here ESC ) I).
+    #[test]
+    fn text_designating_its_own_g1_set_is_converted() {
+        let path = temp_path("convert-g1.dcm");
+        write_part10(
+            &path,
+            Some(b"\\ISO 2022 IR 13"),
+            &explicit_element(0x0010, 0x0020, b"LO", b"\x1b)I\xca\xdd"),
+        );
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        assert_eq!(value_and_editable(&nodes, "(0010,0020)").0, "ﾊﾝ");
+        set_value(&mut nodes, &["(0008,0005)"], "ISO_IR 192");
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert!(contains(&saved, "ﾊﾝ".as_bytes()));
+        let reopened = reopen("convert-g1-reopened.dcm", &saved);
+        assert_eq!(value_and_editable(&reopened, "(0010,0020)").0, "ﾊﾝ");
+    }
+
+    #[test]
+    fn character_sets_taglet_cannot_write_are_left_to_the_full_writer() {
+        let path = temp_path("convert-unsupported.dcm");
+        write_part10(
+            &path,
+            Some(b"ISO_IR 100"),
+            &explicit_element(0x0010, 0x0020, b"LO", b"ID001"),
+        );
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(&mut nodes, &["(0008,0005)"], "\\ISO 2022 IR 149");
+        let spliced = plans_splice(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+    }
+
+    #[test]
+    fn implicit_vr_text_is_converted() {
+        let path = temp_path("convert-implicit.dcm");
+        write_implicit_mixed_charset_file(&path);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        set_value(
+            &mut nodes,
+            &["(3006,0020)", "Item#0", "(0008,0005)"],
+            "ISO_IR 192",
+        );
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        let saved = saved.unwrap();
+        assert!(!contains(&saved, HAN_IR13));
+        let reopened = reopen("convert-implicit-reopened.dcm", &saved);
+        assert_eq!(value_and_editable(&reopened, "(3006,0026)").0, "ﾊﾝ");
+        assert_eq!(value_and_editable(&reopened, "(0010,0010)").0, "山田^太郎");
     }
 
     #[test]
