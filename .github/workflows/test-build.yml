@@ -1,9 +1,10 @@
 name: Test Build (Windows)
 
 # Windows builds for testing, separate from releases: no tag, no release, no updater
-# files. Run it from the Actions tab ("Run workflow", then pick a branch), or add the
-# "build:windows" label to a pull request (later pushes to it build again while the
-# label stays). The installers are attached to the run as an artifact.
+# files, and installed as a separate app ("Taglet Test"). Run it from the Actions tab
+# ("Run workflow", then pick a branch), or add the "build:windows" label to a pull
+# request (later pushes to it build again while the label stays). The installers are
+# attached to the run as an artifact.
 
 on:
   workflow_dispatch:
@@ -81,13 +82,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Updater files need the release signing key, and test builds should not be
-      # offered as updates anyway.
+      # src-tauri/tauri.test-build.conf.json makes the test build a separate app
+      # ("Taglet Test"), so it installs next to the release instead of replacing it,
+      # without file associations or update checks. It also creates no updater files,
+      # which would need the release signing key.
       - name: Build Tauri app
-        shell: bash
-        run: |
-          echo '{"bundle":{"createUpdaterArtifacts":false}}' > "$RUNNER_TEMP/test-build.json"
-          npm run tauri -- build --config "$RUNNER_TEMP/test-build.json"
+        run: npm run tauri -- build --config src-tauri/tauri.test-build.conf.json
 
       - name: Name the artifact
         id: name
