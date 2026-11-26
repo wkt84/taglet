@@ -2,7 +2,13 @@ import { expect, type Page } from '@playwright/test'
 import { files, FILE_A, FILE_B, FILE_C } from './fixtures'
 import type { DicomFileContent } from '../../src/types/dicom'
 
-export async function openMockFiles(page: Page, fixtureFiles: Record<string, DicomFileContent> = files, viewerResponses: Record<string, unknown> = {}) {
+export async function openMockFiles(
+  page: Page,
+  fixtureFiles: Record<string, DicomFileContent> = files,
+  viewerResponses: Record<string, unknown> = {},
+  // Whole values of previews, by file and key (see src/data/fullValues.ts).
+  fullValues: Record<string, Record<string, string>> = {},
+) {
   // Inject the official Tauri mocks before React mounts; production code is untouched.
   await page.route('**/src/main.tsx', async (route) => {
     const response = await route.fetch()
@@ -11,6 +17,7 @@ export async function openMockFiles(page: Page, fixtureFiles: Record<string, Dic
       mockWindows('main');
       const fixtureFiles = ${JSON.stringify(fixtureFiles)};
       const viewerResponses = ${JSON.stringify(viewerResponses)};
+      const fullValues = ${JSON.stringify(fullValues)};
       window.__testIpcCalls = [];
       mockIPC((command, args) => {
         window.__testIpcCalls.push({ command, args });
@@ -26,6 +33,11 @@ export async function openMockFiles(page: Page, fixtureFiles: Record<string, Dic
             const file = fixtureFiles[args.path];
             if (!file) throw new Error('Unknown fixture: ' + args.path);
             return structuredClone(file);
+          }
+          case 'get_full_value': {
+            const value = fullValues[args.path]?.[args.key];
+            if (value === undefined) throw new Error('Unknown whole value: ' + args.path + ' ' + args.key);
+            return value;
           }
           case 'set_current_dicom_file':
           case 'save_dicom_file': return null;

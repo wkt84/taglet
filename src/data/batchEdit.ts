@@ -1,11 +1,19 @@
 import type { DicomElement, DicomNode, ValidationResult } from '../types/dicom'
 import { canBatchEdit } from './privateTags.ts'
+import { isPreview, withValue } from './fullValues.ts'
 
 export type BatchValueChange = {
   documentId: string
   path: string[]
   previousValue: string
+  /** Whether `previousValue` is only the start of the value (see `data/fullValues`). */
+  previousIsPreview?: boolean
   value: string
+}
+
+/** Whether the element still holds the value the change was made from. */
+function holdsPrevious(element: DicomElement, change: BatchValueChange) {
+  return element.value === change.previousValue && isPreview(element) === (change.previousIsPreview === true)
 }
 
 export type TagOccurrence = { element: DicomElement; location: string }
@@ -81,7 +89,7 @@ export async function validateBatchValueChanges(
     if (element && !canBatchEdit(element) && element.editable) {
       throw new Error('Private tags do not support batch editing.')
     }
-    if (!element || !canBatchEdit(element) || element.value !== change.previousValue) {
+    if (!element || !canBatchEdit(element) || !holdsPrevious(element, change)) {
       throw new Error('A target has changed or is no longer editable. Review the preview and try again.')
     }
     const values = valuesByVr.get(element.vr) ?? new Set<string>()
@@ -102,8 +110,8 @@ export function applyBatchValueChanges(nodes: DicomNode[], changes: BatchValueCh
     return current.map((node) => {
       if (node.kind === 'Sequence') return { ...node, items: node.items.map(visit) }
       const change = byPath.get(JSON.stringify(node.path))
-      return change && canBatchEdit(node) && node.value === change.previousValue
-        ? { ...node, value: change.value }
+      return change && canBatchEdit(node) && holdsPrevious(node, change)
+        ? withValue(node, change.value)
         : node
     })
   }

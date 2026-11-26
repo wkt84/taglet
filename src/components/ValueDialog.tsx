@@ -3,20 +3,28 @@ import { createPortal } from 'react-dom'
 import { invoke } from '@tauri-apps/api/core'
 import type { DicomElement, ValidationResult } from '../types/dicom'
 import { formattedXml, valueMatrix } from '../data/valueFormats'
+import { fullValue, isPreview } from '../data/fullValues'
 
 type Props = {
   element: DicomElement
+  /** The open file the element is from, to fetch its whole value if it is a preview. */
+  filePath?: string
   onCommit: (value: string) => void
   onClose: () => void
 }
 
-export default function ValueDialog({ element, onCommit, onClose }: Props) {
+export default function ValueDialog({ element, filePath, onCommit, onClose }: Props) {
   const titleId = useId()
   const dialogRef = useRef<HTMLDialogElement>(null)
   const textRef = useRef<HTMLTextAreaElement>(null)
   const activeRef = useRef(false)
   const applyingRef = useRef(false)
-  const [draft, setDraft] = useState(element.value)
+  // The whole value: a preview's is fetched first, and until then nothing can be
+  // edited, copied or applied.
+  const [original, setOriginal] = useState(isPreview(element) ? undefined : element.value)
+  const [loadError, setLoadError] = useState<string>()
+  const [draft, setDraft] = useState(isPreview(element) ? '' : element.value)
+  const loading = original === undefined
   const [wrap, setWrap] = useState(true)
   const [applying, setApplying] = useState(false)
   const [validation, setValidation] = useState<ValidationResult>({ valid: true })
@@ -30,6 +38,27 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
   useEffect(() => {
     if (mode === 'xml' && xml === null) setMode('raw')
   }, [mode, xml])
+
+  // Fetched once per preview, not again when the element object is rebuilt (which would
+  // replace the draft being edited).
+  const fullValueKey = element.full_value_key
+  const elementRef = useRef(element)
+  useEffect(() => {
+    if (fullValueKey === undefined) return
+    let canceled = false
+    fullValue(filePath, elementRef.current)
+      .then((value) => {
+        if (canceled) return
+        setOriginal(value)
+        setDraft(value)
+      })
+      .catch((error) => {
+        if (!canceled) setLoadError(String(error))
+      })
+    return () => {
+      canceled = true
+    }
+  }, [fullValueKey, filePath])
 
   useEffect(() => {
     activeRef.current = true
@@ -45,7 +74,7 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
   }, [])
 
   async function apply() {
-    if (!element.editable || applyingRef.current) return
+    if (!element.editable || applyingRef.current || original === undefined) return
     applyingRef.current = true
     setApplying(true)
     try {
@@ -53,7 +82,7 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
       if (!activeRef.current) return
       setValidation(result)
       if (result.valid) {
-        if (draft !== element.value) onCommit(draft)
+        if (draft !== original) onCommit(draft)
         onClose()
       }
     } catch (error) {
@@ -65,6 +94,7 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
   }
 
   async function copy() {
+    if (loading) return
     try {
       await navigator.clipboard.writeText(draft)
       if (activeRef.current) setCopyStatus('Copied')
@@ -122,7 +152,7 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
           <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
             <label className="flex items-center gap-2">
               Display
-              <select aria-label="Display" disabled={applying} className="rounded border border-slate-300 bg-white px-2 py-1" value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
+              <select aria-label="Display" disabled={applying || loading} className="rounded border border-slate-300 bg-white px-2 py-1" value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
                 <option value="raw">Original</option>
                 <option value="table">Table</option>
                 {xml !== null ? <option value="xml">XML format</option> : null}
@@ -138,20 +168,20 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
               Wrap text
             </label>}
             <span className="text-xs text-slate-500">
-              {Array.from(draft).length.toLocaleString()} characters · DICOM Length: {element.length.toLocaleString()} bytes (loaded)
+              {loading ? 'Loading' : Array.from(draft).length.toLocaleString()} characters · DICOM Length: {element.length.toLocaleString()} bytes (loaded)
             </span>
           </div>
           <textarea
             hidden={mode !== 'raw'}
             ref={textRef}
             aria-label="Full value"
-            readOnly={!element.editable}
+            readOnly={!element.editable || loading}
             disabled={applying}
             wrap={wrap ? 'soft' : 'off'}
             spellCheck={false}
             className={`dicom-value-font h-[min(50vh,28rem)] min-h-32 w-full resize-none overflow-auto rounded border p-3 text-sm outline-none focus:ring-2 ${validation.valid ? 'border-slate-300 focus:border-blue-400 focus:ring-blue-200' : 'border-red-500 focus:ring-red-200'} ${wrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'}`}
-            value={draft}
-            onChange={(event) => { setDraft(event.target.value); setValidation({ valid: true }); setCopyStatus('') }}
+            value={loading ? (loadError ? `Could not load the whole value: ${loadError}` : 'Loading the whole value…') : draft}
+            onChange={(event) => { if (loading) return; setDraft(event.target.value); setValidation({ valid: true }); setCopyStatus('') }}
           />
           {mode === 'table' ? <div className="h-[min(50vh,28rem)] min-h-32 overflow-auto rounded border border-slate-300">
             <table aria-label="Value table" className="w-full border-collapse text-sm">
@@ -172,10 +202,10 @@ export default function ValueDialog({ element, onCommit, onClose }: Props) {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 px-4 py-3">
-          <button disabled={applying} className="rounded border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-50" onClick={() => void copy()}>Copy full value</button>
+          <button disabled={applying || loading} className="rounded border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-50" onClick={() => void copy()}>Copy full value</button>
           <span role="status" className="flex-1 text-xs text-slate-600">{copyStatus}</span>
           <button className="rounded px-3 py-1.5 text-sm hover:bg-slate-100" onClick={onClose}>{element.editable ? 'Cancel' : 'Close'}</button>
-          {element.editable && mode === 'raw' ? <button disabled={applying} className="rounded bg-blue-700 px-4 py-1.5 text-sm text-white hover:bg-blue-600 disabled:opacity-50" onClick={() => void apply()}>{applying ? 'Validating…' : 'Apply'}</button> : null}
+          {element.editable && mode === 'raw' ? <button disabled={applying || loading} className="rounded bg-blue-700 px-4 py-1.5 text-sm text-white hover:bg-blue-600 disabled:opacity-50" onClick={() => void apply()}>{applying ? 'Validating…' : 'Apply'}</button> : null}
         </div>
       </div>
     </dialog>,

@@ -3,13 +3,16 @@ import { invoke } from '@tauri-apps/api/core'
 import type { DicomElement, ValidationResult } from '../types/dicom'
 import { valuePreview } from '../data/valuePreview'
 import ValueDialog from './ValueDialog'
+import { isPreview } from '../data/fullValues'
 
 type Props = {
   element: DicomElement
+  /** The open file the element is from, to fetch its whole value if it is a preview. */
+  filePath?: string
   onCommit: (value: string) => void
 }
 
-export default function ValueCell({ element, onCommit }: Props) {
+export default function ValueCell({ element, filePath, onCommit }: Props) {
   const [editing, setEditing] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const preview = useMemo(() => valuePreview(element.value), [element.value])
@@ -38,11 +41,13 @@ export default function ValueCell({ element, onCommit }: Props) {
   }, [draft, editing, element.editable, element.vr])
 
   const hasDisplayOptions = element.value.includes('\\') || element.value.trimStart().startsWith('<')
-  if (preview.needsDialog || dialogOpen || hasDisplayOptions) {
+  // A preview is only the start of the value: it is shown and edited in the dialog,
+  // which fetches the whole value.
+  if (preview.needsDialog || dialogOpen || hasDisplayOptions || isPreview(element)) {
     return (
       <div className="flex min-w-0 items-center gap-2">
         <span className={`dicom-value-font min-w-0 flex-1 truncate ${element.editable ? '' : 'text-slate-500'}`}>
-          {preview.text || '(empty)'}
+          {isPreview(element) && !preview.text.endsWith('…') ? `${preview.text}…` : preview.text || '(empty)'}
         </span>
         <button
           className="shrink-0 rounded border border-slate-300 px-2 py-0.5 text-xs text-blue-700 hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-300"
@@ -50,7 +55,7 @@ export default function ValueCell({ element, onCommit }: Props) {
         >
           View full value
         </button>
-        {dialogOpen ? <ValueDialog element={element} onCommit={onCommit} onClose={() => setDialogOpen(false)} /> : null}
+        {dialogOpen ? <ValueDialog element={element} filePath={filePath} onCommit={onCommit} onClose={() => setDialogOpen(false)} /> : null}
       </div>
     )
   }

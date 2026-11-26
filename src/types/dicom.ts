@@ -8,6 +8,8 @@ export type DicomElement = {
   length: number
   path: string[]
   editable: boolean
+  /** Set when `value` is only the start of a long value: the key to fetch it whole (see `data/fullValues`). */
+  full_value_key?: string
 }
 
 export type DicomSequence = {

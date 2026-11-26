@@ -4,7 +4,8 @@ name: Test Build (Windows)
 # files, and installed as a separate app ("Taglet Test"). Run it from the Actions tab
 # ("Run workflow", then pick a branch), or add the "build:windows" label to a pull
 # request (later pushes to it build again while the label stays). The installers are
-# attached to the run as an artifact.
+# attached to the run as an artifact. The "test:windows" label runs only the Rust tests
+# on Windows, without building the installers.
 
 on:
   workflow_dispatch:
@@ -21,8 +22,8 @@ concurrency:
   group: >-
     test-build-${{ github.event.pull_request.number || github.ref }}-${{
     (github.event_name == 'workflow_dispatch' ||
-    (github.event.action == 'labeled' && github.event.label.name == 'build:windows') ||
-    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:windows')))
+    (github.event.action == 'labeled' && (github.event.label.name == 'build:windows' || github.event.label.name == 'test:windows')) ||
+    (github.event.action == 'synchronize' && (contains(github.event.pull_request.labels.*.name, 'build:windows') || contains(github.event.pull_request.labels.*.name, 'test:windows'))))
     && 'build' || github.run_id }}
   cancel-in-progress: true
 
@@ -30,8 +31,8 @@ jobs:
   test:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.action == 'labeled' && github.event.label.name == 'build:windows') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:windows'))
+      (github.event.action == 'labeled' && (github.event.label.name == 'build:windows' || github.event.label.name == 'test:windows')) ||
+      (github.event.action == 'synchronize' && (contains(github.event.pull_request.labels.*.name, 'build:windows') || contains(github.event.pull_request.labels.*.name, 'test:windows')))
     runs-on: windows-latest
     steps:
       # The pull request's own head commit, not the merge with the base branch, so
