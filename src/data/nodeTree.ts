@@ -62,6 +62,32 @@ export function deleteNodeAtPath(nodes: DicomNode[], path: string[]): DicomNode[
 }
 
 /**
+ * Add an empty item at the end of the sequence at `sequencePath`. `item_sources`
+ * records it as new, so that saving writes it after the file's items. Returns the new
+ * item's path, or `undefined` when there is no such sequence.
+ */
+export function appendItem(
+  nodes: DicomNode[],
+  sequencePath: string[],
+): { nodes: DicomNode[]; itemPath?: string[] } {
+  let itemPath: string[] | undefined
+  const visit = (current: DicomNode[]): DicomNode[] => current.map((node) => {
+    if (node.kind === 'Element') return node
+    if (samePath(node.path, sequencePath)) {
+      const sources = node.item_sources ?? node.items.map((_, index) => index)
+      itemPath = [...node.path, `Item#${node.items.length}`]
+      return { ...node, items: [...node.items, []], item_sources: [...sources, null] }
+    }
+    if (!sequencePath.slice(0, node.path.length).every((part, index) => part === node.path[index])) {
+      return node
+    }
+    return { ...node, items: node.items.map(visit) }
+  })
+  const result = visit(nodes)
+  return itemPath ? { nodes: result, itemPath } : { nodes }
+}
+
+/**
  * The nodes without `item_sources`: after a save, the file's items are the shown
  * ones, in order, so the sources no longer apply.
  */

@@ -14,7 +14,7 @@ CT、MR、RT Plan、RT Structure Set、RT Dose などの DICOM ファイルを�
 - テキスト系 VR の編集
 - 同じタグ番号の一括変更（親 Sequence 配下・ファイル全体・複数ファイル）
 - multiple value の validation
-- Tag の追加、Tag / Sequence / Sequence Item の削除
+- Tag / Sequence / Sequence Item の追加と削除（Sequence は Add Tag で SQ を選んで追加し、Item は Add Item で追加）
 - Save / Save As
 - 複数 DICOM ファイルをタブで表示
 - ドラッグアンドドロップでファイルを開く

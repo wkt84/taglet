@@ -454,6 +454,9 @@ pub struct Edits {
     pub insertions: HashMap<Vec<String>, Vec<(Tag, Vec<u8>)>>,
     /// Existing elements, sequences and items to leave out.
     pub removals: HashSet<Vec<String>>,
+    /// New items (encoded whole, see `item_start`) to write after the existing items
+    /// of the sequence at the path.
+    pub appended_items: HashMap<Vec<String>, Vec<Vec<u8>>>,
     /// New values of existing file meta information elements (e.g. Media Storage SOP
     /// Instance UID), encoded and padded. File Meta Information Group Length
     /// (0002,0000) is updated to match.
@@ -733,6 +736,10 @@ impl SpliceWriter<'_> {
                         self.item(item, &item_path)?;
                     }
                 }
+                let edits = self.edits;
+                for item in edits.appended_items.get(&path).into_iter().flatten() {
+                    self.write(item)?;
+                }
                 if !*defined_length {
                     // Sequence delimitation item.
                     self.copy(end - 8, *end)?;
@@ -810,6 +817,7 @@ impl SpliceWriter<'_> {
         self.edits.replacements.keys().any(below)
             || self.edits.removals.iter().any(below)
             || self.edits.insertions.keys().any(below)
+            || self.edits.appended_items.keys().any(below)
     }
 
     fn nodes_length(&self, nodes: &[IndexNode], parent: &[String]) -> Result<u32, String> {
@@ -868,12 +876,43 @@ impl SpliceWriter<'_> {
             let content = u64::from(self.nodes_length(&item.nodes, &item_path)?);
             total += 8 + content + if item.defined_length { 0 } else { 8 };
         }
+        for item in self.edits.appended_items.get(path).into_iter().flatten() {
+            total += item.len() as u64;
+        }
         checked_length(total, "A sequence")
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.out.write_all(bytes).map_err(|error| error.to_string())
     }
+}
+
+/// The start of a new sequence, of undefined length (closed by `sequence_end`).
+pub fn sequence_start(tag: Tag, explicit: bool) -> Vec<u8> {
+    long_header(tag, *b"SQ", UNDEFINED, explicit)
+}
+
+/// The sequence delimitation item.
+pub fn sequence_end() -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&SEQUENCE_DELIMITER.group().to_le_bytes());
+    out.extend_from_slice(&SEQUENCE_DELIMITER.element().to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out
+}
+
+/// The start of a new item, of undefined length (closed by `item_end`).
+pub fn item_start() -> Vec<u8> {
+    item_header(UNDEFINED)
+}
+
+/// The item delimitation item.
+pub fn item_end() -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&ITEM_DELIMITER.group().to_le_bytes());
+    out.extend_from_slice(&ITEM_DELIMITER.element().to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out
 }
 
 /// Whether a group length element (gggg,0000) is a 4-byte UL value, which splicing

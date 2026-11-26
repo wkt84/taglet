@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { deleteNodeAtPath, withoutItemSources } from '../src/data/nodeTree.ts'
+import { appendItem, deleteNodeAtPath, withoutItemSources } from '../src/data/nodeTree.ts'
 
 const SEQ = '(3006,0020)'
 const NESTED = '(3006,0040)'
@@ -64,4 +64,31 @@ test('after saving, item sources are dropped as the file now has the shown items
   assert.equal('item_sources' in saved[1].items[1][1], false)
   assert.equal(saved[1].items[1][0].value, 'GTV')
   assert.deepEqual(saved[1].items[1][0].path, [SEQ, 'Item#1', '(3006,0026)'])
+})
+
+test('appending an item adds an empty item recorded as new', () => {
+  const { nodes: result, itemPath } = appendItem(nodes(), [SEQ])
+  assert.deepEqual(itemPath, [SEQ, 'Item#3'])
+  assert.equal(result[1].items.length, 4)
+  assert.deepEqual(result[1].items[3], [])
+  assert.deepEqual(result[1].item_sources, [0, 1, 2, null])
+})
+
+test('items can be appended to nested and new sequences', () => {
+  const nested = appendItem(nodes(), [SEQ, 'Item#1', NESTED])
+  assert.deepEqual(nested.itemPath, [SEQ, 'Item#1', NESTED, 'Item#1'])
+  assert.deepEqual(nested.nodes[1].items[1][1].item_sources, [0, null])
+  assert.equal(nested.nodes[1].item_sources, undefined)
+
+  const added = [...nodes(), sequence('(3006,0080)', ['(3006,0080)'], [], { item_sources: [] })]
+  const withItem = appendItem(added, ['(3006,0080)'])
+  assert.deepEqual(withItem.nodes[2].item_sources, [null])
+  assert.equal(appendItem(nodes(), ['(0008,1140)']).itemPath, undefined)
+})
+
+test('removing a new item drops it from the sources', () => {
+  const appended = appendItem(appendItem(nodes(), [SEQ]).nodes, [SEQ]).nodes
+  const removed = deleteNodeAtPath(appended, [SEQ, 'Item#3'])
+  assert.deepEqual(removed[1].item_sources, [0, 1, 2, null])
+  assert.equal(removed[1].items.length, 4)
 })

@@ -1,13 +1,13 @@
 import { useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { DICOM_TAG_OPTIONS, DicomTagOption } from '../data/dicomTags'
-import type { DicomElement } from '../types/dicom'
+import type { DicomNode } from '../types/dicom'
 import { isPrivateTag } from '../data/privateTags'
 
 type Props = {
   existingTags: string[]
   targetLabel: string
-  onAdd: (node: DicomElement) => void
+  onAdd: (node: DicomNode) => void
   onClose: () => void
 }
 
@@ -54,7 +54,8 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
   }, [query])
 
   const isDuplicate = existingTags.includes(selected.tag)
-  const isSupported = EDITABLE_TEXT_VRS.has(selected.vr)
+  const isSequence = selected.vr === 'SQ'
+  const isSupported = isSequence || EDITABLE_TEXT_VRS.has(selected.vr)
 
   async function lookupCustomTag() {
     setError(undefined)
@@ -85,7 +86,22 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
       return
     }
     if (!isSupported) {
-      setError(`${selected.vr} is visible in the dictionary, but Add Tag currently supports text VRs only.`)
+      setError(`${selected.vr} is visible in the dictionary, but Add Tag currently supports text VRs and sequences only.`)
+      return
+    }
+
+    const description = selected.description || (isPrivateTag(selected.tag) ? '[Private]' : '[Unknown]')
+    if (isSequence) {
+      // An empty sequence; add items to it with Add Item.
+      onAdd({
+        kind: 'Sequence',
+        tag: selected.tag,
+        description,
+        length: 0,
+        path: [selected.tag],
+        items: [],
+        item_sources: [],
+      })
       return
     }
 
@@ -93,7 +109,7 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
       kind: 'Element',
       tag: selected.tag,
       vr: selected.vr,
-      description: selected.description || (isPrivateTag(selected.tag) ? '[Private]' : '[Unknown]'),
+      description,
       value,
       length: value.length,
       path: [selected.tag],
@@ -154,14 +170,20 @@ export default function AddTagDialog({ existingTags, targetLabel, onAdd, onClose
               </div>
             </div>
 
-            <label className="block text-sm">
-              Initial Value
-              <input
-                className="mt-1 w-full rounded border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-300"
-                value={value}
-                onChange={(event) => setValue(event.target.value)}
-              />
-            </label>
+            {isSequence ? (
+              <div className="rounded bg-slate-100 p-2 text-sm text-slate-600">
+                Adds an empty sequence. Select it and use Add Item to add items.
+              </div>
+            ) : (
+              <label className="block text-sm">
+                Initial Value
+                <input
+                  className="mt-1 w-full rounded border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-blue-400 focus:ring-1 focus:ring-blue-300"
+                  value={value}
+                  onChange={(event) => setValue(event.target.value)}
+                />
+              </label>
+            )}
 
             <div className="rounded border border-slate-200 p-3">
               <label className="block text-sm">
