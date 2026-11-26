@@ -4,6 +4,7 @@ import { open, save } from '@tauri-apps/plugin-dialog'
 import type { DicomElement, DicomFileContent, DicomNode, ValidationResult } from '../types/dicom'
 import { applyBatchValueChanges, validateBatchValueChanges, type BatchValueChange } from '../data/batchEdit'
 import { appendItem, deleteNodeAtPath, withoutItemSources } from '../data/nodeTree'
+import { recordOpen } from '../data/timings'
 
 export type DicomDocument = {
   id: string
@@ -207,7 +208,9 @@ export function useDicomFile() {
         return true
       }
 
+      const started = performance.now()
       const loaded = await invoke<DicomFileContent>('open_dicom_file', { path })
+      const received = performance.now()
       const id = crypto.randomUUID()
       setDocuments((current) => {
         const next = [
@@ -221,6 +224,7 @@ export function useDicomFile() {
       if (loaded.warnings.length > 0) {
         setWarnings((current) => [...current, ...loaded.warnings])
       }
+      recordOpen(path.split(/[\\/]/).pop() ?? path, started, received, loaded.open_ms)
       return true
     } catch (error) {
       setError(String(error))

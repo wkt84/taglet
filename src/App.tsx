@@ -12,6 +12,7 @@ import DocumentTabs from './components/DocumentTabs'
 import ImageViewer from './components/ImageViewer'
 import RtStructViewer from './components/RtStructViewer'
 import TagTable from './components/TagTable'
+import TimingBadge from './components/TimingBadge'
 import Toolbar from './components/Toolbar'
 import UpdateChecker from './components/UpdateChecker'
 import { useDicomFile } from './hooks/useDicomFile'
@@ -191,6 +192,7 @@ export default function App() {
   return (
     <main className="flex h-screen flex-col bg-slate-100 text-slate-900">
       <UpdateChecker />
+      <TimingBadge />
       <Toolbar
         title={title}
         {...dicom}

@@ -88,6 +88,9 @@ jobs:
       # which would need the release signing key.
       - name: Build Tauri app
         run: npm run tauri -- build --config src-tauri/tauri.test-build.conf.json
+        env:
+          # Show how long opening files and starting take (src/data/timings.ts).
+          VITE_TAGLET_TIMINGS: '1'
 
       - name: Name the artifact
         id: name

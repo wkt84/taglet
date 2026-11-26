@@ -34,6 +34,9 @@ pub struct DicomFileContent {
     pub file_meta: Vec<DicomNode>,
     pub nodes: Vec<DicomNode>,
     pub warnings: Vec<String>,
+    /// How long reading the file took, in milliseconds (shown by test builds, #20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_ms: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

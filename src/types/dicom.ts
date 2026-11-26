@@ -31,6 +31,8 @@ export type DicomFileContent = {
   file_meta: DicomNode[]
   nodes: DicomNode[]
   warnings: string[]
+  /** How long reading the file took in the backend (see `data/timings`). */
+  open_ms?: number
 }
 
 export type ValidationResult = {
