@@ -213,7 +213,9 @@ pub async fn open_dicom_file(
 ) -> Result<DicomFileContent, String> {
     // Taken before reading, so that a change made while reading is noticed on save.
     let stamp = file_stamp(&path);
-    let content = open_nodes(&path)?;
+    let started = std::time::Instant::now();
+    let mut content = open_nodes(&path)?;
+    content.open_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
     let hidden_trailing = content.file_meta.is_empty().then(HashSet::new);
     store
         .objects

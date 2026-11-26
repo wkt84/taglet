@@ -244,6 +244,7 @@ fn open_nodes_lazily(path: &str) -> Result<Option<DicomFileContent>, String> {
         file_meta,
         nodes,
         warnings: Vec::new(),
+        open_ms: None,
     }))
 }
 
@@ -450,6 +451,7 @@ fn open_nodes_from_object(path: &str) -> Result<DicomFileContent, String> {
                 file_meta,
                 nodes,
                 warnings: Vec::new(),
+                open_ms: None,
             })
         }
         Err(standard_error) => {
@@ -462,6 +464,7 @@ fn open_nodes_from_object(path: &str) -> Result<DicomFileContent, String> {
                 file_meta: Vec::new(),
                 nodes,
                 warnings: vec![MISSING_FILE_META_WARNING.to_string()],
+                open_ms: None,
             })
         }
     }
