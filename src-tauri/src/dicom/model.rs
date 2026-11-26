@@ -13,6 +13,10 @@ pub enum DicomNode {
         length: u32,
         path: Vec<String>,
         editable: bool,
+        /// Set when `value` is only the start of a long value (#20): the key of the
+        /// whole value, kept by the backend for the open file (see `previews`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_value_key: Option<String>,
     },
     Sequence {
         tag: String,

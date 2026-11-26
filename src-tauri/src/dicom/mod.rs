@@ -2,6 +2,7 @@ pub mod charset;
 pub mod deflate;
 pub mod model;
 pub mod parser;
+pub mod previews;
 mod private;
 pub mod replace;
 pub mod splice;

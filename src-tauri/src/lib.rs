@@ -2,7 +2,7 @@ mod commands;
 mod dicom;
 
 use commands::file::{
-    open_dicom_file, save_dicom_file, save_dicom_file_as, set_current_dicom_file,
+    get_full_value, open_dicom_file, save_dicom_file, save_dicom_file_as, set_current_dicom_file,
     take_launch_file_paths, DicomStore, LaunchFileStore,
 };
 use commands::image::{get_dicom_frame_image, get_dicom_frame_pixels, get_dicom_image_info};
@@ -26,6 +26,7 @@ pub fn run() {
         .manage(LaunchFileStore::default())
         .invoke_handler(tauri::generate_handler![
             open_dicom_file,
+            get_full_value,
             set_current_dicom_file,
             save_dicom_file,
             save_dicom_file_as,
