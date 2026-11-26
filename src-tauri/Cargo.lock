@@ -3524,7 +3524,7 @@ dependencies = [
 
 [[package]]
 name = "taglet"
-version = "0.1.16"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
