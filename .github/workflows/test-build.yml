@@ -15,16 +15,21 @@ on:
 permissions:
   contents: read
 
-# A newer build for the same pull request or branch replaces a running one. Events
-# that do not build (e.g. another label added) get a group of their own, so that
-# they never cancel a running build.
+# A newer run for the same pull request or branch replaces a running one of the same
+# kind: builds (with the installers) and test-only runs ("test:windows") have groups of
+# their own, so that adding the test label never cancels a running build. Events that
+# do not run anything (e.g. another label added) get a group of their own, so that they
+# never cancel a running build.
 concurrency:
   group: >-
     test-build-${{ github.event.pull_request.number || github.ref }}-${{
     (github.event_name == 'workflow_dispatch' ||
-    (github.event.action == 'labeled' && (github.event.label.name == 'build:windows' || github.event.label.name == 'test:windows')) ||
-    (github.event.action == 'synchronize' && (contains(github.event.pull_request.labels.*.name, 'build:windows') || contains(github.event.pull_request.labels.*.name, 'test:windows'))))
-    && 'build' || github.run_id }}
+    (github.event.action == 'labeled' && github.event.label.name == 'build:windows') ||
+    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:windows')))
+    && 'build' ||
+    ((github.event.action == 'labeled' && github.event.label.name == 'test:windows') ||
+    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'test:windows')))
+    && 'test' || github.run_id }}
   cancel-in-progress: true
 
 jobs:
