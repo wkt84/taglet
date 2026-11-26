@@ -2,6 +2,8 @@
 // files and starting the app take (#20). Built with VITE_TAGLET_TIMINGS=1, as the
 // Windows test build is; release builds do not measure.
 
+import { startupSteps, type StartupMark, type StartupStep } from './startupSteps'
+
 export const TIMINGS_ENABLED = import.meta.env.VITE_TAGLET_TIMINGS === '1'
 
 export type OpenTiming = {
@@ -17,10 +19,10 @@ export type OpenTiming = {
 }
 
 export type StartupTiming = {
-  /** From the backend starting until the first screen is painted. */
+  /** From the process being created (or the backend starting) until the first screen is painted. */
   totalMs: number
-  /** From the page starting to load until then. */
-  pageMs: number
+  /** What that took, step by step (see `startupSteps`). */
+  steps: StartupStep[]
 }
 
 export type Timings = { open?: OpenTiming; startup?: StartupTiming }
@@ -87,11 +89,11 @@ export function openShown(path: string | undefined) {
 }
 
 /**
- * Record startup, once the first screen is painted. `backendStartedAt` gives when the
- * backend started, in milliseconds since the Unix epoch: the time until the first paint
- * is taken by the same clock, so the call itself does not count.
+ * Record startup, once the first screen is painted. `backendMarks` gives the moments the
+ * backend recorded, in milliseconds since the Unix epoch: the page's moments are taken
+ * by the same clock, so the call itself does not count.
  */
-export function recordStartup(backendStartedAt: () => Promise<number>) {
+export function recordStartup(backendMarks: () => Promise<StartupMark[]>) {
   if (!TIMINGS_ENABLED) return
   afterNextPaint(() => {
     // When the first content was painted, as the browser records it; otherwise now
@@ -99,11 +101,14 @@ export function recordStartup(backendStartedAt: () => Promise<number>) {
     const firstPaint = performance
       .getEntriesByType('paint')
       .find((entry) => entry.name === 'first-contentful-paint')
-    const pageMs = firstPaint?.startTime ?? performance.now()
-    const paintedAt = performance.timeOrigin + pageMs
-    void backendStartedAt().then((startedAt) => {
-      const startup: StartupTiming = { totalMs: paintedAt - startedAt, pageMs }
-      console.info('[taglet] startup', startup)
+    const navigationAt = performance.timeOrigin
+    const paintedAt = navigationAt + (firstPaint?.startTime ?? performance.now())
+    void backendMarks().then((marks) => {
+      const startup: StartupTiming = startupSteps(marks, navigationAt, paintedAt)
+      const first = Math.min(...marks.map((mark) => mark.at_ms), navigationAt)
+      const moments = [...marks, { name: 'navigation', at_ms: navigationAt }, { name: 'paint', at_ms: paintedAt }]
+        .map((mark) => `${mark.name} +${Math.round(mark.at_ms - first)}`)
+      console.info('[taglet] startup', startup, moments.join(', '))
       update({ startup })
     }).catch(() => {})
   })
@@ -119,5 +124,6 @@ export function formatOpenTiming(open: OpenTiming) {
 }
 
 export function formatStartupTiming(startup: StartupTiming) {
-  return `Started in ${Math.round(startup.totalMs)} ms (page ${Math.round(startup.pageMs)})`
+  const steps = startup.steps.map((step) => `${step.name} ${Math.round(step.ms)}`)
+  return `Started in ${Math.round(startup.totalMs)} ms (${steps.join(' · ')})`
 }
