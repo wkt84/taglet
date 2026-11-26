@@ -161,6 +161,12 @@ export function useDicomFile() {
     documentsRef.current = documents
   }, [documents])
 
+  // Documents being saved. They are not edited until the save finishes: the save sends
+  // the nodes as they were, and afterwards the file's items are numbered as shown
+  // (see `withoutItemSources`), which edits made meanwhile would not follow.
+  const savingRef = useRef(new Set<string>())
+  const SAVING_MESSAGE = 'The file is being saved. Edit it again after saving finishes.'
+
   const updateDocument = useCallback((id: string, update: (document: DicomDocument) => DicomDocument) => {
     setDocuments((current) => {
       const next = current.map((document) => (
@@ -261,21 +267,24 @@ export function useDicomFile() {
     if (!activeDocument) return
     setError(undefined)
     setLoading(true)
+    const savedNodes = activeDocument.nodes
+    savingRef.current.add(activeDocument.id)
     try {
       await setBackendCurrentPath(activeDocument.filePath)
       await invoke('save_dicom_file', {
         path: activeDocument.filePath,
-        nodes: activeDocument.nodes,
+        nodes: savedNodes,
       })
       // The saved file's items are the shown ones, in order.
-      updateDocument(activeDocument.id, (document) => ({
-        ...document,
-        nodes: withoutItemSources(document.nodes),
-        dirty: false,
-      }))
+      updateDocument(activeDocument.id, (document) => (
+        document.nodes === savedNodes
+          ? { ...document, nodes: withoutItemSources(document.nodes), dirty: false }
+          : document
+      ))
     } catch (error) {
       setError(String(error))
     } finally {
+      savingRef.current.delete(activeDocument.id)
       setLoading(false)
     }
   }, [activeDocument, setBackendCurrentPath, updateDocument])
@@ -291,17 +300,21 @@ export function useDicomFile() {
       })
       if (!destination) return
 
+      const savedNodes = activeDocument.nodes
+      savingRef.current.add(activeDocument.id)
       await setBackendCurrentPath(activeDocument.filePath)
-      await invoke('save_dicom_file_as', { path: destination, nodes: activeDocument.nodes })
+      await invoke('save_dicom_file_as', { path: destination, nodes: savedNodes })
       updateDocument(activeDocument.id, (document) => ({
         ...document,
         filePath: destination,
-        nodes: withoutItemSources(document.nodes),
-        dirty: false,
+        ...(document.nodes === savedNodes
+          ? { nodes: withoutItemSources(document.nodes), dirty: false }
+          : {}),
       }))
     } catch (error) {
       setError(String(error))
     } finally {
+      savingRef.current.delete(activeDocument.id)
       setLoading(false)
     }
   }, [activeDocument, setBackendCurrentPath, updateDocument])
@@ -330,6 +343,10 @@ export function useDicomFile() {
 
   const updateNodeValue = useCallback((path: string[], value: string) => {
     if (!activeDocumentId) return
+    if (savingRef.current.has(activeDocumentId)) {
+      setError(SAVING_MESSAGE)
+      return
+    }
     updateDocument(activeDocumentId, (document) => {
       const nodes = updateNode(document.nodes, path, value)
       return {
@@ -344,6 +361,10 @@ export function useDicomFile() {
   const addTag = useCallback((parentPath: string[], node: DicomElement) => {
     if (!activeDocument) return false
     setError(undefined)
+    if (savingRef.current.has(activeDocument.id)) {
+      setError(SAVING_MESSAGE)
+      return false
+    }
     const result = insertNode(activeDocument.nodes, parentPath, node)
 
     if (result.duplicate) {
@@ -367,10 +388,14 @@ export function useDicomFile() {
   const batchUpdateValues = useCallback(async (changes: BatchValueChange[]) => {
     setError(undefined)
     if (changes.length === 0) return false
+    if (changes.some((change) => savingRef.current.has(change.documentId))) {
+      setError(SAVING_MESSAGE)
+      return false
+    }
     const snapshot = documentsRef.current
     try {
       await validateBatchValueChanges(snapshot, changes, (vr, value) => invoke<ValidationResult>('validate_value', { vr, value }))
-      if (documentsRef.current !== snapshot) {
+      if (documentsRef.current !== snapshot || changes.some((change) => savingRef.current.has(change.documentId))) {
         throw new Error('The open files changed during validation. Review the preview and try again.')
       }
       const next = snapshot.map((document) => {
@@ -390,6 +415,10 @@ export function useDicomFile() {
 
   const deleteNodeByPath = useCallback((path: string[]) => {
     if (!activeDocumentId) return
+    if (savingRef.current.has(activeDocumentId)) {
+      setError(SAVING_MESSAGE)
+      return
+    }
     updateDocument(activeDocumentId, (document) => {
       const nodes = deleteNodeAtPath(document.nodes, path)
       return {

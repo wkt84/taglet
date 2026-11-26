@@ -578,7 +578,7 @@ pub fn object_to_nodes(obj: &InMemDicomObject, parent_path: Vec<String>) -> Vec<
                             object_to_nodes(item, item_path)
                         })
                         .collect(),
-                    item_sources: Vec::new(),
+                    item_sources: None,
                 },
                 Value::PixelSequence(_) if tag == PIXEL_DATA => DicomNode::Element {
                     tag: tag_text,
@@ -629,7 +629,7 @@ pub fn apply_nodes_to_object_with_text(
     text: &TextValues,
     nodes_show_trailing: bool,
 ) -> Result<HashSet<Vec<String>>, String> {
-    if !items_follow_file(nodes) {
+    if !items_match_object(obj, nodes)? {
         return Err(ITEMS_REMOVED_NEED_SPLICING.to_string());
     }
     validate_private_nodes(obj, nodes)?;
@@ -1322,14 +1322,17 @@ const ITEMS_REMOVED_NEED_SPLICING: &str = "Cannot save: removing sequence items 
 
 /// The index of the file's item that the node item at `index` shows (see
 /// `DicomNode::Sequence::item_sources`).
-pub(crate) fn item_source(item_sources: &[usize], index: usize) -> usize {
-    item_sources.get(index).copied().unwrap_or(index)
+pub(crate) fn item_source(item_sources: &Option<Vec<usize>>, index: usize) -> usize {
+    item_sources
+        .as_ref()
+        .and_then(|sources| sources.get(index).copied())
+        .unwrap_or(index)
 }
 
 /// The file's item that the node item at `index` shows.
 pub(crate) fn source_item<'a>(
     file_items: &'a [InMemDicomObject],
-    item_sources: &[usize],
+    item_sources: &Option<Vec<usize>>,
     index: usize,
 ) -> Option<&'a InMemDicomObject> {
     file_items.get(item_source(item_sources, index))
@@ -1412,22 +1415,41 @@ fn child_path(parent: &[String], segment: &str) -> Vec<String> {
     path
 }
 
-/// Whether the nodes show the file's items as they are (none removed).
-fn items_follow_file(nodes: &[DicomNode]) -> bool {
-    nodes.iter().all(|node| match node {
-        DicomNode::Element { .. } => true,
-        DicomNode::Sequence {
+/// Whether no items were removed from the object's: where `item_sources` is set,
+/// it must list the object's items in order (removing the last items, or all of them,
+/// leaves a shorter list). Without it, the items are the ones read, which can be fewer
+/// in raw data sets read up to Pixel Data in an item.
+fn items_match_object(obj: &InMemDicomObject, nodes: &[DicomNode]) -> Result<bool, String> {
+    for node in nodes {
+        let DicomNode::Sequence {
+            tag,
             items,
             item_sources,
             ..
-        } => {
-            item_sources
-                .iter()
-                .enumerate()
-                .all(|(index, source)| *source == index)
-                && items.iter().all(|item| items_follow_file(item))
+        } = node
+        else {
+            continue;
+        };
+        let Some(obj_items) = sequence_items(obj, parse_tag(tag)?) else {
+            continue;
+        };
+        if let Some(sources) = item_sources {
+            if sources.len() != obj_items.len()
+                || sources
+                    .iter()
+                    .enumerate()
+                    .any(|(index, source)| *source != index)
+            {
+                return Ok(false);
+            }
         }
-    })
+        for (item, item_nodes) in obj_items.iter().zip(items) {
+            if !items_match_object(item, item_nodes)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Elements added by the nodes, and elements, sequences and items removed from the
@@ -2178,7 +2200,7 @@ where
                     length: length_to_u32(len),
                     path,
                     items,
-                    item_sources: Vec::new(),
+                    item_sources: None,
                 });
                 if found_pixel_data {
                     return Ok((nodes, true));
@@ -5379,7 +5401,7 @@ mod tests {
                 &["(0008,1115)", "Item#0"],
             )]],
             path: vec!["(0008,1115)".to_string()],
-            item_sources: Vec::new(),
+            item_sources: None,
         }];
         in_items.push(element_node("(0028,0106)", "SS", "-1", &[]));
         let signed_after_item =
@@ -5434,7 +5456,7 @@ mod tests {
                     length: 0,
                     items: vec![vec![]],
                     path: vec![sequence_tag.to_string()],
-                    item_sources: Vec::new(),
+                    item_sources: None,
                 },
             ]
         };
@@ -5710,7 +5732,7 @@ mod tests {
             length: 0,
             path: vec!["(0040,0275)".to_string()],
             items: Vec::new(),
-            item_sources: Vec::new(),
+            item_sources: None,
         });
         *find_element_mut(&mut nodes, &["(0010,0020)"]).unwrap() = "ID002".to_string();
         let planned = plan_for(&path, &nodes);
@@ -5910,7 +5932,7 @@ mod tests {
             length: 0,
             path: vec!["(FFFA,FFFA)".to_string()],
             items: Vec::new(),
-            item_sources: Vec::new(),
+            item_sources: None,
         });
         let planned = plan_for(&path, &nodes);
         std::fs::remove_file(&path).ok();
@@ -6140,11 +6162,9 @@ mod tests {
             } = node
             {
                 if path == sequence_path {
-                    if item_sources.is_empty() {
-                        *item_sources = (0..items.len()).collect();
-                    }
+                    let sources = item_sources.get_or_insert_with(|| (0..items.len()).collect());
                     items.remove(index);
-                    item_sources.remove(index);
+                    sources.remove(index);
                     let depth = path.len();
                     for (position, item) in items.iter_mut().enumerate().skip(index) {
                         renumber(item, depth, &format!("Item#{position}"));
@@ -6313,6 +6333,34 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(result.unwrap_err().contains("removing sequence items"));
+        assert!(!destination.exists());
+    }
+
+    /// Removing the last items leaves `item_sources` in order (or empty); the full
+    /// writer still notices them by count.
+    #[test]
+    fn the_full_writer_refuses_removed_last_items() {
+        let path = temp_path("remove-last-item-full.dcm");
+        write_three_rois(&path, true);
+        let path_text = path.to_str().unwrap();
+        let opened = open_nodes(path_text).unwrap().nodes;
+        let mut last = opened.clone();
+        remove_item(&mut last, &["(3006,0020)"], 2);
+        let mut all = opened.clone();
+        for _ in 0..3 {
+            remove_item(&mut all, &["(3006,0020)"], 0);
+        }
+        let text = TextValues::try_read(path_text).unwrap();
+        let destination = temp_path("remove-last-item-full-out.dcm");
+        let results = [last, all].map(|nodes| {
+            let mut obj = open_full_object(path_text).unwrap();
+            save_object_with_nodes(&mut obj, &nodes, &text, destination.to_str().unwrap())
+        });
+        std::fs::remove_file(&path).ok();
+
+        for result in results {
+            assert!(result.unwrap_err().contains("removing sequence items"));
+        }
         assert!(!destination.exists());
     }
 
