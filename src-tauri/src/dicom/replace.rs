@@ -19,8 +19,8 @@
 use std::path::Path;
 
 /// Move `temporary` to `destination`, replacing it if it exists (see the module
-/// documentation). On failure, `destination` is unchanged; `temporary` is left for the
-/// caller to remove.
+/// documentation). On failure, `destination` is unchanged and `temporary` is left for
+/// the caller to remove.
 pub fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
     match std::fs::metadata(destination) {
         Ok(_) => replace_existing(temporary, destination),
@@ -33,39 +33,87 @@ pub fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> 
 
 #[cfg(windows)]
 fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<u16>>()
-    };
-    let replaced = wide(destination);
-    let replacement = wide(temporary);
+    // A backup name, so that a failed replacement never leaves the replaced file
+    // deleted: without one, ReplaceFileW can fail after deleting it
+    // (ERROR_UNABLE_TO_MOVE_REPLACEMENT).
+    let backup = unused_name(destination, "bak");
+    let (replaced, replacement, backup_name) = (
+        verbatim(destination)?,
+        verbatim(temporary)?,
+        verbatim(&backup)?,
+    );
     // No flags: failing to keep the replaced file's access control list or attributes
     // fails the replacement (REPLACEFILE_IGNORE_MERGE_ERRORS would ignore that).
-    // SAFETY: both paths are NUL-terminated wide strings that outlive the call, and
-    // the optional arguments are null.
+    // SAFETY: the paths are NUL-terminated wide strings that outlive the call, and the
+    // reserved arguments are null.
     let replaced_ok = unsafe {
         ReplaceFileW(
             replaced.as_ptr(),
             replacement.as_ptr(),
-            std::ptr::null(),
+            backup_name.as_ptr(),
             0,
             std::ptr::null(),
             std::ptr::null(),
         )
     };
     if replaced_ok == 0 {
+        let error = std::io::Error::last_os_error();
+        // The replaced file was moved to the backup but the new one not moved into
+        // place (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2): put the replaced file back.
+        if !destination.exists() && backup.exists() {
+            std::fs::rename(&backup, destination).ok();
+        }
         return Err(format!(
-            "Could not replace {}: {}",
-            destination.display(),
-            std::io::Error::last_os_error()
+            "Could not replace {}: {error}",
+            destination.display()
         ));
     }
+    // The replaced file, kept only until the replacement succeeded.
+    std::fs::remove_file(&backup).ok();
     Ok(())
+}
+
+/// A path next to `path` that does not exist yet, ending in `extension`.
+#[cfg(windows)]
+fn unused_name(path: &Path, extension: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let unique = format!(
+            ".taglet-{}-{}.{extension}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let candidate = path.with_file_name(unique);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+}
+
+/// `path` as a NUL-terminated wide string in the extended-length form (`\\?\C:\...`,
+/// `\\?\UNC\server\share\...`), which is not limited to MAX_PATH characters. The
+/// standard library does this for its own file functions.
+#[cfg(windows)]
+fn verbatim(path: &Path) -> Result<Vec<u16>, String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // Absolute and normalized (no `.` or `..`, backslashes), as extended-length paths
+    // must be.
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let wide = absolute.as_os_str().encode_wide().collect::<Vec<u16>>();
+    let text = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let mut out = if wide.starts_with(&text(r"\\?\")) || wide.starts_with(&text(r"\\.\")) {
+        wide
+    } else if let Some(unc) = wide.strip_prefix(text(r"\\").as_slice()) {
+        [text(r"\\?\UNC\").as_slice(), unc].concat()
+    } else {
+        [text(r"\\?\").as_slice(), &wide].concat()
+    };
+    out.push(0);
+    Ok(out)
 }
 
 #[cfg(unix)]
@@ -122,9 +170,9 @@ fn copy_access_control(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Copy the extended attributes of `from` to `to`, including the POSIX access control
-/// list (`system.posix_acl_access`). Other attributes the file system or its security
-/// module will not set (e.g. `security.selinux` without the right) are skipped: they
-/// do not widen who may access the file.
+/// list (`system.posix_acl_access`). Other attributes that cannot be read or set (e.g.
+/// `security.selinux` without the right) are skipped: they do not widen who may access
+/// the file.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn copy_access_control(from: &Path, to: &Path) -> Result<(), String> {
     const POSIX_ACL: &str = "system.posix_acl_access";
@@ -136,10 +184,13 @@ fn copy_access_control(from: &Path, to: &Path) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     };
     for name in names {
-        let Some(value) = xattr::get(from, &name).map_err(|error| error.to_string())? else {
-            continue;
-        };
-        if let Err(error) = xattr::set(to, &name, &value) {
+        // Only the access control list must be kept; other attributes are kept when
+        // they can be read and written (e.g. `user.*` ones need read permission).
+        let copied = xattr::get(from, &name).and_then(|value| match value {
+            Some(value) => xattr::set(to, &name, &value),
+            None => Ok(()),
+        });
+        if let Err(error) = copied {
             if name == POSIX_ACL {
                 return Err(error.to_string());
             }
@@ -277,5 +328,29 @@ mod tests {
         replaced.unwrap();
         assert_eq!(content, b"new");
         assert_eq!(kept, created);
+    }
+
+    /// Paths longer than MAX_PATH (260 characters) are replaced too, as the standard
+    /// library's own file functions handle them.
+    #[cfg(windows)]
+    #[test]
+    fn replaces_files_with_long_paths() {
+        let mut directory =
+            std::env::temp_dir().join(format!("taglet-long-{}", std::process::id()));
+        let root = directory.clone();
+        while directory.as_os_str().len() < 300 {
+            directory.push("a-long-folder-name-to-pass-max-path");
+        }
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("destination.dcm");
+        let temporary = directory.join("temporary.dcm");
+        std::fs::write(&destination, b"old").unwrap();
+        std::fs::write(&temporary, b"new").unwrap();
+        let replaced = replace_file(&temporary, &destination);
+        let content = std::fs::read(&destination).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        replaced.unwrap();
+        assert_eq!(content, b"new");
     }
 }

@@ -2264,6 +2264,7 @@ fn write_file_atomically_with(
     guard: Option<(&str, splice::FileStamp)>,
     write: impl FnOnce(&mut dyn std::io::Write) -> Result<(), String>,
 ) -> Result<(), String> {
+    let existed = std::path::Path::new(destination).exists();
     let (temporary, file) = create_temporary_save_file(destination)?;
     let result = write_checked(file, write)
         .and_then(|()| match guard {
@@ -2274,10 +2275,19 @@ fn write_file_atomically_with(
         })
         // Keeps the replaced file's owner and access control list (#7).
         .and_then(|()| replace::replace_file(&temporary, std::path::Path::new(destination)));
-    if result.is_err() {
-        std::fs::remove_file(&temporary).ok();
+    match result {
+        // A replacement that failed half way (which `replace_file` undoes where it
+        // can) must not lose the new content too.
+        Err(error) if existed && !std::path::Path::new(destination).exists() => Err(format!(
+            "{error} The saved content was kept in {}.",
+            temporary.display()
+        )),
+        Err(error) => {
+            std::fs::remove_file(&temporary).ok();
+            Err(error)
+        }
+        Ok(()) => Ok(()),
     }
-    result
 }
 
 /// Create a temporary file that only this save uses, readable by the owner only.
