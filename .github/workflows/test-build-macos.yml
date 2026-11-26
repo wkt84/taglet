@@ -1,0 +1,110 @@
+name: Test Build (macOS)
+
+# macOS builds for testing, like the Windows ones (test-build.yml): no tag, no release,
+# no updater files, and a separate app ("Taglet Test"). Run it from the Actions tab
+# ("Run workflow", then pick a branch), or add the "build:macos" label to a pull request
+# (later pushes to it build again while the label stays). It builds for Intel Macs
+# (x86_64) and attaches the disk image to the run as an artifact. The "test:macos"
+# label runs only the Rust tests on macOS, without building the app.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions:
+  contents: read
+
+# As in test-build.yml: builds and test-only runs have groups of their own, and events
+# that run nothing never cancel a running build.
+concurrency:
+  group: >-
+    test-build-macos-${{ github.event.pull_request.number || github.ref }}-${{
+    (github.event_name == 'workflow_dispatch' ||
+    (github.event.action == 'labeled' && github.event.label.name == 'build:macos') ||
+    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:macos')))
+    && 'build' ||
+    ((github.event.action == 'labeled' && github.event.label.name == 'test:macos') ||
+    (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'test:macos')))
+    && 'test' || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && (github.event.label.name == 'build:macos' || github.event.label.name == 'test:macos')) ||
+      (github.event.action == 'synchronize' && (contains(github.event.pull_request.labels.*.name, 'build:macos') || contains(github.event.pull_request.labels.*.name, 'test:macos')))
+    runs-on: macos-latest
+    steps:
+      # The pull request's own head commit, not the merge with the base branch, so
+      # that the build matches the commit it is named after.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # On the runner's own architecture (Apple Silicon); the code that differs on
+      # macOS (copyfile, in src-tauri/src/dicom/replace.rs) is the same on Intel.
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'build:macos') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'build:macos'))
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      # See test-build.yml for src-tauri/tauri.test-build.conf.json ("Taglet Test").
+      - name: Build Tauri app
+        run: npm run tauri -- build --target x86_64-apple-darwin --bundles app,dmg --config src-tauri/tauri.test-build.conf.json
+        env:
+          # Show how long opening files and starting take (src/data/timings.ts).
+          VITE_TAGLET_TIMINGS: '1'
+
+      - name: Name the artifact
+        id: name
+        shell: bash
+        run: |
+          sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "artifact=taglet-macos-intel-test-${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.artifact }}
+          path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14

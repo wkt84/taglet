@@ -269,6 +269,20 @@ WebView の作成が終わる前に画面の読み込みが始まった場合は
 
 `Build Taglet`（`build.yml`）はリリース用です。ブランチで手動実行すると、ブランチ名のタグとリリースが作られるので、テストには使わないでください。
 
+### macOS のテストビルド
+
+macOS 用のテストビルドも、Windows と同じように作れます（`.github/workflows/test-build-macos.yml`）。Intel Mac 用（x86_64）の `Taglet Test.app` を、ディスクイメージ（`.dmg`）で作ります。リリース版の `Taglet.app` と共存でき、ファイルの関連付けや自動アップデートの確認をしないのも Windows と同じです。
+
+- Actions タブの「Test Build (macOS)」で「Run workflow」を押し、ブランチを選んで実行する
+- または、Pull Request に `build:macos` ラベルを付ける（付けている間は、push のたびにビルドし直す）
+- テストだけでよい場合は、`test:macos` ラベルを付ける（macOS（Apple Silicon のランナー）上で `cargo test --lib` だけを実行し、アプリは作らない）
+
+ディスクイメージは、実行結果ページの Artifacts から zip でダウンロードできます（14 日間保存）。署名していないので、`Taglet Test.app` をアプリケーションフォルダにコピーしたあと、次のコマンドで quarantine 属性を削除してから起動してください。
+
+```bash
+xattr -cr "/Applications/Taglet Test.app"
+```
+
 ## ライセンス
 
 MIT
