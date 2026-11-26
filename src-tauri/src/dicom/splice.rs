@@ -95,6 +95,10 @@ pub struct IndexItem {
 pub struct FileIndex {
     /// The file's modification time when indexed, to detect a replaced file.
     modified: Option<std::time::SystemTime>,
+    /// Offset of the file meta information (after the preamble and "DICM").
+    meta_start: u64,
+    /// The file meta information elements, in file order.
+    meta: Vec<IndexNode>,
     /// Offset of the first data set element (after the file meta information).
     dataset_start: u64,
     /// Whether the data set is Explicit VR (Implicit VR otherwise).
@@ -121,6 +125,7 @@ impl FileIndex {
         if &head[128..132] != b"DICM" {
             return Err("Not a DICOM Part 10 file with a preamble".to_string());
         }
+        let meta_start = reader.position;
         let meta = read_nodes(&mut reader, file_length, |tag| tag.group() != 0x0002)?;
         if meta
             .iter()
@@ -140,6 +145,8 @@ impl FileIndex {
         Ok(Self {
             modified,
             explicit: reader.explicit,
+            meta_start,
+            meta,
             dataset_start,
             file_length,
             nodes,
@@ -447,6 +454,10 @@ pub struct Edits {
     pub insertions: HashMap<Vec<String>, Vec<(Tag, Vec<u8>)>>,
     /// Existing elements, sequences and items to leave out.
     pub removals: HashSet<Vec<String>>,
+    /// New values of existing file meta information elements (e.g. Media Storage SOP
+    /// Instance UID), encoded and padded. File Meta Information Group Length
+    /// (0002,0000) is updated to match.
+    pub meta_replacements: HashMap<Tag, Vec<u8>>,
 }
 
 /// Write `source` to `out` with `edits` applied, updating the lengths of enclosing
@@ -468,7 +479,7 @@ pub fn write_spliced(
         edits,
         explicit: index.explicit,
     };
-    writer.copy(0, index.dataset_start)?;
+    writer.meta(index)?;
     writer.nodes(&index.nodes, &[])?;
     writer.copy(index.dataset_end(), index.file_length)
 }
@@ -482,6 +493,11 @@ pub fn encode_element(tag: Tag, vr: VR, value: &[u8], explicit: bool) -> Result<
 }
 
 impl FileIndex {
+    /// Whether the file meta information has the element.
+    pub fn has_meta_element(&self, tag: Tag) -> bool {
+        self.meta.iter().any(|node| node.tag() == tag)
+    }
+
     /// The file's length and modification time when it was indexed.
     pub fn stamp(&self) -> Option<FileStamp> {
         self.modified.map(|modified| (self.file_length, modified))
@@ -562,6 +578,69 @@ struct SpliceWriter<'a> {
 }
 
 impl SpliceWriter<'_> {
+    /// The preamble and the file meta information, with replaced values and the group
+    /// length that follows from them.
+    fn meta(&mut self, index: &FileIndex) -> Result<(), String> {
+        const GROUP_LENGTH: Tag = Tag(0x0002, 0x0000);
+        let replacements = &self.edits.meta_replacements;
+        if replacements.is_empty() {
+            return self.copy(0, index.dataset_start);
+        }
+        let element_length = |node: &IndexNode| -> Result<u64, String> {
+            let IndexNode::Element {
+                tag,
+                vr_bytes,
+                start,
+                end,
+                ..
+            } = node
+            else {
+                return Err("Unexpected structure in the file meta information".to_string());
+            };
+            Ok(match replacements.get(tag) {
+                Some(value) => {
+                    (element_header(*tag, *vr_bytes, value.len(), true)?.len() + value.len()) as u64
+                }
+                None => end - start,
+            })
+        };
+        self.copy(0, index.meta_start)?;
+        for node in &index.meta {
+            let IndexNode::Element {
+                tag,
+                vr_bytes,
+                start,
+                end,
+                ..
+            } = node
+            else {
+                return Err("Unexpected structure in the file meta information".to_string());
+            };
+            if *tag == GROUP_LENGTH {
+                // An Explicit VR UL element: 8-byte header and a 4-byte value.
+                if end - start != 12 {
+                    return Err("Unexpected File Meta Information Group Length".to_string());
+                }
+                let mut total = 0_u64;
+                for other in index
+                    .meta
+                    .iter()
+                    .filter(|other| other.tag() != GROUP_LENGTH)
+                {
+                    total += element_length(other)?;
+                }
+                self.copy(*start, start + 8)?;
+                self.write(&checked_length(total, "The file meta information")?.to_le_bytes())?;
+            } else if let Some(value) = replacements.get(tag) {
+                self.write(&element_header(*tag, *vr_bytes, value.len(), true)?)?;
+                self.write(value)?;
+            } else {
+                self.copy(*start, *end)?;
+            }
+        }
+        Ok(())
+    }
+
     fn copy(&mut self, start: u64, end: u64) -> Result<(), String> {
         if end <= start {
             return Ok(());
