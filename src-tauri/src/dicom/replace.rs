@@ -61,9 +61,16 @@ fn replace_existing(temporary: &Path, destination: &Path) -> Result<(), String> 
     if replaced_ok == 0 {
         let error = std::io::Error::last_os_error();
         // The replaced file was moved to the backup but the new one not moved into
-        // place (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2): put the replaced file back.
+        // place (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2): put the replaced file back, or
+        // say where it is.
         if !destination.exists() && backup.exists() {
-            std::fs::rename(&backup, destination).ok();
+            if let Err(restore_error) = std::fs::rename(&backup, destination) {
+                return Err(format!(
+                    "Could not replace {}: {error}. The original file could not be moved back ({restore_error}) and is now {}.",
+                    destination.display(),
+                    backup.display()
+                ));
+            }
         }
         return Err(format!(
             "Could not replace {}: {error}",
