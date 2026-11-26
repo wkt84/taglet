@@ -1,10 +1,10 @@
 use base64::Engine;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry, VirtualVr};
-use dicom_core::header::{HasLength, Header, Length};
+use dicom_core::header::{DataElementHeader, HasLength, Header, Length};
 use dicom_core::value::{PrimitiveValue, Value};
 use dicom_core::{DataElement, Tag, VR};
 use dicom_dictionary_std::{tags, uids, StandardDataDictionary};
-use dicom_encoding::text::SpecificCharacterSet;
+use dicom_encoding::text::{DefaultCharacterSetCodec, SpecificCharacterSet, TextCodec};
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_object::{
     DefaultDicomObject, FileMetaTable, FileMetaTableBuilder, InMemDicomObject, OpenFileOptions,
@@ -139,6 +139,299 @@ fn can_splice(path: &str, content: &DicomFileContent) -> Option<bool> {
 }
 
 fn open_nodes_without_text_values(path: &str) -> Result<DicomFileContent, String> {
+    let lazily = open_nodes_lazily(path);
+    #[cfg(test)]
+    {
+        // Every file opened in the tests is also read the way below, and both must
+        // give the same nodes.
+        if let Ok(Some(lazily)) = &lazily {
+            let read = open_nodes_from_object(path).expect("the object reader fails");
+            assert_eq!(
+                serde_json::to_value(lazily).unwrap(),
+                serde_json::to_value(&read).unwrap(),
+                "nodes read lazily differ for {path}"
+            );
+        }
+    }
+    match lazily {
+        Ok(Some(content)) => Ok(content),
+        // Anything the lazy reading does not handle is read as an object.
+        _ => open_nodes_from_object(path),
+    }
+}
+
+/// The nodes of a Part 10 file up to Pixel Data, read with dicom-rs's lazy reader and
+/// built as `object_to_nodes` builds them from the object dicom-rs reads, without
+/// dicom-rs reading text values into a string per value (Contour Data has thousands)
+/// only for them to be joined again (#20). `Ok(None)` for files it does not handle
+/// (raw data sets without file meta information, anything unexpected), which are read
+/// as an object.
+fn open_nodes_lazily(path: &str) -> Result<Option<DicomFileContent>, String> {
+    let mut file = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+    let mut head = [0_u8; 132];
+    if file.read_exact(&mut head).is_err() || &head[128..132] != b"DICM" {
+        return Ok(None);
+    }
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(128))
+        .map_err(|error| error.to_string())?;
+    let Ok(meta) = FileMetaTable::from_reader(&mut file) else {
+        return Ok(None);
+    };
+    let file_meta = file_meta_to_nodes(&meta);
+    let nodes = if deflate::is_deflated(meta.transfer_syntax()) {
+        let mut inflated = Vec::new();
+        if deflate::inflate_into(&mut file, &mut inflated).is_err() {
+            return Ok(None);
+        }
+        let Some(transfer_syntax) = TransferSyntaxRegistry.get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+        else {
+            return Ok(None);
+        };
+        let Ok(mut reader) = LazyDataSetReader::new_with_ts_cs(
+            std::io::Cursor::new(inflated),
+            transfer_syntax,
+            SpecificCharacterSet::default(),
+        ) else {
+            return Ok(None);
+        };
+        lazy_nodes(
+            &mut reader,
+            &[],
+            false,
+            &mut SpecificCharacterSet::default(),
+        )
+    } else {
+        let Some(transfer_syntax) = TransferSyntaxRegistry.get(meta.transfer_syntax()) else {
+            return Ok(None);
+        };
+        if !transfer_syntax.can_decode_dataset() {
+            return Ok(None);
+        }
+        let Ok(mut reader) = LazyDataSetReader::new_with_ts_cs(
+            file,
+            transfer_syntax,
+            SpecificCharacterSet::default(),
+        ) else {
+            return Ok(None);
+        };
+        lazy_nodes(
+            &mut reader,
+            &[],
+            false,
+            &mut SpecificCharacterSet::default(),
+        )
+    };
+    let Ok(mut nodes) = nodes else {
+        return Ok(None);
+    };
+    // As `pixel_data_likely_present` does with the object.
+    let number = |tag: Tag| {
+        nodes.iter().find_map(|node| match node {
+            DicomNode::Element {
+                tag: found, value, ..
+            } if *found == format_tag(tag) => value.split('\\').next()?.trim().parse::<u32>().ok(),
+            _ => None,
+        })
+    };
+    if number(tags::ROWS).is_some()
+        && number(tags::COLUMNS).is_some()
+        && number(tags::BITS_ALLOCATED).is_some()
+        && !nodes.iter().any(is_pixel_data_node)
+    {
+        nodes.push(pixel_data_placeholder_node());
+    }
+    Ok(Some(DicomFileContent {
+        file_meta,
+        nodes,
+        warnings: Vec::new(),
+    }))
+}
+
+/// The nodes of a data set or item from the lazy reader, in tag order as an object
+/// holds them (a repeated tag keeps the last element, as in an object). At the top
+/// level (`in_item` false), reading stops at the first element from Pixel Data's tag
+/// on, as `OpenFileOptions::read_until` does. `codec` follows the character set
+/// dicom-rs decodes text with (see `dicom_rs_codec_after`). Fails on anything
+/// `object_to_nodes` would show differently.
+fn lazy_nodes<S>(
+    reader: &mut LazyDataSetReader<S>,
+    parent: &[String],
+    in_item: bool,
+    codec: &mut SpecificCharacterSet,
+) -> Result<Vec<DicomNode>, String>
+where
+    S: StatefulDecode,
+{
+    let mut nodes = std::collections::BTreeMap::new();
+    while let Some(token) = next_data_token(reader)? {
+        match token {
+            LazyDataToken::ElementHeader(header) => {
+                if !in_item && header.tag >= PIXEL_DATA {
+                    break;
+                }
+                let Some(value) = next_data_token(reader)? else {
+                    return Err("Missing element value".to_string());
+                };
+                let node = lazy_element_node(header, value, parent, codec)?;
+                nodes.insert(header.tag, node);
+            }
+            LazyDataToken::SequenceStart { tag, len } => {
+                if !in_item && tag >= PIXEL_DATA {
+                    break;
+                }
+                let tag_text = format_tag(tag);
+                let mut path = parent.to_vec();
+                path.push(tag_text.clone());
+                let mut items = Vec::new();
+                loop {
+                    match next_data_token(reader)? {
+                        Some(LazyDataToken::ItemStart { .. }) => {
+                            let mut item_path = path.clone();
+                            item_path.push(format!("Item#{}", items.len()));
+                            items.push(lazy_nodes(reader, &item_path, true, codec)?);
+                        }
+                        Some(LazyDataToken::SequenceEnd) => break,
+                        _ => return Err("Unexpected token in a sequence".to_string()),
+                    }
+                }
+                nodes.insert(
+                    tag,
+                    DicomNode::Sequence {
+                        tag: tag_text,
+                        description: description_for(tag),
+                        length: length_to_u32(len),
+                        path,
+                        items,
+                        item_sources: None,
+                    },
+                );
+            }
+            LazyDataToken::PixelSequenceStart if !in_item => break,
+            LazyDataToken::ItemEnd if in_item => return Ok(nodes.into_values().collect()),
+            _ => return Err("Unexpected token".to_string()),
+        }
+    }
+    if in_item {
+        return Err("Unterminated item".to_string());
+    }
+    Ok(nodes.into_values().collect())
+}
+
+/// An element node from its header and lazy value token, shown as `object_to_nodes`
+/// shows the element dicom-rs reads (with `ValueReadStrategy::Preserved`). Text values
+/// are shown from their bytes; others are read by dicom-rs.
+fn lazy_element_node<S>(
+    header: DataElementHeader,
+    token: LazyDataToken<S>,
+    parent: &[String],
+    codec: &mut SpecificCharacterSet,
+) -> Result<DicomNode, String>
+where
+    S: StatefulDecode,
+{
+    let LazyDataToken::LazyValue { .. } = token else {
+        return Err("Unexpected token instead of a value".to_string());
+    };
+    let (tag, vr, length) = (header.tag, header.vr, header.len);
+    let text = matches!(
+        vr,
+        VR::AE
+            | VR::AS
+            | VR::CS
+            | VR::DA
+            | VR::DS
+            | VR::DT
+            | VR::IS
+            | VR::LO
+            | VR::LT
+            | VR::PN
+            | VR::SH
+            | VR::ST
+            | VR::TM
+            | VR::UC
+            | VR::UI
+            | VR::UR
+            | VR::UT
+    );
+    let shown = if text && tag != tags::SPECIFIC_CHARACTER_SET && length.get().is_some() {
+        let mut bytes = Vec::with_capacity(length.0 as usize);
+        token
+            .read_value_into(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        (text_shown_as_dicom_rs_reads(codec, vr, &bytes)?, None)
+    } else {
+        let value = token.into_value().map_err(|error| error.to_string())?;
+        if tag == tags::SPECIFIC_CHARACTER_SET {
+            // dicom-rs switches its codec on the first value.
+            let strings = value.to_multi_str();
+            *codec = dicom_rs_codec_after(codec.clone(), strings.first().map(String::as_str));
+        }
+        display_element_value(tag, vr, &Value::Primitive(value))
+    };
+    let tag_text = format_tag(tag);
+    let mut path = parent.to_vec();
+    path.push(tag_text.clone());
+    Ok(DicomNode::Element {
+        tag: tag_text,
+        vr: vr.to_string().to_owned(),
+        inferred_vr: shown.1,
+        description: description_for(tag),
+        value: shown.0,
+        length: length_to_u32(length),
+        path,
+        editable: tag != PIXEL_DATA && is_text_editable(vr),
+    })
+}
+
+/// A text value as `display_value` shows what dicom-rs reads: decoded (AE, AS and CS
+/// with the default repertoire, others with `codec`), split into values at `\` bytes
+/// (except LT, ST, UR and UT), each without trailing spaces and NULs, joined with `\`.
+/// ASCII without escape sequences reads the same in every character set.
+fn text_shown_as_dicom_rs_reads(
+    codec: &SpecificCharacterSet,
+    vr: VR,
+    bytes: &[u8],
+) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let single = matches!(vr, VR::LT | VR::ST | VR::UR | VR::UT);
+    let ascii = bytes.iter().all(|byte| byte.is_ascii() && *byte != 0x1B);
+    let decode = |part: &[u8]| -> Result<String, String> {
+        if ascii {
+            return Ok(String::from_utf8(part.to_vec()).expect("ASCII is UTF-8"));
+        }
+        let decoded = if matches!(vr, VR::AE | VR::AS | VR::CS) {
+            DefaultCharacterSetCodec.decode(part)
+        } else {
+            codec.decode(part)
+        };
+        decoded.map_err(|error| error.to_string())
+    };
+    if single {
+        return Ok(trim_padding(&decode(bytes)?).to_string());
+    }
+    let mut shown = String::with_capacity(bytes.len());
+    for (index, part) in bytes.split(|byte| *byte == b'\\').enumerate() {
+        if index > 0 {
+            shown.push('\\');
+        }
+        if ascii {
+            let end = part
+                .iter()
+                .rposition(|byte| *byte != b' ' && *byte != 0)
+                .map_or(0, |last| last + 1);
+            shown.push_str(std::str::from_utf8(&part[..end]).expect("ASCII is UTF-8"));
+        } else {
+            shown.push_str(trim_padding(&decode(part)?));
+        }
+    }
+    Ok(shown)
+}
+
+/// The nodes of a file read as an object by dicom-rs, up to Pixel Data, or of a raw
+/// data set (see `open_nodes_without_text_values`).
+fn open_nodes_from_object(path: &str) -> Result<DicomFileContent, String> {
     let opened = match open_deflated_object(path, true)? {
         Some(obj) => Ok(obj),
         None => OpenFileOptions::new()
@@ -8504,5 +8797,96 @@ mod tests {
         assert!(!is_link);
         assert_eq!(saved_content, b"new");
         assert_eq!(target_content, b"other");
+    }
+
+    /// Timing of opening a large RT Structure Set, by stage (#20). Run with
+    /// `cargo test --release --lib open_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn open_timing() {
+        // 30 ROIs x 120 contours x 120 points of Contour Data (DS), about 10 MB.
+        let mut point = 0_u32;
+        let rois = (0..30)
+            .map(|roi| {
+                let contours = (0..120)
+                    .map(|_| {
+                        let values = (0..120 * 3)
+                            .map(|_| {
+                                point += 1;
+                                format!("{:.3}", f64::from(point % 100_000) * 0.137)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\\");
+                        let element = explicit_element(0x3006, 0x0050, b"DS", values.as_bytes());
+                        [
+                            explicit_element(0x3006, 0x0042, b"CS", b"CLOSED_PLANAR"),
+                            explicit_element(0x3006, 0x0046, b"IS", b"120"),
+                            element,
+                        ]
+                        .concat()
+                    })
+                    .collect::<Vec<_>>();
+                [
+                    explicit_element(0x3006, 0x0084, b"IS", (roi + 1).to_string().as_bytes()),
+                    sequence(0x3006, 0x0040, &contours, true),
+                ]
+                .concat()
+            })
+            .collect::<Vec<_>>();
+        let dataset = [
+            base_elements(b"ISO_IR 192"),
+            explicit_element(0x0010, 0x0010, b"PN", "山田^太郎".as_bytes()),
+            sequence(0x3006, 0x0039, &rois, true),
+        ]
+        .concat();
+        let path = temp_path("open-timing.dcm");
+        write_part10_with(&path, uids::EXPLICIT_VR_LITTLE_ENDIAN, &dataset);
+        let path_text = path.to_str().unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let time = |label: &str, run: &mut dyn FnMut()| {
+            // The third run, with the file in the cache.
+            let mut elapsed = std::time::Duration::ZERO;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                run();
+                elapsed = start.elapsed();
+            }
+            println!("{label:<40} {:>8.1} ms", elapsed.as_secs_f64() * 1000.0);
+        };
+        println!("file: {:.1} MB", size as f64 / 1e6);
+        time("deflate::read_inflated (check)", &mut || {
+            deflate::read_inflated(path_text).unwrap();
+        });
+        // (In tests, `open_nodes_without_text_values` also reads the file as an
+        // object to compare, so its stages are timed on their own.)
+        time("open_nodes_lazily", &mut || {
+            open_nodes_lazily(path_text).unwrap().unwrap();
+        });
+        time("open_nodes_from_object (before #20)", &mut || {
+            open_nodes_from_object(path_text).unwrap();
+        });
+        time("TextValues::read", &mut || {
+            TextValues::read(path_text);
+        });
+        let content = open_nodes_lazily(path_text).unwrap().unwrap();
+        time("can_splice (FileIndex::read)", &mut || {
+            can_splice(path_text, &content);
+        });
+        let text = TextValues::read(path_text);
+        time("apply_text_values", &mut || {
+            let mut nodes = content.nodes.clone();
+            apply_text_values(&mut nodes, &text, true);
+        });
+        let opened = open_nodes(path_text).unwrap();
+        let mut json = String::new();
+        time("serde_json::to_string", &mut || {
+            json = serde_json::to_string(&opened).unwrap();
+        });
+        println!("JSON: {:.1} MB", json.len() as f64 / 1e6);
+        if let Ok(out) = std::env::var("TAGLET_TIMING_JSON") {
+            std::fs::write(out, &json).unwrap();
+        }
+        std::fs::remove_file(&path).ok();
     }
 }
