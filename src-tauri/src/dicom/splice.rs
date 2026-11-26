@@ -445,7 +445,7 @@ pub struct Edits {
     /// New elements (tag and encoded element, header included) by the path of the data
     /// set or item they go into (empty for the top level).
     pub insertions: HashMap<Vec<String>, Vec<(Tag, Vec<u8>)>>,
-    /// Existing plain elements to leave out.
+    /// Existing elements, sequences and items to leave out.
     pub removals: HashSet<Vec<String>>,
 }
 
@@ -632,7 +632,10 @@ impl SpliceWriter<'_> {
                     self.copy(*start, start + header_length)?;
                 }
                 for (index, item) in items.iter().enumerate() {
-                    self.item(item, &child_path(&path, format!("Item#{index}")))?;
+                    let item_path = child_path(&path, format!("Item#{index}"));
+                    if !self.edits.removals.contains(&item_path) {
+                        self.item(item, &item_path)?;
+                    }
                 }
                 if !*defined_length {
                     // Sequence delimitation item.
@@ -706,12 +709,9 @@ impl SpliceWriter<'_> {
                 items,
                 ..
             } => {
-                let mut total = header_length + if *defined_length { 0 } else { 8 };
-                for (index, item) in items.iter().enumerate() {
-                    let item_path = child_path(&path, format!("Item#{index}"));
-                    let content = u64::from(self.nodes_length(&item.nodes, &item_path)?);
-                    total += 8 + content + if item.defined_length { 0 } else { 8 };
-                }
+                let total = header_length
+                    + if *defined_length { 0 } else { 8 }
+                    + u64::from(self.items_length(items, &path)?);
                 checked_length(total, "A sequence")
             }
             IndexNode::Opaque { .. } => original(),
@@ -722,6 +722,9 @@ impl SpliceWriter<'_> {
         let mut total = 0_u64;
         for (index, item) in items.iter().enumerate() {
             let item_path = child_path(path, format!("Item#{index}"));
+            if self.edits.removals.contains(&item_path) {
+                continue;
+            }
             let content = u64::from(self.nodes_length(&item.nodes, &item_path)?);
             total += 8 + content + if item.defined_length { 0 } else { 8 };
         }

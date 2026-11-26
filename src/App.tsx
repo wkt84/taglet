@@ -86,13 +86,15 @@ function findNodeByPath(nodes: DicomNode[], path?: string[]): DicomNode | { kind
 }
 
 function nodeDeleteLabel(node: DicomNode | { kind: 'Item'; path: string[] } | undefined) {
-  if (!node || node.kind === 'Item') return undefined
-  return node.kind === 'Sequence' ? `${node.tag} ${node.description}` : `${node.tag} ${node.description}`
+  if (!node) return undefined
+  if (node.kind === 'Item') return `${targetLabel(node.path)}（この Item 内のタグをすべて含む）`
+  return `${node.tag} ${node.description}`
 }
 
 type PendingDelete = {
   path: string[]
   label: string
+  item: boolean
 }
 
 export default function App() {
@@ -119,8 +121,7 @@ export default function App() {
   const canDeleteSelected = Boolean(
     selectedPath
       && selectedNode
-      && selectedNode.kind !== 'Item'
-      && selectedNode.tag !== '(7FE0,0010)',
+      && (selectedNode.kind === 'Item' || selectedNode.tag !== '(7FE0,0010)'),
   )
   const title = useMemo(() => {
     const name = fileName(dicom.filePath)
@@ -209,6 +210,7 @@ export default function App() {
           setPendingDelete({
             path: selectedPath,
             label: label ?? 'selected tag',
+            item: selectedNode?.kind === 'Item',
           })
         }}
         canDeleteSelectedTag={canDeleteSelected}
@@ -286,6 +288,7 @@ export default function App() {
       {pendingDelete ? (
         <ConfirmDeleteDialog
           label={pendingDelete.label}
+          subject={pendingDelete.item ? 'Item' : 'タグ'}
           onCancel={() => setPendingDelete(undefined)}
           onConfirm={() => {
             dicom.deleteNodeByPath(pendingDelete.path)

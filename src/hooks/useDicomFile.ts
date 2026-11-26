@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import type { DicomElement, DicomFileContent, DicomNode, ValidationResult } from '../types/dicom'
 import { applyBatchValueChanges, validateBatchValueChanges, type BatchValueChange } from '../data/batchEdit'
+import { deleteNodeAtPath } from '../data/nodeTree'
 
 export type DicomDocument = {
   id: string
@@ -78,19 +79,6 @@ function syncFileMetaFromNodes(fileMeta: DicomNode[], nodes: DicomNode[]) {
 
 function samePath(left: string[], right: string[]) {
   return left.length === right.length && left.every((part, index) => part === right[index])
-}
-
-function deleteNode(nodes: DicomNode[], path: string[]): DicomNode[] {
-  return nodes
-    .filter((node) => !samePath(node.path, path))
-    .map((node) => {
-      if (node.kind === 'Element') return node
-
-      return {
-        ...node,
-        items: node.items.map((item) => deleteNode(item, path)),
-      }
-    })
 }
 
 function tagExists(nodes: DicomNode[], tag: string) {
@@ -397,7 +385,7 @@ export function useDicomFile() {
   const deleteNodeByPath = useCallback((path: string[]) => {
     if (!activeDocumentId) return
     updateDocument(activeDocumentId, (document) => {
-      const nodes = deleteNode(document.nodes, path)
+      const nodes = deleteNodeAtPath(document.nodes, path)
       return {
         ...document,
         nodes,
