@@ -1500,6 +1500,14 @@ fn structure_diff(nodes: &[DicomNode], index: &[splice::IndexNode]) -> Option<St
                     ..
                 } => {
                     shape.sequences.insert(path.clone());
+                    // Items can be removed, not reordered: splicing writes them in the
+                    // file's order.
+                    if item_sources
+                        .as_ref()
+                        .is_some_and(|sources| sources.windows(2).any(|pair| pair[0] >= pair[1]))
+                    {
+                        shape.inconsistent = true;
+                    }
                     for (index, item) in items.iter().enumerate() {
                         let mut item_path = path.clone();
                         item_path.push(format!("Item#{}", item_source(item_sources, index)));
@@ -6334,6 +6342,39 @@ mod tests {
 
         assert!(result.unwrap_err().contains("removing sequence items"));
         assert!(!destination.exists());
+    }
+
+    /// Items can be removed but not reordered: splicing writes them in the file's order.
+    #[test]
+    fn reordered_items_are_not_spliced() {
+        let path = temp_path("reorder-items.dcm");
+        write_three_rois(&path, true);
+        let mut nodes = open_nodes(path.to_str().unwrap()).unwrap().nodes;
+        remove_item(&mut nodes, &["(3006,0020)"], 1);
+        if let Some(DicomNode::Sequence {
+            items,
+            item_sources,
+            ..
+        }) = nodes
+            .iter_mut()
+            .find(|node| matches!(node, DicomNode::Sequence { tag, .. } if tag == "(3006,0020)"))
+        {
+            items.swap(0, 1);
+            item_sources.as_mut().unwrap().swap(0, 1);
+            for (position, item) in items.iter_mut().enumerate() {
+                for node in item.iter_mut() {
+                    if let DicomNode::Element { path, .. } = node {
+                        path[1] = format!("Item#{position}");
+                    }
+                }
+            }
+        }
+        let spliced = plans_splice(&path, &nodes);
+        let saved = save_file(&path, &nodes);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!spliced);
+        assert!(saved.unwrap_err().contains("removing sequence items"));
     }
 
     /// Removing the last items leaves `item_sources` in order (or empty); the full

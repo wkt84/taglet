@@ -265,6 +265,8 @@ export function useDicomFile() {
 
   const saveFile = useCallback(async () => {
     if (!activeDocument) return
+    // Already being saved (e.g. by Save As): its loading state is the other save's.
+    if (savingRef.current.has(activeDocument.id)) return
     setError(undefined)
     setLoading(true)
     const savedNodes = documentsRef.current.find((document) => document.id === activeDocument.id)?.nodes
@@ -294,6 +296,8 @@ export function useDicomFile() {
     if (!activeDocument) return
     setError(undefined)
     setLoading(true)
+    // Only release the edit lock this save took: another save may hold it.
+    let locked = false
     try {
       const destination = await save({
         defaultPath: activeDocument.filePath,
@@ -304,8 +308,13 @@ export function useDicomFile() {
       // The document as it is now: it may have been edited while the dialog was open.
       const current = documentsRef.current.find((document) => document.id === activeDocument.id)
       if (!current) return
+      if (savingRef.current.has(activeDocument.id)) {
+        setError(SAVING_MESSAGE)
+        return
+      }
       const savedNodes = current.nodes
       savingRef.current.add(activeDocument.id)
+      locked = true
       await setBackendCurrentPath(activeDocument.filePath)
       await invoke('save_dicom_file_as', { path: destination, nodes: savedNodes })
       updateDocument(activeDocument.id, (document) => ({
@@ -318,7 +327,7 @@ export function useDicomFile() {
     } catch (error) {
       setError(String(error))
     } finally {
-      savingRef.current.delete(activeDocument.id)
+      if (locked) savingRef.current.delete(activeDocument.id)
       setLoading(false)
     }
   }, [activeDocument, setBackendCurrentPath, updateDocument])
